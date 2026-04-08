@@ -10,7 +10,7 @@
 //!     let text = std::fs::read_to_string("config.json")?;
 //!     let mut root: serde_json::Value = serde_json::from_str(&text)?;
 //!     // optional: hs_utils::config::deep_merge(&mut root, overlay);
-//!     hs_utils::config::normalize_to_strings(&mut root);
+//!     hs_utils::config::prepare_config(&mut root);
 //!     hs_utils::config::apply_env_overrides(&mut root);
 //!     Ok(serde_json::from_value(root)?)
 //! }
@@ -18,10 +18,9 @@
 //!
 //! # Secret file indirection
 //!
-//! Config values that start with `[SECRET]:` are treated as file paths.
-//! Call `resolve_secrets(&mut root)` after merging sources to replace them
-//! with the file's contents.  This mirrors the TS `hs.utils` behaviour and
-//! lets secrets be injected as mounted files rather than env vars:
+//! Config values that start with `[SECRET]:` are treated as file paths and are
+//! resolved automatically by `prepare_config`.  No explicit call is needed —
+//! secrets are invisible to service code:
 //!
 //! ```json
 //! { "db": { "password": "[SECRET]:/run/secrets/db_password" } }
@@ -54,6 +53,21 @@ pub fn normalize_to_strings(v: &mut Value) {
         Value::Number(n) => *v = Value::String(n.to_string()),
         _ => {} // strings and null unchanged
     }
+}
+
+/// Prepare a raw config `Value` tree for deserialisation in one call.
+///
+/// Performs (in order):
+/// 1. `resolve_secrets` — replaces `[SECRET]:/path` strings with file contents
+/// 2. `normalize_to_strings` — converts booleans and numbers to strings so
+///    that `true` and `"true"` are equivalent
+///
+/// Call this after all source layers have been merged (base config + any
+/// overlay), and before `apply_env_overrides`.  `[SECRET]:` resolution is
+/// intentionally invisible to the calling code.
+pub fn prepare_config(v: &mut Value) {
+    resolve_secrets(v);
+    normalize_to_strings(v);
 }
 
 /// Walk env vars and apply any that use `__` as a path separator as overrides
