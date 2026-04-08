@@ -119,7 +119,7 @@ pub async fn build_pool(cfg: &DbConfig) -> Result<PgPool> {
 
     PgPoolOptions::new()
         .min_connections(cfg.minpool.unwrap_or(0))
-        .max_connections(cfg.maxpool.unwrap_or(10))
+        .max_connections(cfg.maxpool.unwrap_or(3))
         .connect_with(opts)
         .await
         .context("Failed to connect to database")

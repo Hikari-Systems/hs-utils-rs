@@ -101,7 +101,7 @@ let pool = hs_utils::db::build_pool(&cfg.db).await?;
 | `password` | `String` | Can be a `[SECRET]:/path` reference |
 | `ssl` | `Option<DbSslConfig>` | |
 | `minpool` | `Option<u32>` | Default 0 |
-| `maxpool` | `Option<u32>` | Default 10 |
+| `maxpool` | `Option<u32>` | Default 3 |
 
 **`DbSslConfig` fields:** `enabled: Option<bool>`, `verify: Option<bool>`, `ca_cert_file: Option<String>`.
 
