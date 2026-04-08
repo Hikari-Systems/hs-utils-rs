@@ -3,16 +3,13 @@
 //! Add to `main.rs` before the async runtime starts:
 //!
 //! ```rust,ignore
-//! if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-//!     let host = std::env::args().nth(2).unwrap_or_else(|| "localhost".to_string());
-//!     let default_port = config::load().map(|c| c.server.port).unwrap_or(3000);
-//!     let port = std::env::args()
-//!         .nth(3)
-//!         .and_then(|s| s.parse::<u16>().ok())
-//!         .unwrap_or(default_port);
-//!     std::process::exit(if hs_utils::healthcheck::run(&host, port) { 0 } else { 1 });
-//! }
+//! hs_utils::healthcheck::check_subcommand(
+//!     config::load().map(|c| c.server.port).unwrap_or(3000),
+//! );
 //! ```
+//!
+//! `check_subcommand` is a no-op when `argv[1] != "healthcheck"`, so it is
+//! safe to call unconditionally at the top of every `main`.
 //!
 //! **Dockerfile:**
 //! ```dockerfile
@@ -47,4 +44,32 @@ pub fn run(host: &str, port: u16) -> bool {
     }
 
     response.starts_with("HTTP/1.1 200")
+}
+
+/// Handle the `healthcheck` CLI subcommand and exit if it is present.
+///
+/// Parses `argv[1..3]` as `[host] [port]`, using `default_port` when port is
+/// absent.  Calls `std::process::exit(0)` on success, `exit(1)` on failure.
+///
+/// This function is a **no-op** when `argv[1] != "healthcheck"`, so it can be
+/// called unconditionally at the top of every `main` before the async runtime
+/// starts:
+///
+/// ```rust,ignore
+/// hs_utils::healthcheck::check_subcommand(
+///     config::load().map(|c| c.server.port).unwrap_or(3000),
+/// );
+/// ```
+pub fn check_subcommand(default_port: u16) {
+    if std::env::args().nth(1).as_deref() != Some("healthcheck") {
+        return;
+    }
+    let host = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "localhost".to_string());
+    let port = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(default_port);
+    std::process::exit(if run(&host, port) { 0 } else { 1 });
 }

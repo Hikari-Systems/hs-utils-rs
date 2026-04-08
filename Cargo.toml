@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 [dependencies]
@@ -11,4 +11,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
 actix-web = "4"
+actix-service = "2"
+actix-http = "3"
 futures-util = "0.3"
