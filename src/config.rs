@@ -16,6 +16,17 @@
 //! }
 //! ```
 //!
+//! # Secret file indirection
+//!
+//! Config values that start with `[SECRET]:` are treated as file paths.
+//! Call `resolve_secrets(&mut root)` after merging sources to replace them
+//! with the file's contents.  This mirrors the TS `hs.utils` behaviour and
+//! lets secrets be injected as mounted files rather than env vars:
+//!
+//! ```json
+//! { "db": { "password": "[SECRET]:/run/secrets/db_password" } }
+//! ```
+//!
 //! # Deserializer attributes
 //!
 //! Add `#[serde(deserialize_with = "hs_utils::config::deser_<type>")]` to
@@ -74,6 +85,33 @@ pub fn deep_merge(base: &mut Value, overlay: Value) {
             }
         }
         (base, overlay) => *base = overlay,
+    }
+}
+
+/// Recursively walk a `Value` tree and replace any string that starts with
+/// `[SECRET]:` with the contents of the file at the given path.
+///
+/// Trailing newlines are stripped from the file contents so that secrets
+/// produced by tools like `echo "value" > /run/secrets/foo` work correctly.
+///
+/// Should be called **before** `normalize_to_strings` — file contents are
+/// already strings and will pass through unchanged.
+///
+/// A warning is logged (not an error) if a secret file cannot be read, so
+/// that misconfiguration is visible at startup without crashing prematurely.
+pub fn resolve_secrets(v: &mut Value) {
+    const PREFIX: &str = "[SECRET]:";
+    match v {
+        Value::Object(map) => map.values_mut().for_each(resolve_secrets),
+        Value::Array(arr) => arr.iter_mut().for_each(resolve_secrets),
+        Value::String(s) if s.starts_with(PREFIX) => {
+            let path = s[PREFIX.len()..].trim();
+            match std::fs::read_to_string(path) {
+                Ok(content) => *v = Value::String(content.trim_end_matches('\n').to_string()),
+                Err(e) => tracing::warn!("Failed to read secret file '{path}': {e}"),
+            }
+        }
+        _ => {}
     }
 }
 
