@@ -117,10 +117,24 @@ pub async fn build_pool(cfg: &DbConfig) -> Result<PgPool> {
         opts = opts.ssl_root_cert(ca);
     }
 
-    PgPoolOptions::new()
+    tracing::info!(
+        host = %cfg.host,
+        port = %port,
+        user = %cfg.username,
+        "Connecting to database"
+    );
+
+    let result = PgPoolOptions::new()
         .min_connections(cfg.minpool.unwrap_or(0))
         .max_connections(cfg.maxpool.unwrap_or(3))
         .connect_with(opts)
         .await
-        .context("Failed to connect to database")
+        .context("Failed to connect to database");
+
+    match &result {
+        Ok(_) => tracing::info!(host = %cfg.host, user = %cfg.username, "Database connected"),
+        Err(e) => tracing::error!(host = %cfg.host, user = %cfg.username, error = %e, "Database connection failed"),
+    }
+
+    result
 }
