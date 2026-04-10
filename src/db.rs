@@ -66,7 +66,7 @@ pub struct DbConfig {
     #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
     pub maxpool: Option<u32>,
     #[allow(dead_code)]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
     pub debug: Option<bool>,
 }
 
