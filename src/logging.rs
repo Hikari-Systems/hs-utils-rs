@@ -7,5 +7,7 @@ pub fn init(level: &str) {
             tracing_subscriber::EnvFilter::try_new(level)
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_ansi(false)
+        .with_target(false)
         .init();
 }
