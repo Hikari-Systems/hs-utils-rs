@@ -10,3 +10,6 @@ pub mod middleware;
 
 #[cfg(feature = "web")]
 pub mod server;
+
+#[cfg(feature = "mcp-auth")]
+pub mod mcp_auth;
