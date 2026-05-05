@@ -1,11 +1,12 @@
 [package]
 name = "hs-utils"
-version = "0.2.7"
+version = "0.3.0"
 edition = "2021"
 
 [features]
 db = ["dep:sqlx"]
 web = ["dep:actix-web", "dep:actix-service", "dep:actix-http", "dep:futures-util"]
+mcp-auth = ["web", "dep:reqwest"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -18,3 +19,4 @@ actix-web = { version = "4", optional = true }
 actix-service = { version = "2", optional = true }
 actix-http = { version = "3", optional = true }
 futures-util = { version = "0.3", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
