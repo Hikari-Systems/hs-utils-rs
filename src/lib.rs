@@ -13,3 +13,6 @@ pub mod server;
 
 #[cfg(feature = "mcp-auth")]
 pub mod mcp_auth;
+
+#[cfg(feature = "mcp-resource-server")]
+pub mod mcp_resource_server;

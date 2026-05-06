@@ -1,12 +1,26 @@
 [package]
 name = "hs-utils"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [features]
 db = ["dep:sqlx"]
 web = ["dep:actix-web", "dep:actix-service", "dep:actix-http", "dep:futures-util"]
-mcp-auth = ["web", "dep:reqwest"]
+# Framework-free RFC 7591 DCR proxy primitives. Pick an adapter feature below
+# to wire it into your HTTP framework of choice.
+mcp-auth = ["dep:reqwest"]
+mcp-auth-actix = ["mcp-auth", "web"]
+mcp-auth-axum = ["mcp-auth", "dep:axum"]
+# Full MCP resource-server stack: JWT verification, JWKS cache, claim-based
+# user resolver, RFC 9728 metadata routes, axum auth middleware. Pulls the
+# axum DCR adapter so the same router can mount /register too.
+mcp-resource-server = [
+    "mcp-auth-axum",
+    "dep:jsonwebtoken",
+    "dep:moka",
+    "dep:tokio",
+    "dep:uuid",
+]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -20,3 +34,8 @@ actix-service = { version = "2", optional = true }
 actix-http = { version = "3", optional = true }
 futures-util = { version = "0.3", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"], optional = true }
+jsonwebtoken = { version = "9", default-features = false, optional = true }
+moka = { version = "0.12", default-features = false, features = ["future"], optional = true }
+tokio = { version = "1", default-features = false, features = ["sync", "time"], optional = true }
+uuid = { version = "1", features = ["v4", "serde"], optional = true }
