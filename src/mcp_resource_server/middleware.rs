@@ -16,17 +16,18 @@ use axum::{
     Json,
 };
 use serde_json::json;
-use uuid::Uuid;
 
 use super::claims::OauthProfile;
 use super::config::McpAuthConfig;
 use super::jwt::JwtVerifier;
-use super::user_resolver::ClaimsUserResolver;
+use super::kratos_resolver::KratosUserResolver;
 
 /// Per-request auth context attached to the axum request extensions.
 #[derive(Debug, Clone)]
 pub struct AuthExtension {
-    pub user_id: Option<Uuid>,
+    /// The Kratos identity id (== JWT `sub`). Mirrors the TS
+    /// `McpResolvedUser.userId` (a string, not a DB UUID).
+    pub user_id: Option<String>,
     pub profile: Option<OauthProfile>,
     pub sub: Option<String>,
     pub client_id: Option<String>,
@@ -38,7 +39,7 @@ pub struct AuthExtension {
 #[derive(Clone)]
 pub struct AuthState {
     pub verifier: Arc<JwtVerifier>,
-    pub resolver: Arc<ClaimsUserResolver>,
+    pub resolver: Arc<KratosUserResolver>,
     pub auth_cfg: Arc<McpAuthConfig>,
 }
 
@@ -66,7 +67,7 @@ pub async fn auth_middleware(
 
     let scopes = claims.scopes();
     let extension = AuthExtension {
-        user_id: resolved.as_ref().map(|r| r.user_id),
+        user_id: resolved.as_ref().map(|r| r.user_id.clone()),
         profile: resolved.as_ref().map(|r| r.profile.clone()),
         sub: Some(claims.sub.clone()),
         client_id: claims.client_id.clone(),
@@ -78,7 +79,7 @@ pub async fn auth_middleware(
     tracing::debug!(
         target: "auth",
         "{method} {path} userId={user} email={email} name={name} sub={sub} client={client} scopes={scopes}",
-        user = extension.user_id.map(|u| u.to_string()).unwrap_or_else(|| "-".to_string()),
+        user = extension.user_id.clone().unwrap_or_else(|| "-".to_string()),
         email = extension.profile.as_ref().and_then(|p| p.email.clone()).unwrap_or_else(|| "-".to_string()),
         name = extension.profile.as_ref().and_then(|p| p.name.clone()).unwrap_or_else(|| "-".to_string()),
         sub = extension.sub.as_deref().unwrap_or("-"),

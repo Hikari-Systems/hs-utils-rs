@@ -44,6 +44,23 @@ pub struct McpAuthConfig {
     /// IdP post-login action. Defaults to `https://hikari-systems.com/`.
     #[serde(default = "default_namespace")]
     pub claims_namespace: String,
+
+    /// Ory Kratos *admin* API base URL (e.g. `http://kratos:4434`). Used
+    /// by the Kratos user resolver's fallback identity lookup. Optional —
+    /// when absent the resolver runs claims-only (no admin fallback).
+    /// Mirrors the TS `kratos:adminUrl` config key.
+    #[serde(default)]
+    pub kratos_admin_url: Option<String>,
+
+    /// Whether the Kratos resolver may fall back to
+    /// `GET {kratos_admin_url}/admin/identities/{sub}` when the JWT's
+    /// namespaced claims carry no email/name/picture. Mirrors the TS
+    /// `fallbackToKratosAdmin` (default `true`).
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deser_bool_or_str_default_true"
+    )]
+    pub fallback_to_kratos_admin: bool,
 }
 
 impl McpAuthConfig {

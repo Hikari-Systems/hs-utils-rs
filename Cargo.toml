@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 [features]
@@ -11,15 +11,15 @@ web = ["dep:actix-web", "dep:actix-service", "dep:actix-http", "dep:futures-util
 mcp-auth = ["dep:reqwest"]
 mcp-auth-actix = ["mcp-auth", "web"]
 mcp-auth-axum = ["mcp-auth", "dep:axum"]
-# Full MCP resource-server stack: JWT verification, JWKS cache, claim-based
-# user resolver, RFC 9728 metadata routes, axum auth middleware. Pulls the
-# axum DCR adapter so the same router can mount /register too.
+# Full MCP resource-server stack: JWT verification, JWKS cache,
+# Kratos-backed user resolver, RFC 9728 metadata routes, axum auth
+# middleware. Pulls the axum DCR adapter so the same router can mount
+# /register too.
 mcp-resource-server = [
     "mcp-auth-axum",
     "dep:jsonwebtoken",
     "dep:moka",
     "dep:tokio",
-    "dep:uuid",
 ]
 
 [dependencies]
@@ -38,4 +38,6 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 jsonwebtoken = { version = "9", default-features = false, optional = true }
 moka = { version = "0.12", default-features = false, features = ["future"], optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time"], optional = true }
-uuid = { version = "1", features = ["v4", "serde"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }
