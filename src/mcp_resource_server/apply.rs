@@ -93,7 +93,7 @@ pub fn apply_mcp_auth(
     let verifier = Arc::new(JwtVerifier::new(
         Arc::clone(&stores.jwks),
         auth_server_url,
-        cfg.jwks_url.clone(),
+        cfg.jwks_uri.clone(),
         cfg.expected_audience.clone(),
         cfg.clock_skew_seconds,
     ));
