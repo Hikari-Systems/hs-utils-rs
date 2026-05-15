@@ -54,7 +54,12 @@ pub struct McpAuthConfig {
     pub jwks_uri: Option<String>,
 
     /// `mcp:auth:claimsNamespace`. Namespace prefix for custom claims.
-    #[serde(default = "default_namespace")]
+    /// Absent **or empty/whitespace** ⇒ the default
+    /// `https://hikari-systems.com/`, matching the TS
+    /// `claimsNamespaceRaw === '' ? undefined` + resolver-default
+    /// behaviour (so a `"claimsNamespace": ""` config — as
+    /// bioalphaengine-mcp ships — is safe, not a broken empty namespace).
+    #[serde(default = "default_namespace", deserialize_with = "deser_namespace")]
     pub claims_namespace: String,
 
     /// `mcp:auth:allowedAudiences` (comma-separated). Carried for AuthConfig
@@ -182,6 +187,26 @@ where
     }
 }
 
+// Namespace: null / empty / whitespace → the default. Mirrors TS
+// `claimsNamespaceRaw === '' ? undefined` then resolver default.
+fn deser_namespace<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v = serde_json::Value::deserialize(d)?;
+    let s = match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s,
+        _ => return Err(D::Error::custom("expected string for claims_namespace")),
+    };
+    Ok(if s.trim().is_empty() {
+        default_namespace()
+    } else {
+        s
+    })
+}
+
 // Optional CSV/array → Vec<String>, empty when absent/null. Mirrors the
 // TS `parseCsv(config.configString('mcp:auth:allowedAudiences',''))`.
 fn deser_csv_opt<'de, D>(d: D) -> Result<Vec<String>, D::Error>
@@ -243,5 +268,44 @@ where
             .map_err(|e| D::Error::custom(format!("invalid u64: {e}"))),
         serde_json::Value::Null => Ok(default_clock_skew()),
         _ => Err(D::Error::custom("expected number or string")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::McpAuthConfig;
+
+    fn cfg(extra: &str) -> McpAuthConfig {
+        let json = format!(
+            r#"{{"resourceServerUrl":"https://r","expectedAudience":"https://r",
+                 "supportedScopes":"a,b"{extra}}}"#
+        );
+        serde_json::from_str(&json).expect("McpAuthConfig parse")
+    }
+
+    const DEFAULT_NS: &str = "https://hikari-systems.com/";
+
+    #[test]
+    fn claims_namespace_absent_uses_default() {
+        assert_eq!(cfg("").claims_namespace, DEFAULT_NS);
+    }
+
+    #[test]
+    fn claims_namespace_empty_string_uses_default() {
+        // bioalphaengine-mcp ships `"claimsNamespace": ""` — must NOT
+        // become a literal empty namespace (TS-parity).
+        assert_eq!(cfg(r#","claimsNamespace":"""#).claims_namespace, DEFAULT_NS);
+        assert_eq!(
+            cfg(r#","claimsNamespace":"   ""#).claims_namespace,
+            DEFAULT_NS
+        );
+    }
+
+    #[test]
+    fn claims_namespace_explicit_value_kept() {
+        assert_eq!(
+            cfg(r#","claimsNamespace":"https://x/""#).claims_namespace,
+            "https://x/"
+        );
     }
 }
