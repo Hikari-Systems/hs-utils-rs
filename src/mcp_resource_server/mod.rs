@@ -17,11 +17,14 @@
 
 pub mod claims;
 pub mod config;
+pub mod db_stores;
+pub mod hydra_client_store;
 pub mod jwks;
 pub mod jwt;
 pub mod kratos_resolver;
 pub mod metadata;
 pub mod middleware;
+pub mod stores;
 
 pub use claims::OauthProfile;
 pub use config::McpAuthConfig;
@@ -30,4 +33,14 @@ pub use jwt::{JwtClaims, JwtVerifier};
 pub use kratos_resolver::{
     KratosIdentity, KratosIdentityFetcher, KratosUserResolver, ResolvedUser,
 };
+pub use db_stores::{
+    DbAsmCache, DbClientStore, DbDcrRateLimitStore, DbJwksCacheStore,
+    HttpTransport, McpDataServiceClient,
+};
+pub use hydra_client_store::HydraClientStore;
 pub use middleware::{AuthExtension, AuthState};
+pub use stores::{
+    AsmCache, ClientRegistration, ClientStore, DcrRateLimitStore,
+    InMemoryAsmCache, InMemoryClientStore, InMemoryDcrRateLimitStore,
+    InMemoryJwksCacheStore, JsonWebKeySet, JwksCacheEntry, JwksCacheStore,
+};
