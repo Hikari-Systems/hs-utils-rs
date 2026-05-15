@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 
 [features]
@@ -21,6 +21,7 @@ mcp-resource-server = [
     "dep:moka",
     "dep:tokio",
     "dep:async-trait",
+    "dep:uuid",
 ]
 
 [dependencies]
@@ -40,6 +41,7 @@ jsonwebtoken = { version = "9", default-features = false, optional = true }
 moka = { version = "0.12", default-features = false, features = ["future"], optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time"], optional = true }
 async-trait = { version = "0.1", optional = true }
+uuid = { version = "1", default-features = false, features = ["v4"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }

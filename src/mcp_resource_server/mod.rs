@@ -15,9 +15,11 @@
 //! Behind `mcp-resource-server`. Pulls in `mcp-auth-axum` (for the DCR proxy
 //! axum adapter), `jsonwebtoken`, `moka`, `tokio`.
 
+pub mod apply;
 pub mod claims;
 pub mod config;
 pub mod db_stores;
+pub mod dcr;
 pub mod hydra_client_store;
 pub mod jwks;
 pub mod jwt;
@@ -26,9 +28,10 @@ pub mod metadata;
 pub mod middleware;
 pub mod stores;
 
+pub use apply::{apply_mcp_auth, McpAuthStores};
 pub use claims::OauthProfile;
 pub use config::McpAuthConfig;
-pub use jwks::JwksCache;
+pub use dcr::dcr_router;
 pub use jwt::{JwtClaims, JwtVerifier};
 pub use kratos_resolver::{
     KratosIdentity, KratosIdentityFetcher, KratosUserResolver, ResolvedUser,
@@ -38,6 +41,7 @@ pub use db_stores::{
     HttpTransport, McpDataServiceClient,
 };
 pub use hydra_client_store::HydraClientStore;
+pub use metadata::MetadataState;
 pub use middleware::{AuthExtension, AuthState};
 pub use stores::{
     AsmCache, ClientRegistration, ClientStore, DcrRateLimitStore,

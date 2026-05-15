@@ -61,6 +61,25 @@ pub struct McpAuthConfig {
         deserialize_with = "deser_bool_or_str_default_true"
     )]
     pub fallback_to_kratos_admin: bool,
+
+    /// Ory Hydra *admin* API base URL (e.g. `http://hydra:4445`). When set
+    /// (with `kratos_admin_url`), the resource server runs the Hydra+Kratos
+    /// backend: clients are read through Hydra. Mirrors TS `hydra:adminUrl`.
+    #[serde(default)]
+    pub hydra_admin_url: Option<String>,
+
+    /// mcp-data-service base URL backing the shared DCR-rate-limit / JWKS /
+    /// ASM caches. Mirrors TS `mcpDataService:url` (same default).
+    #[serde(default = "default_mcp_data_service_url")]
+    pub mcp_data_service_url: String,
+
+    /// `X-Api-Key` for mcp-data-service. Mirrors TS `mcpDataService:apiKey`.
+    #[serde(default)]
+    pub mcp_data_service_api_key: String,
+}
+
+fn default_mcp_data_service_url() -> String {
+    "http://mcp-data-service:3000".to_string()
 }
 
 impl McpAuthConfig {
