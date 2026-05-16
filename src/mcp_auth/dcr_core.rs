@@ -91,6 +91,15 @@ pub async fn forward_register(cfg: &HydraDcrProxyConfig, body: &[u8]) -> DcrResp
         Value::Array(audience.into_iter().map(Value::String).collect()),
     );
 
+    // Mark proxied MCP clients consent-exempt (gated by config; on by
+    // default). The consent bridge (hs-login-controller) auto-accepts when
+    // the client carries this flag; Hydra may strip it on the public
+    // registration endpoint, in which case the bridge's audience-based
+    // fallback still skips the consent page.
+    if cfg.skip_consent {
+        obj.insert("skip_consent".to_string(), Value::Bool(true));
+    }
+
     let merged_body = match serde_json::to_vec(&Value::Object(obj)) {
         Ok(b) => b,
         Err(e) => {

@@ -8,6 +8,7 @@
 pub struct HydraDcrProxyConfig {
     pub(super) upstream: String,
     pub(super) allowed_audiences: Vec<String>,
+    pub(super) skip_consent: bool,
     pub(super) client: reqwest::Client,
 }
 
@@ -34,8 +35,19 @@ impl HydraDcrProxyConfig {
         Self {
             upstream,
             allowed_audiences,
+            // Consent-exempt by default; callers opt out via
+            // `with_skip_consent(false)`.
+            skip_consent: true,
             client: reqwest::Client::new(),
         }
+    }
+
+    /// Control whether proxied client registrations are marked
+    /// consent-exempt (`skip_consent: true` injected into the body).
+    /// Defaults to `true`.
+    pub fn with_skip_consent(mut self, skip_consent: bool) -> Self {
+        self.skip_consent = skip_consent;
+        self
     }
 
     /// Build with a caller-supplied `reqwest::Client` (e.g. when sharing a
