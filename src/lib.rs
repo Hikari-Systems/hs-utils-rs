@@ -16,3 +16,6 @@ pub mod mcp_auth;
 
 #[cfg(feature = "mcp-resource-server")]
 pub mod mcp_resource_server;
+
+#[cfg(feature = "web-login")]
+pub mod web_login;
