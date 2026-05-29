@@ -87,7 +87,7 @@ impl HttpTransport for ReqwestTransport {
 }
 
 /// Percent-encode a URL component (mirrors TS `encodeURIComponent`).
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -143,7 +143,7 @@ impl McpDataServiceClient {
         }
     }
 
-    async fn req(
+    pub(crate) async fn req(
         &self,
         method: &str,
         path_and_query: &str,

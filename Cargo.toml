@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 
 [features]
@@ -26,6 +26,9 @@ mcp-resource-server = [
 # Browser (Authorization-Code) OAuth2 login with a cookie session, backed by
 # Kratos (reuses the resource-server's KratosUserResolver + claims).
 web-login = ["mcp-resource-server"]
+# mcp-data-service-backed rmcp SessionStore for cross-replica streamable-HTTP
+# sessions. Pulls rmcp to implement its SessionStore trait.
+mcp-session-store = ["mcp-resource-server", "dep:rmcp"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -45,6 +48,7 @@ moka = { version = "0.12", default-features = false, features = ["future"], opti
 tokio = { version = "1", default-features = false, features = ["sync", "time"], optional = true }
 async-trait = { version = "0.1", optional = true }
 uuid = { version = "1", default-features = false, features = ["v4"], optional = true }
+rmcp = { version = "1.6", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }

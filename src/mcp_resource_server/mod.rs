@@ -18,6 +18,8 @@
 pub mod apply;
 pub mod claims;
 pub mod config;
+#[cfg(feature = "mcp-session-store")]
+pub mod db_session_store;
 pub mod db_stores;
 pub mod dcr;
 pub mod hydra_client_store;
@@ -40,6 +42,10 @@ pub use db_stores::{
     DbAsmCache, DbClientStore, DbDcrRateLimitStore, DbJwksCacheStore,
     HttpTransport, McpDataServiceClient,
 };
+#[cfg(feature = "mcp-session-store")]
+pub use db_session_store::DbSessionStore;
+#[cfg(feature = "mcp-session-store")]
+pub use rmcp::transport::streamable_http_server::session::store::{SessionState, SessionStore};
 pub use hydra_client_store::HydraClientStore;
 pub use metadata::MetadataState;
 pub use middleware::{AuthExtension, AuthState};
