@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 
 [features]
@@ -26,6 +26,10 @@ mcp-resource-server = [
 # Browser (Authorization-Code) OAuth2 login with a cookie session, backed by
 # Kratos (reuses the resource-server's KratosUserResolver + claims).
 web-login = ["mcp-resource-server"]
+# Redis (Sentinel) cross-replica session store for web-login. Reuses the
+# FalkorDB Sentinel cluster (redis) on a dedicated db index, so browser login
+# survives multiple replicas behind a load balancer.
+web-login-redis = ["web-login", "dep:redis"]
 # mcp-data-service-backed rmcp SessionStore for cross-replica streamable-HTTP
 # sessions. Pulls rmcp to implement its SessionStore trait.
 mcp-session-store = ["mcp-resource-server", "dep:rmcp"]
@@ -49,6 +53,7 @@ tokio = { version = "1", default-features = false, features = ["sync", "time"], 
 async-trait = { version = "0.1", optional = true }
 uuid = { version = "1", default-features = false, features = ["v4"], optional = true }
 rmcp = { version = "1.6", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
+redis = { version = "0.27", features = ["tokio-comp", "sentinel", "connection-manager"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }

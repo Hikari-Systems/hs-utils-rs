@@ -5,7 +5,7 @@
 //! `lib/oauth2-kratos.ts` (`authorizeKratosMiddleware`). The flow:
 //!   1. An un-authenticated request to a protected route is redirected to the
 //!      provider's `authorize` endpoint (`response_type=code`), with a random
-//!      `state` → original URL stored in the cookie session.
+//!      `state` → original URL stored in the session.
 //!   2. The provider redirects back to `{callback_uri}` with `code`+`state`.
 //!      [`callback`] exchanges the code for tokens
 //!      ([`do_token_exchange`]), fetches userinfo
@@ -22,11 +22,23 @@
 //! wrapped. Mount [`WebLogin::callback_router`] (public) and apply
 //! [`WebLogin::gate_state`] + [`gate`] via `from_fn_with_state` to the routes
 //! you want behind login.
+//!
+//! # Session storage
+//!
+//! Both the OAuth `state → original-URL` map and the post-login session are
+//! held in a [`WebSessionStore`], keyed by the `hs_session` cookie. The
+//! default ([`InMemorySessionStore`]) keeps them in this process's memory —
+//! correct for a single replica, but it breaks behind a load balancer: the
+//! `gate` that starts the flow and the `callback` that finishes it can land on
+//! different replicas, so the callback finds "no stored state" and 400s. For a
+//! multi-replica deployment construct [`WebLogin::with_store`] with a shared
+//! store (see the `web-login-redis` feature's `RedisSessionStore`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::{Query, Request, State},
@@ -36,10 +48,13 @@ use axum::{
     routing::get,
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::mcp_resource_server::kratos_resolver::KratosUserResolver;
+
+/// Default session TTL (24h) used by [`WebLogin::new`]'s in-memory store.
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -114,19 +129,86 @@ impl WebLoginConfig {
 }
 
 /// One server-side session, keyed by the `sid` cookie. Mirrors the express
-/// `req.session` used by the TS middleware.
-#[derive(Debug, Clone, Default)]
-struct Session {
+/// `req.session` used by the TS middleware. Serializable so it can live in a
+/// shared store (e.g. redis) and be restored on any replica.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Session {
+    #[serde(default)]
     user_id: Option<String>,
+    #[serde(default)]
     profile: Option<Value>,
+    #[serde(default)]
     access_token: Option<String>,
+    #[serde(default)]
     refresh_token: Option<String>,
+    #[serde(default)]
     expires_at: Option<i64>,
     /// `state` → original URL, set at redirect time, consumed at callback.
+    #[serde(default)]
     redirects: HashMap<String, String>,
 }
 
-type Sessions = Arc<Mutex<HashMap<String, Session>>>;
+/// Pluggable backing store for [`Session`]s, keyed by the `sid` cookie.
+///
+/// Reads return `None` when the session is absent (or on a backend failure —
+/// stores should fail open so an outage degrades to "log in again" rather than
+/// erroring every request). Writes are best-effort. Implementations are
+/// responsible for expiry (TTL).
+#[async_trait]
+pub trait WebSessionStore: Send + Sync {
+    async fn load(&self, sid: &str) -> Option<Session>;
+    async fn store(&self, sid: &str, session: &Session);
+    async fn remove(&self, sid: &str);
+}
+
+/// In-process [`WebSessionStore`] (a `HashMap` with lazy TTL eviction). The
+/// default; fine for a single replica. NOT shared across replicas — see the
+/// module docs.
+pub struct InMemorySessionStore {
+    map: Mutex<HashMap<String, (Session, Instant)>>,
+    ttl: Duration,
+}
+
+impl InMemorySessionStore {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+}
+
+impl Default for InMemorySessionStore {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(DEFAULT_SESSION_TTL_SECS))
+    }
+}
+
+#[async_trait]
+impl WebSessionStore for InMemorySessionStore {
+    async fn load(&self, sid: &str) -> Option<Session> {
+        let mut map = self.map.lock().unwrap();
+        match map.get(sid) {
+            Some((s, exp)) if *exp > Instant::now() => Some(s.clone()),
+            Some(_) => {
+                map.remove(sid);
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn store(&self, sid: &str, session: &Session) {
+        self.map
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), (session.clone(), Instant::now() + self.ttl));
+    }
+
+    async fn remove(&self, sid: &str) {
+        self.map.lock().unwrap().remove(sid);
+    }
+}
 
 /// The logged-in user, inserted into request extensions by [`gate`] so
 /// downstream handlers can read who is authenticated.
@@ -140,7 +222,7 @@ pub struct CurrentUser {
 #[derive(Clone)]
 pub struct WebLogin {
     cfg: Arc<WebLoginConfig>,
-    sessions: Sessions,
+    store: Arc<dyn WebSessionStore>,
     resolver: Arc<KratosUserResolver>,
     http: reqwest::Client,
 }
@@ -153,10 +235,26 @@ pub struct GateState {
 }
 
 impl WebLogin {
+    /// Construct with the default in-process [`InMemorySessionStore`]. Use
+    /// [`WebLogin::with_store`] for a shared store across replicas.
     pub fn new(cfg: WebLoginConfig, resolver: Arc<KratosUserResolver>) -> Self {
+        Self::with_store(
+            cfg,
+            resolver,
+            Arc::new(InMemorySessionStore::default()),
+        )
+    }
+
+    /// Construct with a caller-supplied [`WebSessionStore`] (e.g. a shared
+    /// redis-backed store for a multi-replica deployment).
+    pub fn with_store(
+        cfg: WebLoginConfig,
+        resolver: Arc<KratosUserResolver>,
+        store: Arc<dyn WebSessionStore>,
+    ) -> Self {
         Self {
             cfg: Arc::new(cfg),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            store,
             resolver,
             http: reqwest::Client::new(),
         }
@@ -208,32 +306,26 @@ impl WebLogin {
     /// the TS `getAccessToken`). For consumers that need to call downstream
     /// APIs on the user's behalf; not needed for page-access checks.
     pub async fn access_token(&self, sid: &str) -> Option<String> {
-        let (tok, refresh, exp) = {
-            let store = self.sessions.lock().unwrap();
-            let u = store.get(sid)?;
-            (u.access_token.clone(), u.refresh_token.clone(), u.expires_at)
-        };
-        let expired = exp.map(|e| e <= now_secs()).unwrap_or(false);
-        if tok.is_some() && !expired {
-            return tok;
+        let mut sess = self.store.load(sid).await?;
+        let expired = sess.expires_at.map(|e| e <= now_secs()).unwrap_or(false);
+        if let Some(tok) = sess.access_token.clone() {
+            if !expired {
+                return Some(tok);
+            }
         }
-        if let Some(rt) = refresh {
+        if let Some(rt) = sess.refresh_token.clone() {
             if let Ok(t) = do_token_refresh(&self.http, &self.cfg, &rt).await {
-                let mut store = self.sessions.lock().unwrap();
-                if let Some(u) = store.get_mut(sid) {
-                    u.access_token = Some(t.access_token.clone());
-                    u.refresh_token = t.refresh_token.clone();
-                    u.expires_at = t.expires_in.map(|e| now_secs() + e);
-                }
+                sess.access_token = Some(t.access_token.clone());
+                sess.refresh_token = t.refresh_token.clone();
+                sess.expires_at = t.expires_in.map(|e| now_secs() + e);
+                self.store.store(sid, &sess).await;
                 return Some(t.access_token);
             }
         }
-        let mut store = self.sessions.lock().unwrap();
-        if let Some(u) = store.get_mut(sid) {
-            u.access_token = None;
-            u.refresh_token = None;
-            u.expires_at = None;
-        }
+        sess.access_token = None;
+        sess.refresh_token = None;
+        sess.expires_at = None;
+        self.store.store(sid, &sess).await;
         None
     }
 }
@@ -364,12 +456,11 @@ async fn callback(
     let Some(sid) = read_cookie(&headers, &wl.cfg.cookie_name) else {
         return bad_request("no session cookie");
     };
-    let orig = {
-        let store = wl.sessions.lock().unwrap();
-        store
-            .get(&sid)
-            .and_then(|s| s.redirects.get(&state_key).cloned())
-    };
+    let orig = wl
+        .store
+        .load(&sid)
+        .await
+        .and_then(|s| s.redirects.get(&state_key).cloned());
     let Some(orig) = orig else {
         tracing::warn!(state = %state_key, "web_login: no stored state");
         return bad_request("no state found");
@@ -397,14 +488,14 @@ async fn callback(
     };
 
     {
-        let mut store = wl.sessions.lock().unwrap();
-        let sess = store.entry(sid).or_default();
+        let mut sess = wl.store.load(&sid).await.unwrap_or_default();
         sess.redirects.remove(&state_key);
         sess.user_id = Some(resolved.user_id.clone());
         sess.profile = serde_json::to_value(&resolved.profile).ok();
         sess.access_token = Some(token.access_token);
         sess.refresh_token = token.refresh_token;
         sess.expires_at = token.expires_in.map(|e| now_secs() + e);
+        wl.store.store(&sid, &sess).await;
     }
     tracing::debug!(user = %resolved.user_id, "web_login: login complete, redirecting to {orig}");
     see_other(&orig, None)
@@ -422,18 +513,17 @@ pub async fn gate(State(g): State<GateState>, req: Request, next: Next) -> Respo
         Some(s) => (s, None),
         None => {
             let s = uuid::Uuid::new_v4().to_string();
-            wl.sessions.lock().unwrap().entry(s.clone()).or_default();
+            wl.store.store(&s, &Session::default()).await;
             let cookie = build_set_cookie(&wl.cfg, &s);
             (s, Some(cookie))
         }
     };
 
-    let user = {
-        let store = wl.sessions.lock().unwrap();
-        store
-            .get(&sid)
-            .and_then(|s| s.user_id.clone().map(|uid| (uid, s.profile.clone())))
-    };
+    let user = wl
+        .store
+        .load(&sid)
+        .await
+        .and_then(|s| s.user_id.clone().map(|uid| (uid, s.profile.clone())));
 
     if let Some((user_id, profile)) = user {
         let mut req = req;
@@ -461,12 +551,9 @@ pub async fn gate(State(g): State<GateState>, req: Request, next: Next) -> Respo
         .unwrap_or_else(|| "/".to_string());
     let state_key = uuid::Uuid::new_v4().to_string();
     {
-        let mut store = wl.sessions.lock().unwrap();
-        store
-            .entry(sid)
-            .or_default()
-            .redirects
-            .insert(state_key.clone(), orig);
+        let mut sess = wl.store.load(&sid).await.unwrap_or_default();
+        sess.redirects.insert(state_key.clone(), orig);
+        wl.store.store(&sid, &sess).await;
     }
     see_other(&wl.authorize_url(&state_key), set_cookie)
 }
@@ -544,5 +631,25 @@ mod tests {
         // a name that is only a prefix of a different cookie must not match
         assert_eq!(read_cookie(&h, "hs_sess"), None);
         assert_eq!(read_cookie(&h, "missing"), None);
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_roundtrip_and_expiry() {
+        let store = InMemorySessionStore::new(Duration::from_secs(60));
+        assert!(store.load("sid").await.is_none());
+        let mut s = Session::default();
+        s.user_id = Some("u1".into());
+        s.redirects.insert("st".into(), "/orig".into());
+        store.store("sid", &s).await;
+        let got = store.load("sid").await.expect("present");
+        assert_eq!(got.user_id.as_deref(), Some("u1"));
+        assert_eq!(got.redirects.get("st").map(String::as_str), Some("/orig"));
+        store.remove("sid").await;
+        assert!(store.load("sid").await.is_none());
+
+        // already-expired entry is evicted on load
+        let expired = InMemorySessionStore::new(Duration::from_secs(0));
+        expired.store("sid", &Session::default()).await;
+        assert!(expired.load("sid").await.is_none());
     }
 }

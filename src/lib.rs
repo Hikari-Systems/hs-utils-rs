@@ -19,3 +19,6 @@ pub mod mcp_resource_server;
 
 #[cfg(feature = "web-login")]
 pub mod web_login;
+
+#[cfg(feature = "web-login-redis")]
+pub mod web_login_redis;
