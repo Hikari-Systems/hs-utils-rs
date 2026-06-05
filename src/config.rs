@@ -142,6 +142,63 @@ fn set_nested(node: &mut Value, path: &[&str], val: &str) {
     }
 }
 
+// ── Layered loader ───────────────────────────────────────────────────────────
+
+/// Container-standard layered config load.
+///
+/// 1. Reads the **base** config — `/app/config.json` (the image-baked default)
+///    when it exists, falling back to `config.json` in the cwd for local dev
+///    and tests.
+/// 2. If `${CONFIG_PATH:-/sandbox}/config.json` exists, **deep-merges** it OVER
+///    the base — the per-environment overlay mounted at `/sandbox`. `CONFIG_PATH`
+///    selects the overlay *directory* and defaults to `/sandbox`.
+/// 3. Resolves `[SECRET]:` indirections + stringifies scalars (`prepare_config`),
+///    then applies `__`-flattened env overrides (`apply_env_overrides`).
+///
+/// Returns the merged `Value`; the caller does `serde_json::from_value`. This is
+/// the loader hs Rust services should call — no service hand-rolls config-file
+/// reading or overlay merging.
+pub fn load_layered_value() -> anyhow::Result<Value> {
+    let base_path = if std::path::Path::new("/app/config.json").exists() {
+        "/app/config.json".to_string()
+    } else {
+        "config.json".to_string()
+    };
+    let sandbox_dir = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "/sandbox".to_string());
+    load_layered_from(&base_path, &sandbox_dir)
+}
+
+/// Testable core of [`load_layered_value`]: read `base_path`, deep-merge
+/// `{sandbox_dir}/config.json` over it (when present), then prepare + apply env.
+pub fn load_layered_from(base_path: &str, sandbox_dir: &str) -> anyhow::Result<Value> {
+    use anyhow::Context as _;
+
+    let text = std::fs::read_to_string(base_path)
+        .with_context(|| format!("read base config '{base_path}'"))?;
+    let mut root: Value =
+        serde_json::from_str(&text).with_context(|| format!("parse base config '{base_path}'"))?;
+
+    let overlay_path = format!("{}/config.json", sandbox_dir.trim_end_matches('/'));
+    match std::fs::read_to_string(&overlay_path) {
+        Ok(otext) => {
+            let overlay: Value = serde_json::from_str(&otext)
+                .with_context(|| format!("parse overlay config '{overlay_path}'"))?;
+            deep_merge(&mut root, overlay);
+            tracing::info!("config: merged overlay '{overlay_path}' over '{base_path}'");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("config: no overlay at '{overlay_path}'; using '{base_path}' only");
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("read overlay config '{overlay_path}'"));
+        }
+    }
+
+    prepare_config(&mut root);
+    apply_env_overrides(&mut root);
+    Ok(root)
+}
+
 // ── Deserializers ────────────────────────────────────────────────────────────
 //
 // Each function accepts both the native JSON type and its string encoding.
@@ -478,4 +535,64 @@ where
         }
     }
     d.deserialize_any(V)
+}
+
+#[cfg(test)]
+mod layered_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_deep_merges_over_base() {
+        // Unique temp dirs (no Date/rand needed — use the test thread id space).
+        let root = std::env::temp_dir().join(format!("hsutils_layered_{}", std::process::id()));
+        let base_dir = root.join("app");
+        let sandbox_dir = root.join("sandbox");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+
+        let base_path = base_dir.join("config.json");
+        std::fs::write(
+            &base_path,
+            r#"{ "server": { "port": 3000 }, "falkordb": { "host": "baked", "graphName": "g" } }"#,
+        )
+        .unwrap();
+        // Overlay changes host + adds a key; leaves graphName + port untouched.
+        std::fs::write(
+            sandbox_dir.join("config.json"),
+            r#"{ "falkordb": { "host": "from-sandbox" }, "log": { "level": "debug" } }"#,
+        )
+        .unwrap();
+
+        let v = load_layered_from(
+            base_path.to_str().unwrap(),
+            sandbox_dir.to_str().unwrap(),
+        )
+        .unwrap();
+
+        // overlay wins; sibling base keys preserved; new overlay key present.
+        assert_eq!(v["falkordb"]["host"], Value::String("from-sandbox".into()));
+        assert_eq!(v["falkordb"]["graphName"], Value::String("g".into()));
+        assert_eq!(v["log"]["level"], Value::String("debug".into()));
+        // prepare_config stringified the scalar.
+        assert_eq!(v["server"]["port"], Value::String("3000".into()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_overlay_uses_base_only() {
+        let root = std::env::temp_dir().join(format!("hsutils_base_{}", std::process::id()));
+        let base_dir = root.join("app");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let base_path = base_dir.join("config.json");
+        std::fs::write(&base_path, r#"{ "falkordb": { "host": "baked" } }"#).unwrap();
+
+        let v = load_layered_from(
+            base_path.to_str().unwrap(),
+            root.join("does-not-exist").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["falkordb"]["host"], Value::String("baked".into()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
