@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 
 [features]
@@ -30,6 +30,10 @@ web-login = ["mcp-resource-server"]
 # FalkorDB Sentinel cluster (redis) on a dedicated db index, so browser login
 # survives multiple replicas behind a load balancer.
 web-login-redis = ["web-login", "dep:redis"]
+# Postgres cross-replica session store for web-login. Persists sessions in a
+# `web_sessions` table over the service's existing PgPool, so browser login
+# survives multiple replicas behind a load balancer without a redis dependency.
+web-login-postgres = ["web-login", "db"]
 # mcp-data-service-backed rmcp SessionStore for cross-replica streamable-HTTP
 # sessions. Pulls rmcp to implement its SessionStore trait.
 mcp-session-store = ["mcp-resource-server", "dep:rmcp"]
@@ -40,7 +44,7 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"], optional = true }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "json"], optional = true }
 actix-web = { version = "4", optional = true }
 actix-service = { version = "2", optional = true }
 actix-http = { version = "3", optional = true }
