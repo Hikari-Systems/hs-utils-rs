@@ -43,3 +43,31 @@ fn get_string_claim(payload: &Value, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
 }
+
+/// Namespaced Kratos claims, mirroring the TypeScript
+/// `lib/kratos/claims.ts:readKratosClaims`. The Hydra consent app injects
+/// `${ns}email` / `${ns}name` / `${ns}pictureId` off the Kratos identity
+/// traits. NB this differs from [`build_profile`] (the Auth0 reader, which
+/// reads `${ns}picture` + `${ns}email_verified`).
+#[derive(Debug, Clone, Default)]
+pub struct KratosClaimProfile {
+    pub email: Option<String>,
+    pub name: Option<String>,
+    /// `${ns}pictureId` — the image-service UUID, mapped into
+    /// `OauthProfile.picture` by the Kratos resolver.
+    pub picture_image_service_id: Option<String>,
+}
+
+/// Read the namespaced Kratos claims off a verified JWT payload. Returns
+/// `None`-valued fields when a claim is absent or empty so the caller can
+/// decide whether to fall back to a Kratos admin lookup.
+pub fn read_kratos_claims(payload: &Value, namespace: &str) -> KratosClaimProfile {
+    KratosClaimProfile {
+        email: get_string_claim(payload, &format!("{namespace}email")),
+        name: get_string_claim(payload, &format!("{namespace}name")),
+        picture_image_service_id: get_string_claim(
+            payload,
+            &format!("{namespace}pictureId"),
+        ),
+    }
+}

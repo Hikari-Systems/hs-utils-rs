@@ -16,3 +16,12 @@ pub mod mcp_auth;
 
 #[cfg(feature = "mcp-resource-server")]
 pub mod mcp_resource_server;
+
+#[cfg(feature = "web-login")]
+pub mod web_login;
+
+#[cfg(feature = "web-login-redis")]
+pub mod web_login_redis;
+
+#[cfg(feature = "web-login-postgres")]
+pub mod web_login_postgres;

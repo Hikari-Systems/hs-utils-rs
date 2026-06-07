@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.4.0"
+version = "0.13.0"
 edition = "2021"
 
 [features]
@@ -11,16 +11,32 @@ web = ["dep:actix-web", "dep:actix-service", "dep:actix-http", "dep:futures-util
 mcp-auth = ["dep:reqwest"]
 mcp-auth-actix = ["mcp-auth", "web"]
 mcp-auth-axum = ["mcp-auth", "dep:axum"]
-# Full MCP resource-server stack: JWT verification, JWKS cache, claim-based
-# user resolver, RFC 9728 metadata routes, axum auth middleware. Pulls the
-# axum DCR adapter so the same router can mount /register too.
+# Full MCP resource-server stack: JWT verification, JWKS cache,
+# Kratos-backed user resolver, RFC 9728 metadata routes, axum auth
+# middleware. Pulls the axum DCR adapter so the same router can mount
+# /register too.
 mcp-resource-server = [
     "mcp-auth-axum",
     "dep:jsonwebtoken",
     "dep:moka",
     "dep:tokio",
+    "dep:async-trait",
     "dep:uuid",
 ]
+# Browser (Authorization-Code) OAuth2 login with a cookie session, backed by
+# Kratos (reuses the resource-server's KratosUserResolver + claims).
+web-login = ["mcp-resource-server"]
+# Redis (Sentinel) cross-replica session store for web-login. Reuses the
+# FalkorDB Sentinel cluster (redis) on a dedicated db index, so browser login
+# survives multiple replicas behind a load balancer.
+web-login-redis = ["web-login", "dep:redis"]
+# Postgres cross-replica session store for web-login. Persists sessions in a
+# `web_sessions` table over the service's existing PgPool, so browser login
+# survives multiple replicas behind a load balancer without a redis dependency.
+web-login-postgres = ["web-login", "db"]
+# mcp-data-service-backed rmcp SessionStore for cross-replica streamable-HTTP
+# sessions. Pulls rmcp to implement its SessionStore trait.
+mcp-session-store = ["mcp-resource-server", "dep:rmcp"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -28,14 +44,20 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"], optional = true }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "json"], optional = true }
 actix-web = { version = "4", optional = true }
 actix-service = { version = "2", optional = true }
 actix-http = { version = "3", optional = true }
 futures-util = { version = "0.3", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"], optional = true }
 jsonwebtoken = { version = "9", default-features = false, optional = true }
 moka = { version = "0.12", default-features = false, features = ["future"], optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time"], optional = true }
-uuid = { version = "1", features = ["v4", "serde"], optional = true }
+async-trait = { version = "0.1", optional = true }
+uuid = { version = "1", default-features = false, features = ["v4"], optional = true }
+rmcp = { version = "1.6", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
+redis = { version = "0.27", features = ["tokio-comp", "sentinel", "connection-manager"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }

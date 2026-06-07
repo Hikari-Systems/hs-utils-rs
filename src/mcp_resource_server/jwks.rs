@@ -1,139 +1,94 @@
-//! JWKS fetcher with single-flight refresh and TTL caching.
+//! JWKS helpers: discover the `jwks_uri`, fetch the JWKS document, and
+//! resolve a `kid` to a `DecodingKey`.
 //!
-//! On first request for a `kid`, fetches the full JWKS document from the
-//! configured URL, caches each key for `JWKS_TTL`, and returns the matching
-//! `DecodingKey`. Concurrent fetches for an unknown `kid` deduplicate via a
-//! tokio mutex around the fetch step.
-
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+//! Mirrors the TS `tokenVerifier.ts` discovery/fetch logic. The *cache*
+//! lives behind the [`super::stores::JwksCacheStore`] trait (in-memory,
+//! or mcp-data-service-backed) — this module is stateless and only does
+//! the discovery + parse, exactly like the TS helpers.
 
 use anyhow::{anyhow, Context, Result};
 use jsonwebtoken::DecodingKey;
-use moka::future::Cache;
-use serde::Deserialize;
-use tokio::sync::Mutex;
+use serde_json::Value;
 
-const JWKS_TTL: Duration = Duration::from_secs(60 * 60); // 1 hour
-const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+use super::stores::JsonWebKeySet;
 
-#[derive(Debug, Deserialize)]
-struct Jwks {
-    keys: Vec<Jwk>,
+const JWKS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<Value> {
+    let resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .timeout(JWKS_FETCH_TIMEOUT)
+        .send()
+        .await
+        .with_context(|| format!("fetch {url}"))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("HTTP {} fetching {url}", resp.status()));
+    }
+    resp.json::<Value>()
+        .await
+        .with_context(|| format!("parse JSON from {url}"))
 }
 
-#[derive(Debug, Deserialize)]
-struct Jwk {
-    kty: String,
-    #[serde(default)]
-    kid: Option<String>,
-    #[serde(default)]
-    n: Option<String>,
-    #[serde(default)]
-    e: Option<String>,
-    #[serde(default, rename = "use")]
-    use_: Option<String>,
-    #[serde(default)]
-    alg: Option<String>,
+/// `config.jwks_url` override, else the AS-metadata `jwks_uri`. Mirrors
+/// `tokenVerifier.ts:discoverJwksUri`.
+pub async fn discover_jwks_uri(
+    client: &reqwest::Client,
+    auth_server_url: &str,
+    jwks_url_override: Option<&str>,
+) -> Result<String> {
+    if let Some(u) = jwks_url_override {
+        if !u.is_empty() {
+            return Ok(u.to_string());
+        }
+    }
+    let upstream = format!(
+        "{}/.well-known/oauth-authorization-server",
+        auth_server_url.trim_end_matches('/')
+    );
+    let meta = fetch_json(client, &upstream).await?;
+    match meta.get("jwks_uri").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => Ok(s.to_string()),
+        _ => Err(anyhow!(
+            "AS metadata at {upstream} did not include a jwks_uri"
+        )),
+    }
 }
 
-/// JWKS fetcher + per-`kid` decoding-key cache.
-pub struct JwksCache {
-    jwks_url: String,
-    client: reqwest::Client,
-    keys: Cache<String, Arc<DecodingKey>>,
-    fetch_lock: Mutex<()>,
+/// Fetch the JWKS document. Mirrors `tokenVerifier.ts:fetchJwks`.
+pub async fn fetch_jwks(client: &reqwest::Client, jwks_uri: &str) -> Result<JsonWebKeySet> {
+    let body = fetch_json(client, jwks_uri).await?;
+    let keys = body
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("JWKS at {jwks_uri} did not contain a keys array"))?;
+    Ok(JsonWebKeySet { keys: keys.clone() })
 }
 
-impl JwksCache {
-    pub fn new(jwks_url: impl Into<String>) -> Self {
-        Self::with_client(jwks_url, reqwest::Client::new())
+/// Resolve a `kid` within a JWKS document to a `DecodingKey`. RSA only
+/// (the platform's signing keys); `use:enc` keys are skipped.
+pub fn decoding_key_for_kid(doc: &JsonWebKeySet, kid: &str) -> Result<DecodingKey> {
+    for jwk in &doc.keys {
+        if jwk.get("kid").and_then(Value::as_str) != Some(kid) {
+            continue;
+        }
+        if jwk.get("use").and_then(Value::as_str) == Some("enc") {
+            continue;
+        }
+        let kty = jwk.get("kty").and_then(Value::as_str).unwrap_or("");
+        if kty != "RSA" {
+            return Err(anyhow!("JWKS key kid={kid} kty={kty} unsupported"));
+        }
+        let n = jwk
+            .get("n")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("RSA jwk kid={kid} missing n"))?;
+        let e = jwk
+            .get("e")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("RSA jwk kid={kid} missing e"))?;
+        return DecodingKey::from_rsa_components(n, e)
+            .with_context(|| format!("parse RSA jwk kid={kid}"));
     }
-
-    pub fn with_client(jwks_url: impl Into<String>, client: reqwest::Client) -> Self {
-        Self {
-            jwks_url: jwks_url.into(),
-            client,
-            keys: Cache::builder()
-                .time_to_live(JWKS_TTL)
-                .max_capacity(64)
-                .build(),
-            fetch_lock: Mutex::new(()),
-        }
-    }
-
-    /// Get the decoding key for a JWT `kid`. Hits cache first; on miss,
-    /// fetches the full JWKS document and populates the cache for every
-    /// key it contains, then returns the one matching `kid`.
-    pub async fn get_key(&self, kid: &str) -> Result<Arc<DecodingKey>> {
-        if let Some(key) = self.keys.get(kid).await {
-            return Ok(key);
-        }
-
-        // Single-flight: serialise concurrent miss-refreshes for the same
-        // JWKS url. Re-check after acquiring the lock — another task may
-        // have populated the entry already.
-        let _guard = self.fetch_lock.lock().await;
-        if let Some(key) = self.keys.get(kid).await {
-            return Ok(key);
-        }
-
-        let map = self.fetch_jwks().await?;
-        for (k, v) in map {
-            self.keys.insert(k, v).await;
-        }
-        self.keys
-            .get(kid)
-            .await
-            .ok_or_else(|| anyhow!("JWKS did not contain a key for kid={kid}"))
-    }
-
-    async fn fetch_jwks(&self) -> Result<HashMap<String, Arc<DecodingKey>>> {
-        let resp = self
-            .client
-            .get(&self.jwks_url)
-            .timeout(JWKS_FETCH_TIMEOUT)
-            .send()
-            .await
-            .with_context(|| format!("fetch JWKS from {}", self.jwks_url))?;
-        if !resp.status().is_success() {
-            return Err(anyhow!(
-                "JWKS fetch returned status {} from {}",
-                resp.status(),
-                self.jwks_url
-            ));
-        }
-        let jwks: Jwks = resp.json().await.context("parse JWKS body")?;
-
-        let mut out = HashMap::new();
-        for jwk in jwks.keys {
-            if jwk.use_.as_deref() == Some("enc") {
-                continue;
-            }
-            let Some(kid) = jwk.kid.clone() else {
-                tracing::warn!("JWKS entry missing kid, skipping");
-                continue;
-            };
-            let key = match jwk.kty.as_str() {
-                "RSA" => match (jwk.n.as_deref(), jwk.e.as_deref()) {
-                    (Some(n), Some(e)) => DecodingKey::from_rsa_components(n, e)
-                        .with_context(|| format!("parse RSA jwk for kid={kid}"))?,
-                    _ => {
-                        tracing::warn!("RSA jwk for kid={kid} missing n/e, skipping");
-                        continue;
-                    }
-                },
-                other => {
-                    tracing::warn!(
-                        "JWKS key kty={other} alg={:?} for kid={kid} not supported, skipping",
-                        jwk.alg
-                    );
-                    continue;
-                }
-            };
-            out.insert(kid, Arc::new(key));
-        }
-        Ok(out)
-    }
+    Err(anyhow!("JWKS did not contain a key for kid={kid}"))
 }

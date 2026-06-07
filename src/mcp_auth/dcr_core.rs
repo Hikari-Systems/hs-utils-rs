@@ -91,6 +91,15 @@ pub async fn forward_register(cfg: &HydraDcrProxyConfig, body: &[u8]) -> DcrResp
         Value::Array(audience.into_iter().map(Value::String).collect()),
     );
 
+    // NOTE: `skip_consent` is intentionally NOT injected into the public
+    // registration body. It is an Ory privileged client field; Hydra v2
+    // (≥ v26) rejects the *entire* `/oauth2/register` request with
+    // `invalid_request` when it is present (it does not silently strip it).
+    // Consent exemption is instead applied after creation via the admin API
+    // (`mark_skip_consent` below). This deliberately diverges from
+    // hs.utils/lib/mcp-auth/hydraDcrProxy.ts, which still injects it and is
+    // affected by the same Hydra rejection.
+
     let merged_body = match serde_json::to_vec(&Value::Object(obj)) {
         Ok(b) => b,
         Err(e) => {
@@ -140,9 +149,69 @@ pub async fn forward_register(cfg: &HydraDcrProxyConfig, body: &[u8]) -> DcrResp
         }
     };
 
+    // Finalise consent exemption out-of-band. The public DCR response is
+    // returned to the caller verbatim regardless of the outcome here: the
+    // client is already registered and functional, and the consent bridge
+    // has an audience-based fallback, so a failed admin PATCH must not turn
+    // a successful registration into an error.
+    if cfg.skip_consent && (200..300).contains(&status) {
+        match serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.get("client_id"))
+            .and_then(Value::as_str)
+        {
+            Some(client_id) => mark_skip_consent(cfg, client_id).await,
+            None => tracing::warn!(
+                "DCR proxy: registration succeeded but response had no \
+                 client_id; skipping skip_consent admin patch"
+            ),
+        }
+    }
+
     DcrResponse {
         status,
         content_type,
         body: bytes,
+    }
+}
+
+/// Mark a freshly registered client consent-exempt via Hydra's admin API
+/// (`PATCH /admin/clients/{id}`, RFC 6902 JSON Patch). Best-effort: failures
+/// are logged, never propagated — the consent bridge's audience-based
+/// fallback still skips the consent page if this does not land.
+async fn mark_skip_consent(cfg: &HydraDcrProxyConfig, client_id: &str) {
+    let Some(admin) = cfg.admin_url.as_deref() else {
+        tracing::warn!(
+            "DCR proxy: skip_consent requested but no admin_url configured; \
+             relying on the consent bridge audience-based fallback for {client_id}"
+        );
+        return;
+    };
+
+    let url = format!("{admin}/admin/clients/{client_id}");
+    let patch = json!([{ "op": "replace", "path": "/skip_consent", "value": true }]);
+
+    match cfg
+        .client
+        .patch(&url)
+        .header("content-type", "application/json")
+        .body(patch.to_string())
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!("DCR proxy: marked client {client_id} consent-exempt");
+        }
+        Ok(r) => {
+            let st = r.status();
+            let detail = r.text().await.unwrap_or_default();
+            tracing::warn!(
+                "DCR proxy: skip_consent patch for {client_id} returned {st}: {detail}"
+            );
+        }
+        Err(e) => tracing::warn!(
+            "DCR proxy: skip_consent patch for {client_id} failed: {e}"
+        ),
     }
 }
