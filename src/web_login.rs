@@ -281,16 +281,21 @@ impl WebLogin {
         }
     }
 
-    fn redirect_uri(&self) -> String {
-        format!(
-            "{}{}",
-            self.cfg.public_base.trim_end_matches('/'),
-            self.cfg.callback_uri
-        )
+    /// The OAuth `redirect_uri`. Prefers the configured `public_base`; when that
+    /// is empty, derives the browser-facing origin from the request headers via
+    /// [`forwarded_for`] (the TS `forwardedFor` behaviour), so deployments don't
+    /// have to hard-code a public URL.
+    fn redirect_uri(&self, headers: &HeaderMap) -> String {
+        let base = if self.cfg.public_base.trim().is_empty() {
+            forwarded_for(headers, "", "").base_url
+        } else {
+            self.cfg.public_base.trim_end_matches('/').to_string()
+        };
+        format!("{base}{}", self.cfg.callback_uri)
     }
 
-    fn authorize_url(&self, state_key: &str) -> String {
-        let redirect_uri = self.redirect_uri();
+    fn authorize_url(&self, state_key: &str, headers: &HeaderMap) -> String {
+        let redirect_uri = self.redirect_uri(headers);
         reqwest::Url::parse_with_params(
             &self.cfg.authorize_url,
             &[
@@ -411,6 +416,44 @@ pub async fn get_oauth_profile_by_token(
     Ok(resp.json::<Value>().await?)
 }
 
+// ─── Forwarded request origin (port of TS `forwardedFor`) ──────────────────
+
+/// Browser-facing origin derived from a request, for building absolute URLs
+/// (redirect_uri, post_logout_redirect_uri, …) without a hard-coded public URL.
+#[derive(Debug, Clone)]
+pub struct ForwardedInfo {
+    /// e.g. `https://app.example.com`
+    pub base_url: String,
+    /// `base_url` + the supplied path-and-query.
+    pub full_url: String,
+}
+
+/// Port of the TS `forwardedFor(req)`: derive the origin from
+/// `X-[prefix]Forwarded-Proto/Port/Host` (falling back to the `Host` header and
+/// `http`), suppressing the port for the protocol default. `path_and_query` is
+/// appended to form `full_url`. Pass `x_prefix = ""` for the standard headers.
+pub fn forwarded_for(headers: &HeaderMap, path_and_query: &str, x_prefix: &str) -> ForwardedInfo {
+    let get = |suffix: &str| -> Option<String> {
+        let key = format!("x-{x_prefix}forwarded-{suffix}");
+        headers.get(&key).and_then(|v| v.to_str().ok()).map(str::to_string)
+    };
+
+    let protocol = get("proto").unwrap_or_else(|| "http".to_string());
+    let default_port = if protocol == "https" { "443" } else { "80" };
+    let port = get("port").unwrap_or_else(|| default_port.to_string());
+    let host = get("host")
+        .or_else(|| headers.get("host").and_then(|v| v.to_str().ok()).map(str::to_string))
+        .unwrap_or_default();
+
+    let is_standard =
+        (protocol == "https" && port == "443") || (protocol == "http" && port == "80");
+    let port_suffix = if is_standard { String::new() } else { format!(":{port}") };
+
+    let base_url = format!("{protocol}://{host}{port_suffix}");
+    let full_url = format!("{base_url}{path_and_query}");
+    ForwardedInfo { base_url, full_url }
+}
+
 // ─── Cookie + response helpers ─────────────────────────────────────────────
 
 fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -486,7 +529,7 @@ async fn callback(
         return bad_request("no state found");
     };
 
-    let token = match do_token_exchange(&wl.http, &wl.cfg, &code, &wl.redirect_uri()).await {
+    let token = match do_token_exchange(&wl.http, &wl.cfg, &code, &wl.redirect_uri(&headers)).await {
         Ok(t) if !t.access_token.is_empty() => t,
         Ok(_) => return bad_request("no access token in response"),
         Err(e) => {
@@ -576,7 +619,7 @@ pub async fn gate(State(g): State<GateState>, req: Request, next: Next) -> Respo
         sess.redirects.insert(state_key.clone(), orig);
         wl.store.store(&sid, &sess).await;
     }
-    see_other(&wl.authorize_url(&state_key), set_cookie)
+    see_other(&wl.authorize_url(&state_key, req.headers()), set_cookie)
 }
 
 #[cfg(test)]
@@ -634,16 +677,49 @@ mod tests {
     }
 
     #[test]
-    fn redirect_uri_trims_trailing_slash() {
+    fn redirect_uri_uses_public_base_when_set() {
+        // public_base configured ⇒ headers ignored.
         assert_eq!(
-            wl().redirect_uri(),
+            wl().redirect_uri(&HeaderMap::new()),
             "https://app.example.com/oauth2/callback"
         );
     }
 
     #[test]
+    fn redirect_uri_falls_back_to_forwarded_when_no_public_base() {
+        let mut c = cfg();
+        c.public_base = String::new();
+        let resolver = Arc::new(KratosUserResolver::new(
+            "http://kratos:4434",
+            "https://hikari-systems.com/",
+            true,
+        ));
+        let wl = WebLogin::new(c, resolver);
+        let mut h = HeaderMap::new();
+        h.insert("host", "localhost:3000".parse().unwrap());
+        assert_eq!(wl.redirect_uri(&h), "http://localhost:3000/oauth2/callback");
+        // forwarded proto/host win
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-forwarded-proto", "https".parse().unwrap());
+        h2.insert("x-forwarded-host", "app.example.com".parse().unwrap());
+        assert_eq!(wl.redirect_uri(&h2), "https://app.example.com/oauth2/callback");
+    }
+
+    #[test]
+    fn forwarded_for_suppresses_standard_ports() {
+        let mut h = HeaderMap::new();
+        h.insert("host", "localhost:3000".parse().unwrap());
+        assert_eq!(forwarded_for(&h, "/p?q=1", "").base_url, "http://localhost:3000");
+        assert_eq!(forwarded_for(&h, "/p?q=1", "").full_url, "http://localhost:3000/p?q=1");
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-forwarded-proto", "https".parse().unwrap());
+        h2.insert("x-forwarded-host", "api.example.com".parse().unwrap());
+        assert_eq!(forwarded_for(&h2, "", "").base_url, "https://api.example.com");
+    }
+
+    #[test]
     fn authorize_url_has_oauth_params() {
-        let u = wl().authorize_url("state-123");
+        let u = wl().authorize_url("state-123", &HeaderMap::new());
         let parsed = reqwest::Url::parse(&u).unwrap();
         let q: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(q.get("response_type").unwrap(), "code");
