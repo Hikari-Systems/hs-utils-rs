@@ -19,6 +19,17 @@
 //! CREATE INDEX web_sessions_expires_at_idx ON web_sessions (expires_at);
 //! ```
 //!
+//! The table name defaults to `web_sessions` ([`DEFAULT_SESSION_TABLE`]) but can
+//! be overridden with [`PgSessionStore::with_table`] — useful when several
+//! controller services share one database and each needs its own session table
+//! (e.g. `lloquent_web_session`). The override is wired from service config:
+//!
+//! ```ignore
+//! let store = PgSessionStore::from_pool(pool)
+//!     .with_table(cfg.session_table.as_deref().unwrap_or(DEFAULT_SESSION_TABLE))?;
+//! store.ensure_schema().await?;
+//! ```
+//!
 //! Redis evicts expired keys for you; Postgres does not, so expiry is handled
 //! two ways: every `load` filters `expires_at > now()` (an expired row is
 //! invisible the instant it lapses), and [`PgSessionStore::sweep_expired`]
@@ -27,6 +38,10 @@
 //! Posture matches the rest of hs-utils' shared stores: **fail open** — a
 //! Postgres outage degrades to "the user is asked to log in again", never a
 //! 500.
+//!
+//! **First-time DB setup** (role, table, grants — one script per consuming
+//! service) is templated in `docs/web-login-postgres-db-setup.md`; copy the
+//! relevant parts into the service README.
 
 use std::time::Duration;
 
@@ -36,21 +51,35 @@ use sqlx::PgPool;
 
 use crate::web_login::{Session, WebSessionStore, DEFAULT_SESSION_TTL_SECS};
 
+/// Default session table name, used unless overridden via
+/// [`PgSessionStore::with_table`].
+pub const DEFAULT_SESSION_TABLE: &str = "web_sessions";
+
 /// Postgres [`WebSessionStore`] over a shared [`PgPool`].
+///
+/// The table name is fixed for the life of the store: it is validated once at
+/// construction and baked into the SQL strings then (a table name can never be a
+/// bind parameter — the Postgres protocol parameterises *values* only, so the
+/// identifier must be interpolated). The hot-path statements are pre-built here
+/// and reused on every call; sqlx prepares-and-caches each by SQL text per
+/// connection, so each is prepared once per connection and reused thereafter.
 #[derive(Clone)]
 pub struct PgSessionStore {
     pool: PgPool,
     ttl_secs: i64,
+    table: String,
+    sql_load: String,
+    sql_store: String,
+    sql_remove: String,
 }
 
 impl PgSessionStore {
     /// Build over an existing pool with the given per-session expiry (refreshed
-    /// on every write, mirroring redis `set_ex`).
+    /// on every write, mirroring redis `set_ex`). Uses [`DEFAULT_SESSION_TABLE`];
+    /// override with [`with_table`](Self::with_table).
     pub fn new(pool: PgPool, ttl: Duration) -> Self {
-        Self {
-            pool,
-            ttl_secs: ttl.as_secs().max(1) as i64,
-        }
+        // DEFAULT_SESSION_TABLE is a known-valid identifier.
+        Self::build(pool, ttl.as_secs().max(1) as i64, DEFAULT_SESSION_TABLE.to_string())
     }
 
     /// Build with the default 24h TTL ([`DEFAULT_SESSION_TTL_SECS`]).
@@ -58,22 +87,62 @@ impl PgSessionStore {
         Self::new(pool, Duration::from_secs(DEFAULT_SESSION_TTL_SECS))
     }
 
-    /// Create the `web_sessions` table and its expiry index if absent.
+    /// Override the session table name (e.g. `"lloquent_web_session"`) — useful
+    /// when several services share one database, each with its own session
+    /// table. Validated as a Postgres identifier (letters, digits, underscore;
+    /// not starting with a digit; ≤63 chars); errors on anything unsafe to
+    /// interpolate. Pool and TTL are preserved.
+    pub fn with_table(self, table: &str) -> Result<Self> {
+        let table = validate_table_name(table)?;
+        Ok(Self::build(self.pool, self.ttl_secs, table))
+    }
+
+    /// Assemble the struct, baking `table` into the pre-built hot-path SQL.
+    /// `table` must already be a validated identifier.
+    fn build(pool: PgPool, ttl_secs: i64, table: String) -> Self {
+        let sql_load = format!(
+            "SELECT data FROM {table} WHERE sid = $1 AND expires_at > now()"
+        );
+        let sql_store = format!(
+            "INSERT INTO {table} (sid, data, expires_at) \
+             VALUES ($1, $2, now() + ($3 * interval '1 second')) \
+             ON CONFLICT (sid) DO UPDATE \
+               SET data = EXCLUDED.data, expires_at = EXCLUDED.expires_at"
+        );
+        let sql_remove = format!("DELETE FROM {table} WHERE sid = $1");
+        Self {
+            pool,
+            ttl_secs,
+            table,
+            sql_load,
+            sql_store,
+            sql_remove,
+        }
+    }
+
+    /// The configured session table name.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// Create the session table and its expiry index if absent.
     /// Idempotent; safe to call on every boot.
     pub async fn ensure_schema(&self) -> Result<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS web_sessions (\
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
                  sid        TEXT PRIMARY KEY, \
                  data       JSONB NOT NULL, \
                  expires_at TIMESTAMPTZ NOT NULL\
              )",
-        )
+            self.table
+        ))
         .execute(&self.pool)
         .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS web_sessions_expires_at_idx \
-             ON web_sessions (expires_at)",
-        )
+        sqlx::query(&format!(
+            "CREATE INDEX IF NOT EXISTS {table}_expires_at_idx \
+             ON {table} (expires_at)",
+            table = self.table
+        ))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -82,22 +151,42 @@ impl PgSessionStore {
     /// Delete expired rows, returning the number reclaimed. Reads already
     /// ignore expired sessions, so this is housekeeping — run it on a timer.
     pub async fn sweep_expired(&self) -> Result<u64> {
-        let res = sqlx::query("DELETE FROM web_sessions WHERE expires_at <= now()")
-            .execute(&self.pool)
-            .await?;
+        let res = sqlx::query(&format!(
+            "DELETE FROM {} WHERE expires_at <= now()",
+            self.table
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected())
     }
+}
+
+/// Validate a Postgres identifier safe to interpolate into a SQL statement:
+/// `^[A-Za-z_][A-Za-z0-9_]*$`, 1..=63 bytes. This is the injection guard for the
+/// (necessarily) interpolated table name.
+fn validate_table_name(name: &str) -> Result<String> {
+    let valid = (1..=63).contains(&name.len())
+        && name.bytes().enumerate().all(|(i, b)| {
+            b == b'_'
+                || b.is_ascii_alphabetic()
+                || (i > 0 && b.is_ascii_digit())
+        });
+    if !valid {
+        anyhow::bail!(
+            "invalid session table name {name:?}: must be a Postgres identifier \
+             (letters, digits, underscore; not starting with a digit; 1..=63 chars)"
+        );
+    }
+    Ok(name.to_string())
 }
 
 #[async_trait]
 impl WebSessionStore for PgSessionStore {
     async fn load(&self, sid: &str) -> Option<Session> {
-        let res = sqlx::query_scalar::<_, serde_json::Value>(
-            "SELECT data FROM web_sessions WHERE sid = $1 AND expires_at > now()",
-        )
-        .bind(sid)
-        .fetch_optional(&self.pool)
-        .await;
+        let res = sqlx::query_scalar::<_, serde_json::Value>(&self.sql_load)
+            .bind(sid)
+            .fetch_optional(&self.pool)
+            .await;
 
         let data = match res {
             Ok(v) => v?,
@@ -125,17 +214,12 @@ impl WebSessionStore for PgSessionStore {
             }
         };
 
-        let res = sqlx::query(
-            "INSERT INTO web_sessions (sid, data, expires_at) \
-             VALUES ($1, $2, now() + ($3 * interval '1 second')) \
-             ON CONFLICT (sid) DO UPDATE \
-               SET data = EXCLUDED.data, expires_at = EXCLUDED.expires_at",
-        )
-        .bind(sid)
-        .bind(data)
-        .bind(self.ttl_secs)
-        .execute(&self.pool)
-        .await;
+        let res = sqlx::query(&self.sql_store)
+            .bind(sid)
+            .bind(data)
+            .bind(self.ttl_secs)
+            .execute(&self.pool)
+            .await;
 
         if let Err(e) = res {
             tracing::error!("web_login pg store {sid}: {e}");
@@ -143,12 +227,39 @@ impl WebSessionStore for PgSessionStore {
     }
 
     async fn remove(&self, sid: &str) {
-        let res = sqlx::query("DELETE FROM web_sessions WHERE sid = $1")
+        let res = sqlx::query(&self.sql_remove)
             .bind(sid)
             .execute(&self.pool)
             .await;
         if let Err(e) = res {
             tracing::error!("web_login pg remove {sid}: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_valid_identifiers() {
+        for ok in ["web_sessions", "lloquent_web_session", "_x", "T1", "a", &"a".repeat(63)] {
+            assert!(validate_table_name(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_identifiers() {
+        for bad in [
+            "",
+            "1abc",
+            "web sessions",
+            "web-sessions",
+            "web;drop",
+            "x; DROP TABLE users; --",
+            &"a".repeat(64),
+        ] {
+            assert!(validate_table_name(bad).is_err(), "should reject {bad:?}");
         }
     }
 }
