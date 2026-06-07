@@ -141,6 +141,9 @@ pub struct Session {
     access_token: Option<String>,
     #[serde(default)]
     refresh_token: Option<String>,
+    /// OIDC id_token captured at login, for RP-initiated logout (`id_token_hint`).
+    #[serde(default)]
+    id_token: Option<String>,
     #[serde(default)]
     expires_at: Option<i64>,
     /// `state` → original URL, set at redirect time, consumed at callback.
@@ -328,6 +331,23 @@ impl WebLogin {
         self.store.store(sid, &sess).await;
         None
     }
+
+    /// The OIDC `id_token` captured at login, for RP-initiated logout
+    /// (`id_token_hint`). Returns `None` when there is no session or it predates
+    /// id_token capture.
+    pub async fn id_token(&self, sid: &str) -> Option<String> {
+        self.store.load(sid).await?.id_token
+    }
+
+    /// End the session: read the `id_token` (for `id_token_hint`), remove the
+    /// session from the store, and return the id_token. Use this for logout —
+    /// destroy the local session, then redirect to the IdP's RP-initiated logout
+    /// endpoint with the returned hint.
+    pub async fn end_session(&self, sid: &str) -> Option<String> {
+        let id_token = self.store.load(sid).await.and_then(|s| s.id_token);
+        self.store.remove(sid).await;
+        id_token
+    }
 }
 
 // ─── HTTP primitives (ported 1:1 from oauth2.ts) ───────────────────────────
@@ -494,6 +514,7 @@ async fn callback(
         sess.profile = serde_json::to_value(&resolved.profile).ok();
         sess.access_token = Some(token.access_token);
         sess.refresh_token = token.refresh_token;
+        sess.id_token = token.id_token;
         sess.expires_at = token.expires_in.map(|e| now_secs() + e);
         wl.store.store(&sid, &sess).await;
     }
@@ -583,6 +604,33 @@ mod tests {
             true,
         ));
         WebLogin::new(cfg(), resolver)
+    }
+
+    #[test]
+    fn session_round_trips_id_token() {
+        let sess = Session {
+            user_id: Some("u1".into()),
+            id_token: Some("eyJhbGc.payload.sig".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&sess).unwrap();
+        assert_eq!(json["id_token"], "eyJhbGc.payload.sig");
+        let back: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(back.id_token.as_deref(), Some("eyJhbGc.payload.sig"));
+    }
+
+    #[tokio::test]
+    async fn end_session_returns_id_token_and_clears() {
+        let wl = wl();
+        let sess = Session {
+            id_token: Some("tok-123".into()),
+            ..Default::default()
+        };
+        wl.store.store("sid-1", &sess).await;
+        assert_eq!(wl.id_token("sid-1").await.as_deref(), Some("tok-123"));
+        assert_eq!(wl.end_session("sid-1").await.as_deref(), Some("tok-123"));
+        // session is gone now
+        assert!(wl.id_token("sid-1").await.is_none());
     }
 
     #[test]
