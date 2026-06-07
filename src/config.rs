@@ -55,16 +55,21 @@ pub fn normalize_to_strings(v: &mut Value) {
     }
 }
 
-/// Prepare a raw config `Value` tree for deserialisation in one call.
+/// Finalise a raw config `Value` tree for deserialisation in one call.
 ///
 /// Performs (in order):
 /// 1. `resolve_secrets` — replaces `[SECRET]:/path` strings with file contents
 /// 2. `normalize_to_strings` — converts booleans and numbers to strings so
 ///    that `true` and `"true"` are equivalent
 ///
-/// Call this after all source layers have been merged (base config + any
-/// overlay), and before `apply_env_overrides`.  `[SECRET]:` resolution is
-/// intentionally invisible to the calling code.
+/// Call this **last**, after the full layering/override chain has selected each
+/// value: base config → `/sandbox` overlay → `apply_env_overrides`. Secret
+/// resolution must come *after* env overrides so that a `[SECRET]:` indirection
+/// supplied via an environment variable is resolved on the final winning value
+/// (matching the TypeScript `hs.utils` loader, which resolves `[SECRET]:` lazily
+/// at read time). Calling it *before* `apply_env_overrides` leaves any
+/// env-provided secret stored verbatim and never resolved.  `[SECRET]:`
+/// resolution is intentionally invisible to the calling code.
 pub fn prepare_config(v: &mut Value) {
     resolve_secrets(v);
     normalize_to_strings(v);
@@ -75,8 +80,13 @@ pub fn prepare_config(v: &mut Value) {
 /// (case-sensitive camelCase), e.g. `db__host=postgres` or
 /// `s3__bucketName=my-bucket`.
 ///
-/// Should be called *after* `normalize_to_strings` so all existing values are
-/// already strings; new values are inserted as strings directly.
+/// New values are inserted verbatim as strings; `[SECRET]:/path` indirections
+/// are NOT resolved here. Env overrides are part of the *layering/override* step
+/// (they win over config files), and `[SECRET]:` resolution happens afterwards on
+/// the final selected value — see [`prepare_config`], which must run *after* this.
+/// This is why a secret supplied via an environment variable (e.g.
+/// `db__host=[SECRET]:/run/secrets/db-hostname`, the standard container
+/// deployment pattern) resolves the same as one written in config.json.
 pub fn apply_env_overrides(root: &mut Value) {
     for (key, value) in std::env::vars() {
         let parts: Vec<&str> = key.split("__").collect();
@@ -152,8 +162,9 @@ fn set_nested(node: &mut Value, path: &[&str], val: &str) {
 /// 2. If `${CONFIG_PATH:-/sandbox}/config.json` exists, **deep-merges** it OVER
 ///    the base — the per-environment overlay mounted at `/sandbox`. `CONFIG_PATH`
 ///    selects the overlay *directory* and defaults to `/sandbox`.
-/// 3. Resolves `[SECRET]:` indirections + stringifies scalars (`prepare_config`),
-///    then applies `__`-flattened env overrides (`apply_env_overrides`).
+/// 3. Applies `__`-flattened env overrides (`apply_env_overrides`), THEN resolves
+///    `[SECRET]:` indirections + stringifies scalars on the final values
+///    (`prepare_config`) — secret resolution comes after the override chain.
 ///
 /// Returns the merged `Value`; the caller does `serde_json::from_value`. This is
 /// the loader hs Rust services should call — no service hand-rolls config-file
@@ -194,8 +205,11 @@ pub fn load_layered_from(base_path: &str, sandbox_dir: &str) -> anyhow::Result<V
         }
     }
 
-    prepare_config(&mut root);
+    // Order matters: layer/override first (overlay then env), THEN resolve
+    // `[SECRET]:` + normalise on the final selected values. Resolving before the
+    // env override would leave any env-supplied `[SECRET]:` indirection verbatim.
     apply_env_overrides(&mut root);
+    prepare_config(&mut root);
     Ok(root)
 }
 
@@ -594,5 +608,42 @@ mod layered_tests {
         .unwrap();
         assert_eq!(v["falkordb"]["host"], Value::String("baked".into()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression: a `[SECRET]:/path` supplied via an environment variable must
+    /// be resolved to the file's contents — the standard container deployment
+    /// pattern (`session__db__host=[SECRET]:/run/secrets/db-hostname`). This only
+    /// works because `apply_env_overrides` runs *before* secret resolution; if
+    /// secrets were resolved first (the old order), the env value would be stored
+    /// verbatim and the service would treat the literal `[SECRET]:…` as a host.
+    #[test]
+    fn env_provided_secret_is_resolved() {
+        let root = std::env::temp_dir().join(format!("hsutils_envsecret_{}", std::process::id()));
+        let base_dir = root.join("app");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let base_path = base_dir.join("config.json");
+        // Base leaves host empty; the deploy supplies it via env as a secret ref.
+        std::fs::write(&base_path, r#"{ "session": { "db": { "host": "" } } }"#).unwrap();
+
+        let secret_file = root.join("db-hostname");
+        std::fs::write(&secret_file, "pg.internal.example.com\n").unwrap();
+
+        let key = "session__db__host";
+        std::env::set_var(key, format!("[SECRET]:{}", secret_file.display()));
+
+        let v = load_layered_from(
+            base_path.to_str().unwrap(),
+            root.join("does-not-exist").to_str().unwrap(),
+        )
+        .unwrap();
+
+        std::env::remove_var(key);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Resolved to file contents (trailing newline stripped), NOT the literal.
+        assert_eq!(
+            v["session"]["db"]["host"],
+            Value::String("pg.internal.example.com".into()),
+        );
     }
 }
