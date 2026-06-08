@@ -70,6 +70,7 @@ pub trait KratosIdentityFetcher: Send + Sync {
 }
 
 /// Production fetcher: `GET {admin_url}/admin/identities/{sub}`.
+#[derive(Clone)]
 pub struct ReqwestKratosFetcher {
     admin_url: String,
     client: reqwest::Client,
@@ -84,6 +85,48 @@ impl ReqwestKratosFetcher {
         Self {
             admin_url: admin_url.into().trim_end_matches('/').to_string(),
             client,
+        }
+    }
+
+    /// `GET {admin_url}/admin/identities/{id}` returning the raw identity JSON.
+    /// `None` on 404 or any error. Unlike [`KratosIdentityFetcher::fetch`], this
+    /// keeps the full document (`schema_id`, `state`, `metadata_public`,
+    /// `metadata_admin`, `traits`) so callers that need to read or round-trip the
+    /// whole identity (e.g. a `metadata_public` writer) can do so without a
+    /// second GET. Reuses this fetcher's client + admin URL + path encoding.
+    pub async fn fetch_raw(&self, id: &str) -> Option<serde_json::Value> {
+        let url = format!("{}/admin/identities/{}", self.admin_url, encode_segment(id));
+        let resp = match self
+            .client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::error!("Kratos identity lookup {id} failed: {err}");
+                return None;
+            }
+        };
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return None;
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                "Kratos identity lookup {id} → {status}: {}",
+                body.chars().take(200).collect::<String>()
+            );
+            return None;
+        }
+        match resp.json::<serde_json::Value>().await {
+            Ok(v) => Some(v),
+            Err(err) => {
+                tracing::error!("Kratos identity {id} body parse failed: {err}");
+                None
+            }
         }
     }
 }

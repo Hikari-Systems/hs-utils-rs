@@ -25,3 +25,6 @@ pub mod web_login_redis;
 
 #[cfg(feature = "web-login-postgres")]
 pub mod web_login_postgres;
+
+#[cfg(feature = "controller")]
+pub mod controller;
