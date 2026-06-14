@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.14.0"
+version = "0.17.0"
 edition = "2021"
 
 [features]
@@ -37,6 +37,18 @@ web-login-postgres = ["web-login", "db"]
 # mcp-data-service-backed rmcp SessionStore for cross-replica streamable-HTTP
 # sessions. Pulls rmcp to implement its SessionStore trait.
 mcp-session-store = ["mcp-resource-server", "dep:rmcp"]
+# Composable GraphQL controller toolkit: CoreConfig/CoreServices, shared
+# GqlContext, shared async-graphql types + mergeable resolver fragments
+# (loggedInUser, checkTermsAccepted/acceptTerms), terms login-hydration, and a
+# Kratos admin client. Controllers keep ownership of their own AppState, schema
+# build and handlers; they pull these elements in. Requires web-login for the
+# session store + KratosUserResolver/ReqwestKratosFetcher.
+controller = ["web-login", "dep:async-graphql", "dep:async-graphql-axum", "dep:chrono"]
+# Adds the Stripe + payment-data clients and the payments resolver fragments
+# (checkPaidState, listSubscriptionPlans, subscription mutations) on top of the
+# controller toolkit. Stripe is a hand-rolled reqwest client (no `stripe` crate);
+# hmac/sha2/hex back the webhook signature check.
+controller-payments = ["controller", "dep:hmac", "dep:sha2", "dep:hex"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -58,6 +70,12 @@ async-trait = { version = "0.1", optional = true }
 uuid = { version = "1", default-features = false, features = ["v4"], optional = true }
 rmcp = { version = "1.6", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
 redis = { version = "0.27", features = ["tokio-comp", "sentinel", "connection-manager"], optional = true }
+async-graphql = { version = "7", optional = true }
+async-graphql-axum = { version = "7", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+hmac = { version = "0.13", optional = true }
+sha2 = { version = "0.11", optional = true }
+hex = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }

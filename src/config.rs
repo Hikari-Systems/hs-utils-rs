@@ -75,10 +75,16 @@ pub fn prepare_config(v: &mut Value) {
     normalize_to_strings(v);
 }
 
-/// Walk env vars and apply any that use `__` as a path separator as overrides
-/// into `root`.  Key segments must match the JSON key names exactly
-/// (case-sensitive camelCase), e.g. `db__host=postgres` or
-/// `s3__bucketName=my-bucket`.
+/// Walk env vars and apply them as overrides into `root`.  `__` is used as a
+/// path separator so nested keys can be addressed, e.g. `db__host=postgres` or
+/// `s3__bucketName=my-bucket`; a key with no `__` overrides a top-level config
+/// key (e.g. `port=8080`). Key segments must match the JSON key names exactly
+/// (case-sensitive camelCase).
+///
+/// Every env var is applied — there is no namespace filter — so the process
+/// environment (`PATH`, `HOME`, …) is layered onto the config as string keys.
+/// Deserialisation into the service's `AppConfig` ignores any keys the struct
+/// does not declare, so unrelated env vars are harmless.
 ///
 /// New values are inserted verbatim as strings; `[SECRET]:/path` indirections
 /// are NOT resolved here. Env overrides are part of the *layering/override* step
@@ -90,9 +96,6 @@ pub fn prepare_config(v: &mut Value) {
 pub fn apply_env_overrides(root: &mut Value) {
     for (key, value) in std::env::vars() {
         let parts: Vec<&str> = key.split("__").collect();
-        if parts.len() < 2 {
-            continue;
-        }
         set_nested(root, &parts, &value);
     }
 }

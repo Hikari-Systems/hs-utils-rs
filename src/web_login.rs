@@ -91,19 +91,15 @@ pub struct WebLoginConfig {
     pub scopes: String,
     /// Path the provider redirects back to. Default `/oauth2/callback`.
     pub callback_uri: String,
-    /// Public base URL of this server (e.g. `https://app.example.com`), used to
-    /// build the `redirect_uri`. No trailing slash required.
-    pub public_base: String,
     /// Session cookie name. Default `hs_session`.
     pub cookie_name: String,
-    /// Set the `Secure` cookie attribute (enable behind HTTPS).
-    pub cookie_secure: bool,
 }
 
 impl WebLoginConfig {
     /// Construct with the standard defaults (`callback_uri=/oauth2/callback`,
-    /// `cookie_name=hs_session`, `cookie_secure=false`).
-    #[allow(clippy::too_many_arguments)]
+    /// `cookie_name=hs_session`). The browser-facing origin (for `redirect_uri`
+    /// and the cookie `Secure` attribute) is derived per-request from the
+    /// trusted edge's `X-Forwarded-*` headers — never hard-coded here.
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -111,7 +107,6 @@ impl WebLoginConfig {
         token_url: impl Into<String>,
         profile_url: impl Into<String>,
         scopes: impl Into<String>,
-        public_base: impl Into<String>,
     ) -> Self {
         Self {
             client_id: client_id.into(),
@@ -121,9 +116,7 @@ impl WebLoginConfig {
             profile_url: profile_url.into(),
             scopes: scopes.into(),
             callback_uri: "/oauth2/callback".to_string(),
-            public_base: public_base.into(),
             cookie_name: "hs_session".to_string(),
-            cookie_secure: false,
         }
     }
 }
@@ -281,16 +274,12 @@ impl WebLogin {
         }
     }
 
-    /// The OAuth `redirect_uri`. Prefers the configured `public_base`; when that
-    /// is empty, derives the browser-facing origin from the request headers via
-    /// [`forwarded_for`] (the TS `forwardedFor` behaviour), so deployments don't
-    /// have to hard-code a public URL.
+    /// The OAuth `redirect_uri`, derived from the request's browser-facing
+    /// origin via [`forwarded_for`] (proto/host from the trusted edge's
+    /// `X-Forwarded-*` headers — the TS `forwardedFor` behaviour). The app never
+    /// hard-codes a public URL; the edge (LB/WAF) is the source of truth.
     fn redirect_uri(&self, headers: &HeaderMap) -> String {
-        let base = if self.cfg.public_base.trim().is_empty() {
-            forwarded_for(headers, "", "").base_url
-        } else {
-            self.cfg.public_base.trim_end_matches('/').to_string()
-        };
+        let base = forwarded_for(headers, "", "").base_url;
         format!("{base}{}", self.cfg.callback_uri)
     }
 
@@ -469,9 +458,17 @@ fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-fn build_set_cookie(cfg: &WebLoginConfig, sid: &str) -> HeaderValue {
+/// Whether the browser-facing request reached the trusted edge over HTTPS, per
+/// `X-Forwarded-Proto` (same source as [`WebLogin::redirect_uri`]). Drives the
+/// `Secure` cookie attribute, so HTTPS deployments get it automatically and
+/// plain-HTTP local dev does not — without any configured public URL.
+fn request_is_https(headers: &HeaderMap) -> bool {
+    forwarded_for(headers, "", "").base_url.starts_with("https://")
+}
+
+fn build_set_cookie(cfg: &WebLoginConfig, sid: &str, secure: bool) -> HeaderValue {
     let mut s = format!("{}={}; HttpOnly; SameSite=Lax; Path=/", cfg.cookie_name, sid);
-    if cfg.cookie_secure {
+    if secure {
         s.push_str("; Secure");
     }
     HeaderValue::from_str(&s).expect("cookie header value")
@@ -578,7 +575,7 @@ pub async fn gate(State(g): State<GateState>, req: Request, next: Next) -> Respo
         None => {
             let s = uuid::Uuid::new_v4().to_string();
             wl.store.store(&s, &Session::default()).await;
-            let cookie = build_set_cookie(&wl.cfg, &s);
+            let cookie = build_set_cookie(&wl.cfg, &s, request_is_https(req.headers()));
             (s, Some(cookie))
         }
     };
@@ -627,17 +624,23 @@ mod tests {
     use super::*;
 
     fn cfg() -> WebLoginConfig {
-        let mut c = WebLoginConfig::new(
+        WebLoginConfig::new(
             "client-abc",
             "secret-xyz",
             "https://auth.example.com/oauth2/auth",
             "https://auth.example.com/oauth2/token",
             "https://auth.example.com/userinfo",
             "openid profile email",
-            "https://app.example.com/",
-        );
-        c.cookie_secure = true;
-        c
+        )
+    }
+
+    /// Standard forwarded headers from an HTTPS edge (proto + host), as the LB
+    /// supplies them. `redirect_uri` / cookie `Secure` derive from these.
+    fn https_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        h.insert("x-forwarded-host", "app.example.com".parse().unwrap());
+        h
     }
 
     fn wl() -> WebLogin {
@@ -677,32 +680,17 @@ mod tests {
     }
 
     #[test]
-    fn redirect_uri_uses_public_base_when_set() {
-        // public_base configured ⇒ headers ignored.
-        assert_eq!(
-            wl().redirect_uri(&HeaderMap::new()),
-            "https://app.example.com/oauth2/callback"
-        );
-    }
-
-    #[test]
-    fn redirect_uri_falls_back_to_forwarded_when_no_public_base() {
-        let mut c = cfg();
-        c.public_base = String::new();
-        let resolver = Arc::new(KratosUserResolver::new(
-            "http://kratos:4434",
-            "https://hikari-systems.com/",
-            true,
-        ));
-        let wl = WebLogin::new(c, resolver);
+    fn redirect_uri_is_derived_from_the_request() {
+        let wl = wl();
+        // Plain Host header (local dev) → http origin.
         let mut h = HeaderMap::new();
         h.insert("host", "localhost:3000".parse().unwrap());
         assert_eq!(wl.redirect_uri(&h), "http://localhost:3000/oauth2/callback");
-        // forwarded proto/host win
-        let mut h2 = HeaderMap::new();
-        h2.insert("x-forwarded-proto", "https".parse().unwrap());
-        h2.insert("x-forwarded-host", "app.example.com".parse().unwrap());
-        assert_eq!(wl.redirect_uri(&h2), "https://app.example.com/oauth2/callback");
+        // Forwarded proto/host from the edge win.
+        assert_eq!(
+            wl.redirect_uri(&https_headers()),
+            "https://app.example.com/oauth2/callback"
+        );
     }
 
     #[test]
@@ -719,7 +707,7 @@ mod tests {
 
     #[test]
     fn authorize_url_has_oauth_params() {
-        let u = wl().authorize_url("state-123", &HeaderMap::new());
+        let u = wl().authorize_url("state-123", &https_headers());
         let parsed = reqwest::Url::parse(&u).unwrap();
         let q: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(q.get("response_type").unwrap(), "code");
@@ -735,13 +723,25 @@ mod tests {
 
     #[test]
     fn set_cookie_has_security_attrs() {
-        let c = build_set_cookie(&cfg(), "sid-1");
-        let s = c.to_str().unwrap();
+        // Secure derives from the request: HTTPS edge ⇒ Secure, plain HTTP ⇒ not.
+        let secure = build_set_cookie(&cfg(), "sid-1", true);
+        let s = secure.to_str().unwrap();
         assert!(s.starts_with("hs_session=sid-1"));
         assert!(s.contains("HttpOnly"));
         assert!(s.contains("SameSite=Lax"));
         assert!(s.contains("Path=/"));
         assert!(s.contains("Secure"));
+
+        let insecure = build_set_cookie(&cfg(), "sid-1", false);
+        assert!(!insecure.to_str().unwrap().contains("Secure"));
+    }
+
+    #[test]
+    fn request_is_https_tracks_forwarded_proto() {
+        assert!(request_is_https(&https_headers()));
+        let mut h = HeaderMap::new();
+        h.insert("host", "localhost:3000".parse().unwrap());
+        assert!(!request_is_https(&h));
     }
 
     #[test]
