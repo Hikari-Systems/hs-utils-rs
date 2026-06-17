@@ -1,10 +1,16 @@
 [package]
 name = "hs-utils"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 
 [features]
 db = ["dep:sqlx"]
+# Generic realtime pub/sub backplane (EventBus<E> + Postgres LISTEN/NOTIFY +
+# in-memory fallback). Needs a Postgres pool (db) and the Tokio runtime for the
+# background LISTEN task.
+pubsub = ["db", "tokio/rt", "tokio/sync", "tokio/time"]
+# Adds the axum Server-Sent Events helper (`pubsub::sse_stream`).
+pubsub-axum = ["pubsub", "dep:axum", "dep:tokio-stream"]
 web = ["dep:actix-web", "dep:actix-service", "dep:actix-http", "dep:futures-util"]
 # Framework-free RFC 7591 DCR proxy primitives. Pick an adapter feature below
 # to wire it into your HTTP framework of choice.
@@ -66,6 +72,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 jsonwebtoken = { version = "9", default-features = false, optional = true }
 moka = { version = "0.12", default-features = false, features = ["future"], optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time"], optional = true }
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"], optional = true }
 async-trait = { version = "0.1", optional = true }
 uuid = { version = "1", default-features = false, features = ["v4"], optional = true }
 rmcp = { version = "1.6", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
