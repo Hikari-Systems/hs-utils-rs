@@ -5,6 +5,9 @@ pub mod logging;
 #[cfg(feature = "db")]
 pub mod db;
 
+#[cfg(feature = "pubsub")]
+pub mod pubsub;
+
 #[cfg(feature = "web")]
 pub mod middleware;
 

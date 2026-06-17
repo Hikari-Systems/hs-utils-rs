@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "hs-utils"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "actix-http",
  "actix-service",
@@ -1416,6 +1416,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -3384,6 +3385,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
