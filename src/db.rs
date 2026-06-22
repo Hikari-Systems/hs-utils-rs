@@ -19,6 +19,8 @@
 //! let pool = hs_utils::db::build_pool(&cfg.db).await?;
 //! ```
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use sqlx::{
@@ -65,6 +67,12 @@ pub struct DbConfig {
     pub minpool: Option<u32>,
     #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
     pub maxpool: Option<u32>,
+    /// Idle-connection reap timeout, in seconds. When set, a pooled connection
+    /// that has been idle for this long is closed, letting the pool shed surplus
+    /// connections back down toward `minpool`. Unset → sqlx's default (no idle
+    /// reaping), so the pool only ever grows toward `maxpool`.
+    #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
+    pub idle_timeout_secs: Option<u32>,
     #[allow(dead_code)]
     #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
     pub debug: Option<bool>,
@@ -80,7 +88,9 @@ pub struct DbConfig {
 /// - `ssl.enabled = false` / absent       → `Prefer`
 ///
 /// `ssl.caCertFile` is applied when non-empty and SSL is enabled.
-/// Pool sizing defaults: `minpool = 0`, `maxpool = 10`.
+/// Pool sizing defaults: `minpool = 0`, `maxpool = 3`. `idleTimeoutSecs` is
+/// unset by default (no idle reaping); set it so an over-grown pool can shed
+/// idle connections back toward `minpool`.
 pub async fn build_pool(cfg: &DbConfig) -> Result<PgPool> {
     let port: u16 = if cfg.port.is_empty() {
         5432
@@ -124,9 +134,14 @@ pub async fn build_pool(cfg: &DbConfig) -> Result<PgPool> {
         "Connecting to database"
     );
 
-    let result = PgPoolOptions::new()
+    let mut pool_opts = PgPoolOptions::new()
         .min_connections(cfg.minpool.unwrap_or(0))
-        .max_connections(cfg.maxpool.unwrap_or(3))
+        .max_connections(cfg.maxpool.unwrap_or(3));
+    if let Some(secs) = cfg.idle_timeout_secs {
+        pool_opts = pool_opts.idle_timeout(Duration::from_secs(u64::from(secs)));
+    }
+
+    let result = pool_opts
         .connect_with(opts)
         .await
         .context("Failed to connect to database");
