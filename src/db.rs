@@ -72,7 +72,7 @@ pub struct DbConfig {
     /// connections back down toward `minpool`. Unset → sqlx's default (no idle
     /// reaping), so the pool only ever grows toward `maxpool`.
     #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
-    pub idle_timeout_secs: Option<u32>,
+    pub idletimeoutsecs: Option<u32>,
     #[allow(dead_code)]
     #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
     pub debug: Option<bool>,
@@ -137,7 +137,7 @@ pub async fn build_pool(cfg: &DbConfig) -> Result<PgPool> {
     let mut pool_opts = PgPoolOptions::new()
         .min_connections(cfg.minpool.unwrap_or(0))
         .max_connections(cfg.maxpool.unwrap_or(3));
-    if let Some(secs) = cfg.idle_timeout_secs {
+    if let Some(secs) = cfg.idletimeoutsecs {
         pool_opts = pool_opts.idle_timeout(Duration::from_secs(u64::from(secs)));
     }
 
