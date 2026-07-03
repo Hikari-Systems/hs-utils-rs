@@ -31,3 +31,6 @@ pub mod web_login_postgres;
 
 #[cfg(feature = "controller")]
 pub mod controller;
+
+#[cfg(feature = "consent-bridge")]
+pub mod hydra_bridge;

@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 
 [features]
@@ -55,6 +55,11 @@ controller = ["web-login", "dep:async-graphql", "dep:async-graphql-axum", "dep:c
 # controller toolkit. Stripe is a hand-rolled reqwest client (no `stripe` crate);
 # hmac/sha2/hex back the webhook signature check.
 controller-payments = ["controller", "dep:hmac", "dep:sha2", "dep:hex"]
+# Ory Hydra login/consent/logout provider bridge (axum). A reusable port of the
+# hs-login-controller bridge: resolves the Kratos identity and accepts/rejects
+# Hydra login/consent/logout challenges via Hydra's admin API. Mount its router
+# on a public path (`/api/oauth/*`).
+consent-bridge = ["dep:axum", "dep:reqwest"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
