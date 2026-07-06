@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use crate::config::DataServiceConfig;
+
 /// An MCP resource server's OAuth surface. Mirrors the TS
 /// `@hikari-systems/hs.utils` `lib/mcp-auth/config.ts:AuthConfig`.
 ///
@@ -81,17 +83,18 @@ pub struct McpAuthConfig {
     #[serde(skip)]
     pub hydra_admin_url: Option<String>,
 
-    /// `mcp-data-service:url` (host-injected; TS default applied here).
-    #[serde(skip, default = "default_mcp_data_service_url")]
-    pub mcp_data_service_url: String,
-
-    /// `mcp-data-service:apiKey` (host-injected).
-    #[serde(skip)]
-    pub mcp_data_service_api_key: String,
+    /// `mcp-data-service` target (`{ url, apiKey }`, host-injected via
+    /// `with_runtime` from the top-level `mcp-data-service:` block). The URL
+    /// defaults to the in-cluster `http://mcp-data-service:3000`.
+    #[serde(skip, default = "default_mcp_data_service")]
+    pub mcp_data_service: DataServiceConfig,
 }
 
-fn default_mcp_data_service_url() -> String {
-    "http://mcp-data-service:3000".to_string()
+fn default_mcp_data_service() -> DataServiceConfig {
+    DataServiceConfig {
+        url: "http://mcp-data-service:3000".to_string(),
+        api_key: String::new(),
+    }
 }
 
 impl McpAuthConfig {
@@ -112,10 +115,10 @@ impl McpAuthConfig {
         self.kratos_admin_url = nonempty(kratos_admin_url);
         self.hydra_admin_url = nonempty(hydra_admin_url);
         if let Some(u) = nonempty(mcp_data_service_url) {
-            self.mcp_data_service_url = u;
+            self.mcp_data_service.url = u;
         }
         if let Some(k) = mcp_data_service_api_key {
-            self.mcp_data_service_api_key = k;
+            self.mcp_data_service.api_key = k;
         }
         self
     }

@@ -34,3 +34,6 @@ pub mod controller;
 
 #[cfg(feature = "consent-bridge")]
 pub mod hydra_bridge;
+
+#[cfg(feature = "consent-bridge")]
+pub mod avatar_hook;

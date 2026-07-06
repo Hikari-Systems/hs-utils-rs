@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 
 [features]
@@ -59,7 +59,7 @@ controller-payments = ["controller", "dep:hmac", "dep:sha2", "dep:hex"]
 # hs-login-controller bridge: resolves the Kratos identity and accepts/rejects
 # Hydra login/consent/logout challenges via Hydra's admin API. Mount its router
 # on a public path (`/api/oauth/*`).
-consent-bridge = ["dep:axum", "dep:reqwest"]
+consent-bridge = ["dep:axum", "dep:reqwest", "reqwest/multipart"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -59,8 +59,8 @@ impl DbSessionStore {
     /// `mcp_data_service_url` + `mcp_data_service_api_key`).
     pub fn from_config(cfg: &McpAuthConfig) -> Self {
         Self::new(McpDataServiceClient::new(
-            cfg.mcp_data_service_url.clone(),
-            cfg.mcp_data_service_api_key.clone(),
+            cfg.mcp_data_service.url.clone(),
+            cfg.mcp_data_service.api_key.clone(),
         ))
     }
 }

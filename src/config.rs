@@ -33,7 +33,25 @@
 //! accept both the native JSON type and its string encoding so that
 //! `"port": 3000` and `"port": "3000"` are both valid in config.json.
 
+use serde::Deserialize;
 use serde_json::Value;
+
+/// A downstream data-service client target: `{ url, apiKey }`.
+///
+/// The canonical shape every hs service uses to point at a sibling
+/// microservice (image-service, payment-data-service, auction-data-service, …).
+/// Lives here (not behind a feature) so any consumer — controller toolkit,
+/// consent bridge, avatar hook, or a plain service — can reuse one type instead
+/// of redeclaring `{ url, apiKey }`. `controller::config::ServiceConfig` is a
+/// backward-compatible alias of this.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataServiceConfig {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub api_key: String,
+}
 
 // ── Value tree helpers ───────────────────────────────────────────────────────
 

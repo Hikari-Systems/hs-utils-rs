@@ -22,14 +22,11 @@ pub struct KratosConfig {
 }
 
 /// A downstream microservice client target (`{ url, apiKey }`).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServiceConfig {
-    #[serde(default)]
-    pub url: String,
-    #[serde(default)]
-    pub api_key: String,
-}
+///
+/// Canonical definition now lives in [`crate::config::DataServiceConfig`]; this
+/// alias is kept so existing `controller::ServiceConfig` references (and the
+/// `CoreConfig` fields typed as it) continue to compile unchanged.
+pub use crate::config::DataServiceConfig as ServiceConfig;
 
 /// Stripe payments configuration (the payments superset). 5drive does not use
 /// this — its Stripe usage (bids) is app-specific and stays in the controller.

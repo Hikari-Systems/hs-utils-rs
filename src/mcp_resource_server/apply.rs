@@ -58,8 +58,8 @@ impl McpAuthStores {
     /// set), mcp-data-service-backed rate-limit / JWKS / ASM caches.
     pub fn from_config(cfg: &McpAuthConfig) -> Self {
         let mds = McpDataServiceClient::new(
-            cfg.mcp_data_service_url.clone(),
-            cfg.mcp_data_service_api_key.clone(),
+            cfg.mcp_data_service.url.clone(),
+            cfg.mcp_data_service.api_key.clone(),
         );
         let clients: Arc<dyn ClientStore> = match cfg
             .hydra_admin_url
