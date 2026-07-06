@@ -16,6 +16,19 @@ impl IdentityQuery {
         let Some(user_id) = gctx.user_id.clone() else {
             return Ok(None);
         };
+        // Resolve the profile LIVE from Kratos — the same source every other
+        // user resolves through (`lookup_by_sub`) — so name/email/pictureId
+        // reflect the current identity, not the values frozen into the session
+        // token at login (which lag avatar ingest and profile edits). Fall back
+        // to the session profile when the Kratos admin API is unconfigured.
+        if let Some(p) = core.kratos.lookup_by_sub(&user_id).await {
+            return Ok(Some(UserSrc {
+                id: p.id,
+                email: p.email,
+                name: p.name,
+                picture_image_service_id: p.picture_image_service_id,
+            }));
+        }
         Ok(Some(UserSrc {
             id: user_id,
             email: gctx.profile_str("email"),
