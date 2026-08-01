@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2021"
 
 [features]
@@ -55,6 +55,22 @@ controller = ["web-login", "dep:async-graphql", "dep:async-graphql-axum", "dep:c
 # controller toolkit. Stripe is a hand-rolled reqwest client (no `stripe` crate);
 # hmac/sha2/hex back the webhook signature check.
 controller-payments = ["controller", "dep:hmac", "dep:sha2", "dep:hex"]
+# OpenTelemetry tracing (OTLP/http-protobuf → Honeycomb) bridged into the
+# existing `tracing` macros, plus W3C traceparent propagation helpers. Inert
+# until `otel.enabled` is set in config, so enabling the feature alone cannot
+# change runtime behaviour.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:http",
+    "dep:reqwest13",
+    "dep:rustls",
+]
+# Adds `otel::axum_trace_layer()` — a tower-http TraceLayer emitting HTTP
+# semantic-convention attributes and adopting the inbound traceparent.
+otel-axum = ["otel", "dep:axum", "dep:tower-http"]
 # Ory Hydra login/consent/logout provider bridge (axum). A reusable port of the
 # hs-login-controller bridge: resolves the Kratos identity and accepts/rejects
 # Hydra login/consent/logout challenges via Hydra's admin API. Mount its router
@@ -88,6 +104,39 @@ chrono = { version = "0.4", default-features = false, features = ["clock"], opti
 hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 hex = { version = "0.4", optional = true }
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "rt-tokio"], optional = true }
+# Feature notes, each one load-bearing:
+#  * reqwest-BLOCKING-client — the SDK's batch span processor runs on a dedicated
+#    OS thread with no Tokio reactor, so the async client panics there ("there is
+#    no reactor running") on a background thread: service stays up, exports nothing.
+#    Do NOT also enable `reqwest-client`; the exporter prefers the async client
+#    whenever that feature is on, which reintroduces exactly that panic.
+#  * internal-logs — routes the SDK's own export errors into `tracing`. Without it
+#    that failure, and the TLS one below, are completely silent.
+# TLS is NOT configured through an otlp feature here — see the `reqwest13` dep.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "internal-logs"], optional = true }
+tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"], optional = true }
+# opentelemetry-otlp pulls its OWN reqwest 0.13, which does NOT feature-unify with
+# the reqwest 0.12 the rest of this crate uses. Left alone that copy has no TLS
+# backend at all: every HTTPS export to api.honeycomb.io fails while plain-HTTP
+# endpoints appear to work. We enable TLS on it here rather than via an otlp
+# feature, because both otlp TLS features are unusable:
+#   * `reqwest-rustls-webpki-roots` does not resolve — opentelemetry-http 0.32.0
+#     asks for a `reqwest/webpki-roots` feature that reqwest 0.13 dropped.
+#   * `reqwest-rustls` resolves but turns on reqwest's `default-tls`, which drags
+#     in aws-lc-rs. aws-lc-sys needs cmake, and the `rust:1-bookworm` builder
+#     image has no cmake — that breaks the Docker build of every service.
+# `rustls-no-provider` gives rustls with NO crypto provider selected, so we pick
+# ring below — the same provider reqwest 0.12/sqlx already use here. It leaves
+# root certs to rustls-platform-verifier (system store), so the runtime image
+# needs ca-certificates; the service Dockerfiles (debian:bookworm-slim) install it.
+# `otel::init` installs ring as the process-default provider; without that, client
+# construction inside the exporter fails at runtime.
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+tower-http = { version = "0.6", default-features = false, features = ["trace"], optional = true }
+http = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }

@@ -2,6 +2,9 @@ pub mod config;
 pub mod healthcheck;
 pub mod logging;
 
+#[cfg(feature = "otel")]
+pub mod otel;
+
 #[cfg(feature = "db")]
 pub mod db;
 
