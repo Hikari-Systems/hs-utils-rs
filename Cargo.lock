@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "hs-utils"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "actix-http",
  "actix-service",
@@ -1433,6 +1433,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-stream",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",

@@ -302,6 +302,77 @@ mod axum_support {
     type MakeSpan = fn(&http::Request<axum::body::Body>) -> tracing::Span;
     type OnResponse = fn(&http::Response<axum::body::Body>, std::time::Duration, &tracing::Span);
 
+    /// Cap for attacker-controlled string attributes. Honeycomb charges per
+    /// span and truncates anyway; an unbounded `User-Agent` is free inbound
+    /// bytes turned into billable outbound ones.
+    const MAX_ATTR_LEN: usize = 256;
+
+    const REDACTED: &str = "<redacted>";
+
+    fn truncate(s: &str, max: usize) -> String {
+        if s.len() <= max {
+            return s.to_string();
+        }
+        // Do not split a UTF-8 code point.
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
+    }
+
+    /// Record which query parameters were present, never their values.
+    ///
+    /// `?a=1&b` becomes `a=<redacted>&b=<redacted>`.
+    ///
+    /// This span wraps whole routers, so it sees every query string the service
+    /// will ever receive — including the OAuth2 callback, where the provider
+    /// puts `code` and `state`. **An authorization code is a single-use
+    /// credential exchangeable for tokens, and spans leave the building**: they
+    /// land in a third-party store with long retention. Recording the raw query
+    /// published that credential to Honeycomb for every service that mounts a
+    /// callback under this layer.
+    ///
+    /// Redacting *every* value was chosen over the two obvious alternatives,
+    /// because both fail open:
+    ///
+    /// * A **deny-list** (`code`, `token`, `secret`, …) leaks the next sensitive
+    ///   parameter anyone adds, silently, and the failure is invisible until
+    ///   someone reads a trace.
+    /// * An **allow-list** fails safe on secrets but has to be maintained per
+    ///   service, and this is a shared layer with no idea what its host routes.
+    ///
+    /// Keeping the names preserves nearly all the debugging value — "was `state`
+    /// present?", "did the client send a filter?" — at no risk. If a service
+    /// genuinely needs a value, it should record that field itself, at the
+    /// handler, where the type is known and the decision is visible in review.
+    fn redact_query(query: Option<&str>) -> String {
+        let Some(q) = query.filter(|q| !q.is_empty()) else {
+            return String::new();
+        };
+        let mut out = String::with_capacity(q.len().min(MAX_ATTR_LEN));
+        for (i, pair) in q.split('&').enumerate() {
+            if i > 0 {
+                out.push('&');
+            }
+            // A bare token carries no name to keep, and could itself be a
+            // secret — so it is replaced whole rather than passed through.
+            let name = pair.split('=').next().unwrap_or_default();
+            if name.is_empty() {
+                out.push_str(REDACTED);
+            } else {
+                out.push_str(name);
+                out.push('=');
+                out.push_str(REDACTED);
+            }
+            // Parameter *names* are attacker-supplied too; bound the result.
+            if out.len() >= MAX_ATTR_LEN {
+                return truncate(&out, MAX_ATTR_LEN);
+            }
+        }
+        out
+    }
+
     /// A `TraceLayer` that names the server span `{METHOD} {path}` and records
     /// HTTP semantic-convention attributes, adopting an inbound `traceparent`
     /// as the parent so the trace spans service boundaries.
@@ -329,13 +400,15 @@ mod axum_support {
             otel.status_code = tracing::field::Empty,
             http.request.method = %method,
             url.path = %path,
-            url.query = req.uri().query().unwrap_or_default(),
+            url.query = %redact_query(req.uri().query()),
             network.protocol.version = ?req.version(),
-            user_agent.original = req
-                .headers()
-                .get(http::header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default(),
+            user_agent.original = %truncate(
+                req.headers()
+                    .get(http::header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default(),
+                MAX_ATTR_LEN,
+            ),
             http.response.status_code = tracing::field::Empty,
         );
         // Fails only when the subscriber has no OpenTelemetry layer (tracing
@@ -356,6 +429,143 @@ mod axum_support {
         // otherwise drown the error rate in routine 401s from MCP auth probes.
         if status.is_server_error() {
             span.record("otel.status_code", "ERROR");
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The regression this module exists for. An OAuth2 provider redirects
+        /// to the callback with `?code=…&state=…`; before v0.26.0 the raw query
+        /// went onto the span verbatim and was exported to Honeycomb.
+        #[test]
+        fn oauth_callback_query_does_not_carry_the_authorization_code() {
+            let out = redact_query(Some("code=ory_ac_live_9f3&state=csrf-1"));
+            assert_eq!(out, "code=<redacted>&state=<redacted>");
+            assert!(!out.contains("ory_ac_live_9f3"), "authorization code leaked: {out}");
+            assert!(!out.contains("csrf-1"), "csrf state leaked: {out}");
+        }
+
+        /// Names are kept because they carry the debugging value — "was `state`
+        /// present at all?" is most of what you want from a failed login.
+        #[test]
+        fn parameter_names_are_preserved() {
+            assert_eq!(redact_query(Some("page=2&sort=name")), "page=<redacted>&sort=<redacted>");
+        }
+
+        /// A bare token has no name to keep and could itself be a secret, so it
+        /// is replaced whole rather than passed through as a "name".
+        #[test]
+        fn a_valueless_parameter_is_still_redacted() {
+            assert_eq!(redact_query(Some("verbose")), "verbose=<redacted>");
+            assert_eq!(redact_query(Some("=orphan")), "<redacted>");
+        }
+
+        /// `=` inside a value must not resurrect it — base64 and JWTs are full
+        /// of them, and splitting on the last `=` instead of the first would
+        /// publish the payload.
+        #[test]
+        fn only_the_first_equals_delimits_the_name() {
+            assert_eq!(redact_query(Some("t=aGVsbG8=world=")), "t=<redacted>");
+        }
+
+        #[test]
+        fn empty_and_absent_queries_are_empty() {
+            assert_eq!(redact_query(None), "");
+            assert_eq!(redact_query(Some("")), "");
+        }
+
+        /// Parameter names are attacker-supplied, so the redacted result is
+        /// bounded too — otherwise redaction just moves the amplification.
+        #[test]
+        fn attacker_supplied_names_cannot_grow_the_attribute_without_bound() {
+            let hostile = (0..1000).map(|i| format!("p{i}=x")).collect::<Vec<_>>().join("&");
+            let out = redact_query(Some(&hostile));
+            assert!(out.len() <= MAX_ATTR_LEN + 4, "unbounded attribute: {} bytes", out.len());
+        }
+
+        /// Drives the **real** `axum_trace_layer` over a router that mounts a
+        /// callback at the same path `web_login` uses, and asserts on what the
+        /// span actually recorded.
+        ///
+        /// The unit tests above prove `redact_query` is correct; this proves
+        /// `make_span` still calls it. Without this, deleting the call site
+        /// would leave every test above green while the leak came back.
+        #[tokio::test]
+        async fn the_real_layer_records_no_credential_from_a_callback_request() {
+            use std::sync::{Arc, Mutex};
+            use tower::ServiceExt;
+            use tracing_subscriber::layer::SubscriberExt;
+
+            type Fields = Arc<Mutex<Vec<(String, String)>>>;
+
+            struct Grab(Fields);
+            impl tracing::field::Visit for Grab {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.lock().unwrap().push((f.name().into(), format!("{v:?}")));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.0.lock().unwrap().push((f.name().into(), v.into()));
+                }
+            }
+
+            struct Capture(Fields);
+            impl<S> tracing_subscriber::Layer<S> for Capture
+            where
+                S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+            {
+                fn on_new_span(
+                    &self,
+                    attrs: &tracing::span::Attributes<'_>,
+                    _: &tracing::Id,
+                    _: tracing_subscriber::layer::Context<'_, S>,
+                ) {
+                    attrs.record(&mut Grab(self.0.clone()));
+                }
+            }
+
+            let fields: Fields = Arc::new(Mutex::new(Vec::new()));
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(Capture(fields.clone())),
+            );
+
+            let app = axum::Router::new()
+                .route("/api/oauth2/callback", axum::routing::get(|| async { "ok" }))
+                .layer(axum_trace_layer());
+
+            let req = http::Request::builder()
+                .uri("/api/oauth2/callback?code=ory_ac_live_9f3&state=csrf-1")
+                .header(http::header::USER_AGENT, "u".repeat(4096))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let _ = app.oneshot(req).await.unwrap();
+
+            let recorded = fields.lock().unwrap().clone();
+            assert!(!recorded.is_empty(), "the layer recorded no span at all");
+            let all = recorded
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+
+            assert!(!all.contains("ory_ac_live_9f3"), "authorization code reached the span: {all}");
+            assert!(!all.contains("csrf-1"), "csrf state reached the span: {all}");
+
+            let ua = recorded
+                .iter()
+                .find(|(k, _)| k == "user_agent.original")
+                .expect("user_agent.original should be recorded");
+            assert!(ua.1.len() <= MAX_ATTR_LEN + 8, "user agent unbounded: {} bytes", ua.1.len());
+        }
+
+        #[test]
+        fn user_agent_is_truncated_on_a_char_boundary() {
+            let long = "é".repeat(500);
+            let out = truncate(&long, MAX_ATTR_LEN);
+            assert!(out.len() <= MAX_ATTR_LEN + 4);
+            assert!(out.ends_with('…'));
+            assert_eq!(truncate("curl/8.5.0", MAX_ATTR_LEN), "curl/8.5.0");
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2021"
 
 [features]
@@ -140,3 +140,8 @@ http = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }
+# `ServiceExt::oneshot`, so the otel-axum tests can drive the REAL TraceLayer
+# instead of testing its helpers in isolation — a correct `redact_query` proves
+# nothing if `make_span` stops calling it. Already in the tree transitively via
+# axum/tower-http, so this adds no download.
+tower = { version = "0.5", features = ["util"] }
