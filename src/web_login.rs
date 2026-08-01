@@ -492,6 +492,29 @@ fn bad_request(msg: &'static str) -> Response {
     (StatusCode::BAD_REQUEST, msg).into_response()
 }
 
+/// Max length for an attacker-supplied value recorded on a log line.
+const MAX_LOGGED_LEN: usize = 256;
+
+/// Bound an untrusted value before it is logged.
+///
+/// Callers must additionally record the result as a `&str` (`field = log_safe(x)
+/// .as_str()`) and **never** with the `%` sigil: `%` formats via `Display`,
+/// which the fmt layer emits unescaped, so a value containing CRLF injects
+/// whole forged lines into the log stream. Recorded as a `&str` the formatter
+/// escapes it, and this caps the length so it cannot flood the stream either —
+/// the same reasoning that bounds `url.query` and `user_agent.original` in
+/// `crate::otel`, which these fields would otherwise sidestep.
+fn log_safe(s: &str) -> String {
+    if s.len() <= MAX_LOGGED_LEN {
+        return s.to_string();
+    }
+    let mut end = MAX_LOGGED_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 // ─── Callback handler + gate middleware ────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -507,7 +530,9 @@ async fn callback(
     Query(q): Query<CallbackQuery>,
 ) -> Response {
     if let Some(err) = q.error.as_deref() {
-        tracing::warn!(error = err, "web_login: provider returned error");
+        // Already a `&str`, so the formatter escapes it — but it is still an
+        // unbounded attacker-supplied query parameter, so it is capped too.
+        tracing::warn!(error = log_safe(err).as_str(), "web_login: provider returned error");
         return bad_request("login error");
     }
     let (Some(code), Some(state_key)) = (q.code, q.state) else {
@@ -522,7 +547,14 @@ async fn callback(
         .await
         .and_then(|s| s.redirects.get(&state_key).cloned());
     let Some(orig) = orig else {
-        tracing::warn!(state = %state_key, "web_login: no stored state");
+        // Recorded as `&str`, NOT `%state_key`. The `%` sigil formats via
+        // Display, which the fmt layer passes through unescaped — so a
+        // `state` containing CRLF lets an unauthenticated caller inject
+        // whole forged lines into the log stream, indistinguishable from
+        // real ones. As a `&str` the formatter escapes it. Bounded too:
+        // this value is attacker-chosen and otherwise unlimited, which
+        // sidesteps the caps applied to `url.query` and the user agent.
+        tracing::warn!(state = log_safe(&state_key).as_str(), "web_login: no stored state");
         return bad_request("no state found");
     };
 
@@ -530,7 +562,7 @@ async fn callback(
         Ok(t) if !t.access_token.is_empty() => t,
         Ok(_) => return bad_request("no access token in response"),
         Err(e) => {
-            tracing::warn!(error = %e, "web_login: token exchange failed");
+            tracing::warn!(error = log_safe(&e.to_string()).as_str(), "web_login: token exchange failed");
             return bad_request("token exchange failed");
         }
     };
@@ -539,7 +571,7 @@ async fn callback(
     {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "web_login: userinfo fetch failed");
+            tracing::warn!(error = log_safe(&e.to_string()).as_str(), "web_login: userinfo fetch failed");
             return bad_request("profile fetch failed");
         }
     };

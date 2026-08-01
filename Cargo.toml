@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.26.0"
+version = "0.26.1"
 edition = "2021"
 
 [features]
@@ -89,7 +89,12 @@ actix-service = { version = "2", optional = true }
 actix-http = { version = "3", optional = true }
 futures-util = { version = "0.3", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"], optional = true }
+# `matched-path` is required by otel::axum_trace_layer, which names spans after
+# the route TEMPLATE rather than the concrete path. Declared here rather than
+# left to feature unification: with only `otel-axum` on, axum has no
+# matched-path and the build fails — it compiled during development purely
+# because `controller`/`async-graphql-axum` happened to turn it on.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query", "matched-path"], optional = true }
 jsonwebtoken = { version = "9", default-features = false, optional = true }
 moka = { version = "0.12", default-features = false, features = ["future"], optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time"], optional = true }

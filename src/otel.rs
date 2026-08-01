@@ -355,15 +355,17 @@ mod axum_support {
             if i > 0 {
                 out.push('&');
             }
-            // A bare token carries no name to keep, and could itself be a
-            // secret — so it is replaced whole rather than passed through.
-            let name = pair.split('=').next().unwrap_or_default();
-            if name.is_empty() {
-                out.push_str(REDACTED);
-            } else {
-                out.push_str(name);
-                out.push('=');
-                out.push_str(REDACTED);
+            // A bare token — `?sometoken` with no `=` — carries no name to keep
+            // and could itself be a secret, so it is replaced whole. Splitting
+            // on `=` and treating the left side as a "name" would echo exactly
+            // such a token verbatim, which is how a fail-safe design fails open.
+            match pair.split_once('=') {
+                Some((name, _)) if !name.is_empty() => {
+                    out.push_str(name);
+                    out.push('=');
+                    out.push_str(REDACTED);
+                }
+                _ => out.push_str(REDACTED),
             }
             // Parameter *names* are attacker-supplied too; bound the result.
             if out.len() >= MAX_ATTR_LEN {
@@ -386,16 +388,34 @@ mod axum_support {
             .on_response(on_response as OnResponse)
     }
 
+    /// What the span is named when axum did not match a route — a 404, or a
+    /// `ServeDir`/fallback hit. Deliberately constant: the raw path there is
+    /// entirely attacker-chosen, and using it would mint one span name per
+    /// probe. The real path is still on `url.path`, bounded.
+    const UNMATCHED: &str = "<unmatched>";
+
     fn make_span(req: &http::Request<axum::body::Body>) -> tracing::Span {
         let method = req.method().as_str();
-        let path = req.uri().path();
-        // Span names must stay low-cardinality for aggregation, so this uses
-        // the raw path — fine here because these services route on a small
-        // fixed set (/mcp, /healthcheck, discovery). Add a route-matching
-        // layer before reusing this on a service with :id path params.
+        // `url.path` is attacker-supplied and unbounded — the same "free
+        // inbound bytes turned into billable outbound ones" argument that
+        // bounds the user agent. A 4 KB path produced a 4 KB attribute.
+        let path = truncate(req.uri().path(), MAX_ATTR_LEN);
+        // The span NAME is the primary aggregation key, so it must stay
+        // low-cardinality. `MatchedPath` is axum's route template
+        // (`/api/image/url/{id}`) rather than the concrete path, and it is in
+        // the extensions because `Router::layer` runs after routing. Without
+        // this, a service with `:id` params or a `ServeDir` catch-all mints a
+        // distinct span name per request — which is exactly what the previous
+        // revision of this comment told callers to go and fix themselves, and
+        // which none of them did.
+        let route = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|m| m.as_str())
+            .unwrap_or(UNMATCHED);
         let span = tracing::info_span!(
             "http.server",
-            otel.name = %format!("{method} {path}"),
+            otel.name = %format!("{method} {route}"),
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
             http.request.method = %method,
@@ -435,6 +455,40 @@ mod axum_support {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        type Fields = Arc<Mutex<Vec<(String, String)>>>;
+
+        fn capture() -> Fields {
+            Arc::new(Mutex::new(Vec::new()))
+        }
+
+        struct Grab(Fields);
+        impl tracing::field::Visit for Grab {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.lock().unwrap().push((f.name().into(), format!("{v:?}")));
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                self.0.lock().unwrap().push((f.name().into(), v.into()));
+            }
+        }
+
+        struct Capture(Fields);
+        impl<S> tracing_subscriber::Layer<S> for Capture
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _: &tracing::Id,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                attrs.record(&mut Grab(self.0.clone()));
+            }
+        }
 
         /// The regression this module exists for. An OAuth2 provider redirects
         /// to the callback with `?code=…&state=…`; before v0.26.0 the raw query
@@ -456,10 +510,31 @@ mod axum_support {
 
         /// A bare token has no name to keep and could itself be a secret, so it
         /// is replaced whole rather than passed through as a "name".
+        ///
+        /// v0.26.0 got this wrong: it split on `=` and treated the left side as
+        /// a name, so `?ory_at_live_SECRET` came out as
+        /// `ory_at_live_SECRET=<redacted>` — the token echoed verbatim by the
+        /// function whose entire job is to not do that. Fail-safe by design,
+        /// fail-open in fact.
         #[test]
-        fn a_valueless_parameter_is_still_redacted() {
-            assert_eq!(redact_query(Some("verbose")), "verbose=<redacted>");
+        fn a_valueless_parameter_is_redacted_whole_not_echoed_as_a_name() {
+            assert_eq!(redact_query(Some("verbose")), "<redacted>");
             assert_eq!(redact_query(Some("=orphan")), "<redacted>");
+
+            let out = redact_query(Some("ory_at_live_SUPERSECRET"));
+            assert!(!out.contains("SUPERSECRET"), "bare token echoed as a name: {out}");
+
+            // Mixed: the named one keeps its name, the bare one does not.
+            assert_eq!(redact_query(Some("page=2&ory_at_live_X")), "page=<redacted>&<redacted>");
+        }
+
+        /// `url.path` is as attacker-supplied as the user agent, and it is worse
+        /// because it also feeds the span name. A 4 KB path produced a 4 KB
+        /// attribute until this bound existed.
+        #[test]
+        fn an_absurd_path_is_bounded() {
+            let out = truncate(&"A".repeat(4000), MAX_ATTR_LEN);
+            assert!(out.len() <= MAX_ATTR_LEN + 4, "path unbounded: {} bytes", out.len());
         }
 
         /// `=` inside a value must not resurrect it — base64 and JWTs are full
@@ -494,38 +569,7 @@ mod axum_support {
         /// would leave every test above green while the leak came back.
         #[tokio::test]
         async fn the_real_layer_records_no_credential_from_a_callback_request() {
-            use std::sync::{Arc, Mutex};
-            use tower::ServiceExt;
-            use tracing_subscriber::layer::SubscriberExt;
-
-            type Fields = Arc<Mutex<Vec<(String, String)>>>;
-
-            struct Grab(Fields);
-            impl tracing::field::Visit for Grab {
-                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
-                    self.0.lock().unwrap().push((f.name().into(), format!("{v:?}")));
-                }
-                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
-                    self.0.lock().unwrap().push((f.name().into(), v.into()));
-                }
-            }
-
-            struct Capture(Fields);
-            impl<S> tracing_subscriber::Layer<S> for Capture
-            where
-                S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-            {
-                fn on_new_span(
-                    &self,
-                    attrs: &tracing::span::Attributes<'_>,
-                    _: &tracing::Id,
-                    _: tracing_subscriber::layer::Context<'_, S>,
-                ) {
-                    attrs.record(&mut Grab(self.0.clone()));
-                }
-            }
-
-            let fields: Fields = Arc::new(Mutex::new(Vec::new()));
+            let fields: Fields = capture();
             let _guard = tracing::subscriber::set_default(
                 tracing_subscriber::registry().with(Capture(fields.clone())),
             );
@@ -557,6 +601,56 @@ mod axum_support {
                 .find(|(k, _)| k == "user_agent.original")
                 .expect("user_agent.original should be recorded");
             assert!(ua.1.len() <= MAX_ATTR_LEN + 8, "user agent unbounded: {} bytes", ua.1.len());
+        }
+
+        /// Span names are the primary aggregation key, so they must not carry a
+        /// path parameter or an attacker-chosen 404 path. Drives the real layer
+        /// over a router with an `{id}` route and a fallback.
+        #[tokio::test]
+        async fn span_names_use_the_route_template_not_the_concrete_path() {
+            let cap = capture();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(Capture(cap.clone())),
+            );
+
+            let app = axum::Router::new()
+                .route("/api/image/url/{id}", axum::routing::get(|| async { "ok" }))
+                .fallback(|| async { "not found" })
+                .layer(axum_trace_layer());
+
+            let get = |uri: &str| {
+                http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()
+            };
+
+            let _ = app.clone().oneshot(get("/api/image/url/abc-123")).await.unwrap();
+            let _ = app.oneshot(get(&format!("/{}", "A".repeat(4000)))).await.unwrap();
+
+            let rec = cap.lock().unwrap().clone();
+            let names: Vec<&str> = rec
+                .iter()
+                .filter(|(k, _)| k == "otel.name")
+                .map(|(_, v)| v.as_str())
+                .collect();
+
+            assert!(
+                names.contains(&"GET /api/image/url/{id}"),
+                "span name should be the route template, got {names:?}"
+            );
+            assert!(
+                !names.iter().any(|n| n.contains("abc-123")),
+                "concrete id leaked into the span name: {names:?}"
+            );
+            assert!(
+                names.contains(&"GET <unmatched>"),
+                "an unmatched path should collapse to a constant, got {names:?}"
+            );
+            for (k, v) in &rec {
+                assert!(
+                    v.len() <= MAX_ATTR_LEN + 8,
+                    "{k} is unbounded at {} bytes — attacker-supplied paths must be capped",
+                    v.len()
+                );
+            }
         }
 
         #[test]
