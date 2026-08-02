@@ -145,9 +145,7 @@ async fn infer(cfg: &SessionConfig, ttl: Duration) -> Result<SessionSetup> {
         .db
         .as_ref()
         .is_some_and(|db| !db.host.trim().is_empty());
-    let redis_configured = cfg.redis.as_ref().is_some_and(|r| {
-        r.url.as_deref().is_some_and(|u| !u.trim().is_empty()) || !r.hosts.is_empty()
-    });
+    let redis_configured = cfg.redis.as_ref().is_some_and(|r| !r.url.is_empty());
 
     if pg_configured {
         let setup = postgres(cfg, ttl).await.context(
@@ -240,42 +238,48 @@ fn redis_store(cfg: &SessionConfig, ttl: Duration) -> Result<SessionSetup> {
     use crate::web_login_redis::{RedisSentinelConfig, RedisSessionStore};
 
     let r = cfg.redis.as_ref().context("session.redis is not set")?;
-
-    // URL wins: it is the single-node shape, and a config carrying both is
-    // likelier to be a local override of a deployed Sentinel block than an
-    // instruction to prefer Sentinel.
-    if let Some(url) = r.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-        let store = RedisSessionStore::from_url(url, ttl)?;
-        return Ok(SessionSetup {
-            store: Arc::new(store),
-            kind: SessionStoreKind::Redis,
-            #[cfg(feature = "db")]
-            pg_pool: None,
-        });
-    }
-
     anyhow::ensure!(
-        !r.hosts.is_empty(),
-        "session.redis needs either `url` (single node) or `hosts` + `masterName` (sentinel)"
+        !r.url.is_empty(),
+        "session.redis.url is empty — give one redis URL, or several plus \
+         `masterName` for sentinel"
     );
+
+    // `masterName` decides the mode, not the number of URLs. A single-sentinel
+    // dev setup is a real thing, and inferring "one entry means direct" would
+    // point it at the sentinel port as though it were a redis node.
     let master_name = r
         .master_name
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .context("session.redis.masterName is required for sentinel mode")?;
+        .filter(|s| !s.is_empty());
 
-    let store = RedisSessionStore::from_sentinel(
-        RedisSentinelConfig {
-            hosts: r.hosts.clone(),
-            master_name: master_name.to_string(),
-            db: r.db.unwrap_or(0) as i64,
-            username: r.username.clone(),
-            password: r.password.clone(),
-            tls: r.tls.unwrap_or(false),
-        },
-        ttl,
-    )?;
+    let store = match master_name {
+        Some(master_name) => RedisSessionStore::from_sentinel(
+            RedisSentinelConfig {
+                hosts: r.url.clone(),
+                master_name: master_name.to_string(),
+                db: r.db.unwrap_or(0) as i64,
+                username: r.username.clone(),
+                password: r.password.clone(),
+                tls: r.tls.unwrap_or(false),
+            },
+            ttl,
+        )?,
+        None => {
+            // Refuse rather than silently using the first. Several URLs with no
+            // `masterName` is a sentinel list that forgot one key, and quietly
+            // connecting to one node of a cluster as though it were the whole
+            // store is the kind of half-working that surfaces as lost sessions.
+            anyhow::ensure!(
+                r.url.len() == 1,
+                "session.redis.url has {} entries but `masterName` is not set — \
+                 direct mode takes exactly one URL; set `masterName` to use these \
+                 as sentinel addresses",
+                r.url.len()
+            );
+            RedisSessionStore::from_url(&r.url[0], ttl)?
+        }
+    };
 
     Ok(SessionSetup {
         store: Arc::new(store),
@@ -349,29 +353,35 @@ mod tests {
         assert!(build_session_store(&c).await.is_err());
     }
 
-    /// Sentinel config with no master name cannot be built, and saying so beats
-    /// connecting to nothing.
+    /// Several addresses with no `masterName` is a sentinel list missing a key.
+    /// Silently taking the first would connect to one node of a cluster as
+    /// though it were the whole store — half-working, and it surfaces later as
+    /// lost sessions rather than as a startup failure.
     #[cfg(feature = "web-login-redis")]
     #[tokio::test]
-    async fn sentinel_without_a_master_name_is_an_error() {
+    async fn several_urls_without_a_master_name_is_an_error() {
         let c = SessionConfig {
             store: Some("redis".into()),
             redis: Some(SessionRedisConfig {
-                hosts: vec!["sentinel-a:26379".into()],
+                url: vec!["a:26379".into(), "b:26379".into(), "c:26379".into()],
                 ..Default::default()
             }),
             ..cfg()
         };
-        assert!(build_session_store(&c).await.is_err());
+        // `{:#}` — the alternate form walks the source chain. `to_string()`
+        // shows only the outermost `.context(...)`, which is the generic
+        // "could not be built" wrapper and names nothing actionable.
+        let err = format!("{:#}", build_session_store(&c).await.unwrap_err());
+        assert!(err.contains("masterName"), "error should name the missing key: {err}");
     }
 
     #[cfg(feature = "web-login-redis")]
     #[tokio::test]
-    async fn a_redis_url_builds_without_touching_the_network() {
+    async fn a_single_redis_url_builds_without_touching_the_network() {
         let c = SessionConfig {
             store: Some("redis".into()),
             redis: Some(SessionRedisConfig {
-                url: Some("redis://session-redis:6379/0".into()),
+                url: vec!["redis://session-redis:6379/0".into()],
                 ..Default::default()
             }),
             ..cfg()
@@ -415,7 +425,7 @@ mod sentinel_config_tests {
             }
         });
         let cfg: SessionConfig = serde_json::from_value(json).expect("should deserialise");
-        assert_eq!(cfg.redis.as_ref().unwrap().hosts.len(), 3);
+        assert_eq!(cfg.redis.as_ref().unwrap().url.len(), 3);
         assert_eq!(cfg.redis.as_ref().unwrap().db, Some(3), "db must accept the string form");
         assert_eq!(cfg.redis.as_ref().unwrap().tls, Some(true), "tls must accept the string form");
 
@@ -431,33 +441,34 @@ mod sentinel_config_tests {
             "masterName": "mymaster"
         }))
         .unwrap();
-        assert_eq!(cfg.hosts, vec!["a:26379", "b:26379"]);
+        assert_eq!(cfg.url, vec!["a:26379", "b:26379"]);
     }
 
     #[test]
     fn a_trailing_separator_is_not_an_error() {
         let cfg: SessionRedisConfig =
             serde_json::from_value(serde_json::json!({ "hosts": "a:26379, b:26379, " })).unwrap();
-        assert_eq!(cfg.hosts, vec!["a:26379", "b:26379"]);
+        assert_eq!(cfg.url, vec!["a:26379", "b:26379"]);
     }
 
-    /// `url` and `hosts` both set: URL wins. Stated as a test because a config
-    /// carrying both is a local single-node override of a deployed Sentinel
-    /// block, and silently preferring Sentinel would connect the developer to
-    /// production's cluster.
+    /// `masterName`, not the entry count, selects sentinel — so a ONE-address
+    /// sentinel (a dev quorum of one) is expressible. Inferring the mode from
+    /// the list length would point this at the sentinel port as if it were a
+    /// redis node.
     #[cfg(feature = "web-login-redis")]
     #[tokio::test]
-    async fn a_url_overrides_a_sentinel_block() {
+    async fn one_address_plus_a_master_name_is_still_sentinel() {
         let cfg = SessionConfig {
             store: Some("redis".into()),
             redis: Some(SessionRedisConfig {
-                url: Some("redis://localhost:6379".into()),
-                hosts: vec!["sentinel-a:26379".into()],
+                url: vec!["sentinel-a:26379".into()],
                 master_name: Some("mymaster".into()),
                 ..Default::default()
             }),
             ..Default::default()
         };
+        // A bare host:port is not a valid direct URL, so this building at all
+        // proves the sentinel branch was taken.
         assert_eq!(build_session_store(&cfg).await.unwrap().kind, SessionStoreKind::Redis);
     }
 }

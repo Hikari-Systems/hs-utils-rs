@@ -764,27 +764,35 @@ where
 /// Redis settings for the browser-session store, covering both shapes
 /// [`crate::web_login_redis::RedisSessionStore`] supports.
 ///
-/// `url` selects the single-node mode and wins when set; otherwise `hosts` +
-/// `masterName` select Sentinel. They are one struct rather than two so a
-/// deployment can move between them by changing config alone.
+/// **One key holds the addresses in both modes**, and `masterName` decides
+/// which mode they are addresses *for*. An earlier revision had `url` for a
+/// single node and `hosts` for Sentinel, which meant moving between them was
+/// not "change a value" but "know which of two keys this deployment uses".
+///
+/// `masterName` set → the list is Sentinel addresses. Unset → a single direct
+/// node. Deliberately keyed on `masterName` rather than on how many entries
+/// were written: a one-node Sentinel is legitimate in development, and
+/// inferring the mode from a list length would silently reinterpret it.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRedisConfig {
-    /// Single node, e.g. `redis://session-redis:6379/0`. Carries db index,
-    /// credentials and TLS (`rediss://`) inline.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// Sentinel addresses (`host:port`), with or without a `redis://` scheme.
+    /// Redis URL(s) — a JSON array or a delimited string, so it is settable as
+    /// `session__redis__url="a:26379,b:26379,c:26379"` from a deployment stack
+    /// that cannot express an array.
     ///
-    /// Accepts a JSON array or a delimited string, so this is settable as
-    /// `session__redis__hosts="a:26379,b:26379,c:26379"` from a deployment
-    /// stack that has no way to express an array.
-    #[serde(default, deserialize_with = "deser_string_list")]
-    pub hosts: Vec<String>,
-    /// Sentinel master group name.
+    /// Direct mode takes exactly one, e.g. `redis://session-redis:6379/0`,
+    /// which carries db index, credentials and TLS (`rediss://`) inline.
+    /// Sentinel mode takes the sentinel addresses, with or without a scheme.
+    ///
+    /// `urls` and `hosts` are accepted spellings of this same key.
+    #[serde(default, alias = "urls", alias = "hosts", deserialize_with = "deser_string_list")]
+    pub url: Vec<String>,
+    /// Sentinel master group name. **Its presence selects Sentinel mode.**
     #[serde(default)]
     pub master_name: Option<String>,
-    /// Redis logical db index (Sentinel mode; for `url` put it in the path).
+    /// Redis logical db index. Sentinel mode only — in direct mode put it in
+    /// the URL path (`redis://host:6379/3`), because that is where the redis
+    /// crate reads it from and two sources for one value would disagree.
     #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
     pub db: Option<u32>,
     #[serde(default)]
