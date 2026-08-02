@@ -392,3 +392,72 @@ mod tests {
         assert_eq!(build_session_store(&c).await.unwrap().kind, SessionStoreKind::Memory);
     }
 }
+
+#[cfg(test)]
+mod sentinel_config_tests {
+    use super::*;
+    use crate::config::SessionRedisConfig;
+
+    /// Sentinel must be reachable from the environment, not just from
+    /// config.json: the deployed stacks set everything through `a__b__c` env
+    /// vars, and that layer can only ever write a string.
+    #[cfg(feature = "web-login-redis")]
+    #[tokio::test]
+    async fn sentinel_hosts_can_come_from_a_delimited_string() {
+        let json = serde_json::json!({
+            "store": "redis",
+            "redis": {
+                "hosts": "sentinel-a:26379,sentinel-b:26379,sentinel-c:26379",
+                "masterName": "mymaster",
+                "db": "3",
+                "auth": "hunter2",
+                "tls": "true"
+            }
+        });
+        let cfg: SessionConfig = serde_json::from_value(json).expect("should deserialise");
+        assert_eq!(cfg.redis.as_ref().unwrap().hosts.len(), 3);
+        assert_eq!(cfg.redis.as_ref().unwrap().db, Some(3), "db must accept the string form");
+        assert_eq!(cfg.redis.as_ref().unwrap().tls, Some(true), "tls must accept the string form");
+
+        let s = build_session_store(&cfg).await.unwrap();
+        assert_eq!(s.kind, SessionStoreKind::Redis);
+    }
+
+    /// The JSON-array form must keep working — config.json files already use it.
+    #[test]
+    fn sentinel_hosts_still_accept_a_json_array() {
+        let cfg: SessionRedisConfig = serde_json::from_value(serde_json::json!({
+            "hosts": ["a:26379", "b:26379"],
+            "masterName": "mymaster"
+        }))
+        .unwrap();
+        assert_eq!(cfg.hosts, vec!["a:26379", "b:26379"]);
+    }
+
+    #[test]
+    fn a_trailing_separator_is_not_an_error() {
+        let cfg: SessionRedisConfig =
+            serde_json::from_value(serde_json::json!({ "hosts": "a:26379, b:26379, " })).unwrap();
+        assert_eq!(cfg.hosts, vec!["a:26379", "b:26379"]);
+    }
+
+    /// `url` and `hosts` both set: URL wins. Stated as a test because a config
+    /// carrying both is a local single-node override of a deployed Sentinel
+    /// block, and silently preferring Sentinel would connect the developer to
+    /// production's cluster.
+    #[cfg(feature = "web-login-redis")]
+    #[tokio::test]
+    async fn a_url_overrides_a_sentinel_block() {
+        let cfg = SessionConfig {
+            store: Some("redis".into()),
+            redis: Some(SessionRedisConfig {
+                url: Some("redis://localhost:6379".into()),
+                hosts: vec!["sentinel-a:26379".into()],
+                master_name: Some("mymaster".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(build_session_store(&cfg).await.unwrap().kind, SessionStoreKind::Redis);
+    }
+}

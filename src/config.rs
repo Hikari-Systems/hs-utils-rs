@@ -720,6 +720,45 @@ pub struct DbConfig {
     pub debug: Option<bool>,
 }
 
+/// Deserialise a list of strings from **either** a JSON array or a delimited
+/// string.
+///
+/// The `__` env-override layer can only ever set a string at a path
+/// (`set_nested` takes `&str`), so a config key typed as `Vec<String>` is
+/// reachable from `config.json` and unreachable from the environment. That is
+/// not a theoretical gap: the deployed stacks configure services almost
+/// entirely through `service__key__subkey` env vars, so an array-typed key is
+/// effectively un-deployable without this.
+///
+/// Accepts `["a:26379","b:26379"]` or `"a:26379,b:26379"` (comma, semicolon or
+/// whitespace separated). Empty entries are dropped so a trailing comma is not
+/// an error.
+pub fn deser_string_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Value::deserialize(d)?;
+    Ok(match v {
+        Value::Null => Vec::new(),
+        Value::String(s) => s
+            .split([',', ';', ' ', '\t', '\n'])
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|i| match i {
+                Value::String(s) => Some(s),
+                other => Some(other.to_string()),
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        other => vec![other.to_string()],
+    })
+}
+
 // ── Browser session store config ─────────────────────────────────────────────
 
 /// Redis settings for the browser-session store, covering both shapes
@@ -736,7 +775,11 @@ pub struct SessionRedisConfig {
     #[serde(default)]
     pub url: Option<String>,
     /// Sentinel addresses (`host:port`), with or without a `redis://` scheme.
-    #[serde(default)]
+    ///
+    /// Accepts a JSON array or a delimited string, so this is settable as
+    /// `session__redis__hosts="a:26379,b:26379,c:26379"` from a deployment
+    /// stack that has no way to express an array.
+    #[serde(default, deserialize_with = "deser_string_list")]
     pub hosts: Vec<String>,
     /// Sentinel master group name.
     #[serde(default)]
