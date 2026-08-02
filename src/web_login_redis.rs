@@ -1,17 +1,38 @@
-//! Redis (Sentinel-aware) [`WebSessionStore`] for cross-replica browser login.
+//! Redis [`WebSessionStore`] for cross-replica browser login, over **either a
+//! Sentinel cluster or a single node**.
 //!
 //! Backs [`crate::web_login::WebLogin`]'s `state → URL` map and post-login
 //! cookie session in a shared redis so the `gate` (flow start) and `callback`
 //! (flow finish) can run on different replicas behind a load balancer without
 //! the callback hitting "no stored state".
 //!
-//! Mirrors the FalkorDB/graph-data-service Sentinel pattern: discover the
-//! current master through Redis Sentinel and re-resolve on failover. The same
-//! FalkorDB Sentinel cluster is reused (it is just redis) on a dedicated db
-//! index.
+//! Two connection modes, chosen by which constructor the caller uses:
+//!
+//! * [`RedisSessionStore::from_sentinel`] — the deployed shape. Mirrors the
+//!   FalkorDB/graph-data-service Sentinel pattern: discover the current master
+//!   through Redis Sentinel and re-resolve on failover. The same FalkorDB
+//!   Sentinel cluster is reused (it is just redis) on a dedicated db index.
+//! * [`RedisSessionStore::from_url`] — a single node from a `redis://` or
+//!   `rediss://` URL. This exists so a local compose stack can run one
+//!   `redis:7` container and still exercise **the same store, the same
+//!   serialisation and the same key layout** as production, instead of running
+//!   a different store locally and discovering the difference in deployment.
+//!   Standing up a three-node Sentinel quorum to develop against is not a
+//!   reasonable ask, and the alternative — Postgres locally, redis in prod —
+//!   means the code path under test is not the code path that ships.
+//!
+//! Both are sync constructors that perform **no I/O**: `Client::open` only
+//! parses the URL, and Sentinel resolution happens per call. That is deliberate
+//! and load-bearing for the posture below — a store that failed construction
+//! when redis was down would turn a degraded dependency into a service that
+//! will not boot.
 //!
 //! Posture matches the rest of hs-utils' shared stores: **fail open** — a redis
 //! outage degrades to "the user is asked to log in again", never a 500.
+//!
+//! Note both modes obtain a connection per operation. For Sentinel that is
+//! required (the master can move); for a single node it is merely consistent,
+//! and is the honest trade for keeping the two paths behaviourally identical.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,9 +64,19 @@ pub struct RedisSentinelConfig {
     pub tls: bool,
 }
 
-/// Sentinel-aware redis [`WebSessionStore`].
+/// How this store reaches redis. Not public: callers choose by constructor,
+/// and every operation goes through [`RedisSessionStore::conn`], so the two
+/// modes cannot diverge in serialisation, key layout or failure handling.
+enum Backend {
+    /// Resolve the current master through Sentinel on every operation.
+    Sentinel(Arc<Mutex<SentinelClient>>),
+    /// A single node. `Client` holds parsed connection info, not a socket.
+    Direct(redis::Client),
+}
+
+/// Redis [`WebSessionStore`], over a Sentinel cluster or a single node.
 pub struct RedisSessionStore {
-    sentinel: Arc<Mutex<SentinelClient>>,
+    backend: Backend,
     ttl_secs: u64,
     prefix: String,
 }
@@ -53,6 +84,26 @@ pub struct RedisSessionStore {
 impl RedisSessionStore {
     /// Default key prefix for session entries.
     pub const DEFAULT_PREFIX: &'static str = "weblogin:sess:";
+
+    /// Build from a single-node `redis://` / `rediss://` URL.
+    ///
+    /// The URL carries everything the Sentinel config spells out as fields —
+    /// db index (`/0`), credentials (`redis://user:pass@host`) and TLS
+    /// (`rediss://`) — so there is no second config shape to keep in step.
+    ///
+    /// Performs no I/O: an unreachable host is discovered on first use and
+    /// handled by the fail-open path, not here.
+    pub fn from_url(url: &str, ttl: Duration) -> Result<Self> {
+        let url = url.trim();
+        anyhow::ensure!(!url.is_empty(), "redis url is empty");
+        let client = redis::Client::open(url)
+            .with_context(|| format!("open redis client for {url}"))?;
+        Ok(Self {
+            backend: Backend::Direct(client),
+            ttl_secs: ttl.as_secs().max(1),
+            prefix: Self::DEFAULT_PREFIX.to_string(),
+        })
+    }
 
     /// Build from Sentinel settings. `ttl` is the per-session expiry (refreshed
     /// on every write).
@@ -71,7 +122,7 @@ impl RedisSessionStore {
         anyhow::ensure!(!hosts.is_empty(), "redis sentinel hosts list is empty");
 
         let node_info = SentinelNodeConnectionInfo {
-            tls_mode: Some(TlsMode::Insecure).filter(|_| cfg.tls),
+            tls_mode: cfg.tls.then_some(TlsMode::Insecure),
             redis_connection_info: Some(RedisConnectionInfo {
                 db: cfg.db,
                 username: cfg.username.clone(),
@@ -89,7 +140,7 @@ impl RedisSessionStore {
         .context("build redis sentinel client")?;
 
         Ok(Self {
-            sentinel: Arc::new(Mutex::new(sentinel)),
+            backend: Backend::Sentinel(Arc::new(Mutex::new(sentinel))),
             ttl_secs: ttl.as_secs().max(1),
             prefix: Self::DEFAULT_PREFIX.to_string(),
         })
@@ -99,12 +150,23 @@ impl RedisSessionStore {
         format!("{}{sid}", self.prefix)
     }
 
-    /// Borrow a fresh master connection (re-resolves via Sentinel each call).
+    /// Borrow a fresh connection. Sentinel re-resolves the master each call so
+    /// a failover is picked up without restarting; the direct path opens to the
+    /// one node it was given. Every read and write goes through here, which is
+    /// what keeps the two modes indistinguishable above this line.
     async fn conn(&self) -> Result<redis::aio::MultiplexedConnection> {
-        let mut s = self.sentinel.lock().await;
-        s.get_async_connection()
-            .await
-            .context("sentinel get_async_connection")
+        match &self.backend {
+            Backend::Sentinel(sentinel) => {
+                let mut s = sentinel.lock().await;
+                s.get_async_connection()
+                    .await
+                    .context("sentinel get_async_connection")
+            }
+            Backend::Direct(client) => client
+                .get_multiplexed_async_connection()
+                .await
+                .context("redis get_multiplexed_async_connection"),
+        }
     }
 }
 
@@ -167,5 +229,81 @@ impl WebSessionStore for RedisSessionStore {
         if let Err(e) = res {
             tracing::error!("web_login redis remove {sid}: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TTL: Duration = Duration::from_secs(3600);
+
+    /// Every form the URL is expected to carry, because the whole argument for
+    /// the direct mode is that the URL replaces the Sentinel config's fields.
+    /// If a form does not parse, the caller has no other way to express it.
+    #[test]
+    fn from_url_accepts_the_forms_that_replace_the_sentinel_fields() {
+        for url in [
+            "redis://session-redis:6379",       // plain
+            "redis://session-redis:6379/3",     // db index
+            "redis://user:pass@host:6379/1",    // credentials
+            "rediss://host:6379",               // TLS
+        ] {
+            assert!(RedisSessionStore::from_url(url, TTL).is_ok(), "should parse: {url}");
+        }
+    }
+
+    /// An empty URL is the shape a missing/blank config key takes. It must be a
+    /// refusable error, not a store that silently never works — the caller has
+    /// to be able to tell "not configured" from "configured and broken".
+    #[test]
+    fn from_url_rejects_blank_and_non_redis_urls() {
+        assert!(RedisSessionStore::from_url("", TTL).is_err());
+        assert!(RedisSessionStore::from_url("   ", TTL).is_err());
+        assert!(RedisSessionStore::from_url("http://not-redis:6379", TTL).is_err());
+    }
+
+    #[test]
+    fn from_url_trims_surrounding_whitespace() {
+        assert!(RedisSessionStore::from_url("  redis://session-redis:6379  ", TTL).is_ok());
+    }
+
+    /// Pre-existing guard, pinned so the refactor to `Backend` did not drop it.
+    #[test]
+    fn from_sentinel_still_rejects_an_empty_host_list() {
+        let cfg = RedisSentinelConfig { master_name: "mymaster".into(), ..Default::default() };
+        assert!(RedisSessionStore::from_sentinel(cfg, TTL).is_err());
+    }
+
+    /// The property the `Backend` enum exists to guarantee: the connection
+    /// source is the *only* difference. A session written by a Sentinel-backed
+    /// replica must be readable by a URL-backed one, which requires the key to
+    /// be byte-identical — so this is what makes "same store locally and in
+    /// production" a true statement rather than a hopeful one.
+    #[test]
+    fn both_modes_produce_the_same_key_for_the_same_session() {
+        let direct = RedisSessionStore::from_url("redis://session-redis:6379", TTL).unwrap();
+        let sentinel = RedisSessionStore::from_sentinel(
+            RedisSentinelConfig {
+                hosts: vec!["sentinel-a:26379".into()],
+                master_name: "mymaster".into(),
+                ..Default::default()
+            },
+            TTL,
+        )
+        .unwrap();
+
+        assert_eq!(direct.key("abc123"), sentinel.key("abc123"));
+        assert_eq!(direct.key("abc123"), "weblogin:sess:abc123");
+        assert_eq!(direct.ttl_secs, sentinel.ttl_secs);
+        assert_eq!(direct.prefix, sentinel.prefix);
+    }
+
+    /// A sub-second TTL would otherwise floor to 0 and make redis treat the
+    /// `SET ... EX 0` as an error, dropping every session write.
+    #[test]
+    fn a_sub_second_ttl_is_floored_to_one_second() {
+        let s = RedisSessionStore::from_url("redis://h:6379", Duration::from_millis(10)).unwrap();
+        assert_eq!(s.ttl_secs, 1);
     }
 }

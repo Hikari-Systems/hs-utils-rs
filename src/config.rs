@@ -668,3 +668,122 @@ mod layered_tests {
         );
     }
 }
+
+// ── Database connection config ───────────────────────────────────────────────
+// Lives here rather than in `db` so it is available without the `db` feature:
+// `SessionConfig` names it, and a redis-only build still has to deserialise a
+// config file that contains a `db` block.
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DbSslConfig {
+    #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
+    pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
+    pub verify: Option<bool>,
+    #[serde(default)]
+    pub ca_cert_file: Option<String>,
+}
+
+/// Standard PostgreSQL connection config shared across all hs services.
+/// Embed this directly in your service's `AppConfig.db` field.
+///
+/// `port` is a `String` because some config.json files encode it that way;
+/// `build_pool` parses it at runtime.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct DbConfig {
+    #[serde(default)]
+    pub host: String,
+    /// Port as a string — tolerates `"5432"` or `5432` in config.json.
+    #[serde(default)]
+    pub port: String,
+    #[serde(default)]
+    pub database: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub ssl: Option<DbSslConfig>,
+    #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
+    pub minpool: Option<u32>,
+    #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
+    pub maxpool: Option<u32>,
+    /// Idle-connection reap timeout, in seconds. When set, a pooled connection
+    /// that has been idle for this long is closed, letting the pool shed surplus
+    /// connections back down toward `minpool`. Unset → sqlx's default (no idle
+    /// reaping), so the pool only ever grows toward `maxpool`.
+    #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
+    pub idletimeoutsecs: Option<u32>,
+    #[allow(dead_code)]
+    #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
+    pub debug: Option<bool>,
+}
+
+// ── Browser session store config ─────────────────────────────────────────────
+
+/// Redis settings for the browser-session store, covering both shapes
+/// [`crate::web_login_redis::RedisSessionStore`] supports.
+///
+/// `url` selects the single-node mode and wins when set; otherwise `hosts` +
+/// `masterName` select Sentinel. They are one struct rather than two so a
+/// deployment can move between them by changing config alone.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRedisConfig {
+    /// Single node, e.g. `redis://session-redis:6379/0`. Carries db index,
+    /// credentials and TLS (`rediss://`) inline.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Sentinel addresses (`host:port`), with or without a `redis://` scheme.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Sentinel master group name.
+    #[serde(default)]
+    pub master_name: Option<String>,
+    /// Redis logical db index (Sentinel mode; for `url` put it in the path).
+    #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
+    pub db: Option<u32>,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Password. Accepts `auth` too, which is what the existing controllers
+    /// spell it.
+    #[serde(default, alias = "auth")]
+    pub password: Option<String>,
+    #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
+    pub tls: Option<bool>,
+}
+
+/// Canonical `session` config block, shared by every controller.
+///
+/// Previously each controller declared its own structurally identical copy and
+/// hand-rolled the store selection beside it; this is the single definition, and
+/// [`crate::session_store::build_session_store`] is the single builder.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfig {
+    /// Which store backs browser sessions: `postgres`, `redis` or `memory`,
+    /// matched case-insensitively.
+    ///
+    /// **Set this.** When it is set the choice is explicit and a store that
+    /// cannot be built is a hard error. When it is absent the builder infers
+    /// one and warns — that inference exists only so deployments predating this
+    /// key keep working, and it is the exact "behaviour chosen by an absent
+    /// key" shape that makes a misconfiguration look like a working service.
+    #[serde(default)]
+    pub store: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Postgres backing the cross-replica store (`store: "postgres"`).
+    #[serde(default)]
+    pub db: Option<DbConfig>,
+    /// Redis backing the cross-replica store (`store: "redis"`).
+    #[serde(default)]
+    pub redis: Option<SessionRedisConfig>,
+    /// Session table name for the postgres store (defaults to `web_sessions`).
+    #[serde(default)]
+    pub table: Option<String>,
+    /// Session lifetime in seconds. Defaults to 24h.
+    #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
+    pub ttl_secs: Option<u32>,
+}

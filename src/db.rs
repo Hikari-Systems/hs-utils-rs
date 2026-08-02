@@ -22,61 +22,18 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
     PgPool,
 };
 
-use crate::config::{deser_opt_bool_or_str, deser_opt_u32_or_str};
-
 // ── Structs ──────────────────────────────────────────────────────────────────
+// The config structs moved into the always-available `config` module in
+// v0.27.0 so `SessionConfig` can name `DbConfig` without requiring the `db`
+// feature. Re-exported here so every existing `hs_utils::db::DbConfig` import
+// across the estate keeps working unchanged.
+pub use crate::config::{DbConfig, DbSslConfig};
 
-#[derive(Debug, Deserialize, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct DbSslConfig {
-    #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
-    pub enabled: Option<bool>,
-    #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
-    pub verify: Option<bool>,
-    #[serde(default)]
-    pub ca_cert_file: Option<String>,
-}
-
-/// Standard PostgreSQL connection config shared across all hs services.
-/// Embed this directly in your service's `AppConfig.db` field.
-///
-/// `port` is a `String` because some config.json files encode it that way;
-/// `build_pool` parses it at runtime.
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct DbConfig {
-    #[serde(default)]
-    pub host: String,
-    /// Port as a string — tolerates `"5432"` or `5432` in config.json.
-    #[serde(default)]
-    pub port: String,
-    #[serde(default)]
-    pub database: String,
-    #[serde(default)]
-    pub username: String,
-    #[serde(default)]
-    pub password: String,
-    #[serde(default)]
-    pub ssl: Option<DbSslConfig>,
-    #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
-    pub minpool: Option<u32>,
-    #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
-    pub maxpool: Option<u32>,
-    /// Idle-connection reap timeout, in seconds. When set, a pooled connection
-    /// that has been idle for this long is closed, letting the pool shed surplus
-    /// connections back down toward `minpool`. Unset → sqlx's default (no idle
-    /// reaping), so the pool only ever grows toward `maxpool`.
-    #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
-    pub idletimeoutsecs: Option<u32>,
-    #[allow(dead_code)]
-    #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
-    pub debug: Option<bool>,
-}
 
 // ── Pool builder ─────────────────────────────────────────────────────────────
 

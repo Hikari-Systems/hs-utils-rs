@@ -26,6 +26,11 @@ pub mod mcp_resource_server;
 #[cfg(feature = "web-login")]
 pub mod web_login;
 
+// One exported builder for the browser-session store, so controllers stop
+// hand-rolling the same selection (and the same silent fallback).
+#[cfg(feature = "web-login")]
+pub mod session_store;
+
 #[cfg(feature = "web-login-redis")]
 pub mod web_login_redis;
 
