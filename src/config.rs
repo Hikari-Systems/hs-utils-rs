@@ -748,9 +748,9 @@ where
             .collect(),
         Value::Array(items) => items
             .into_iter()
-            .filter_map(|i| match i {
-                Value::String(s) => Some(s),
-                other => Some(other.to_string()),
+            .map(|i| match i {
+                Value::String(s) => s,
+                other => other.to_string(),
             })
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
