@@ -64,6 +64,37 @@ pub struct RedisSentinelConfig {
     pub tls: bool,
 }
 
+/// Replace the userinfo in a URL with `***`, so a connection string can be
+/// named in an error without publishing the password it carries.
+///
+/// Operates on the authority only — everything between `://` and the first `/`
+/// that follows — so an `@` in a path or query is left alone. A URL with no
+/// userinfo comes back unchanged, and anything that does not parse as
+/// scheme-plus-authority is returned whole, because a value that is not a URL
+/// cannot be leaking URL credentials and hiding it would only make the error
+/// less useful.
+fn redact_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find('/')
+        .map(|i| authority_start + i)
+        .unwrap_or(url.len());
+    let authority = &url[authority_start..authority_end];
+
+    // Last `@`, not first: a password may itself contain one.
+    let Some(at) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!(
+        "{}***{}",
+        &url[..authority_start],
+        &url[authority_start + at..]
+    )
+}
+
 /// How this store reaches redis. Not public: callers choose by constructor,
 /// and every operation goes through [`RedisSessionStore::conn`], so the two
 /// modes cannot diverge in serialisation, key layout or failure handling.
@@ -96,8 +127,13 @@ impl RedisSessionStore {
     pub fn from_url(url: &str, ttl: Duration) -> Result<Self> {
         let url = url.trim();
         anyhow::ensure!(!url.is_empty(), "redis url is empty");
+        // REDACTED, not raw. A redis URL carries its password inline
+        // (`redis://user:pass@host`), and this error surfaces at startup in the
+        // container log — where a misconfiguration would have published the
+        // credential to whatever ships those logs. The host is what a reader
+        // needs to diagnose "which redis did it try?"; the password never is.
         let client = redis::Client::open(url)
-            .with_context(|| format!("open redis client for {url}"))?;
+            .with_context(|| format!("open redis client for {}", redact_url_userinfo(url)))?;
         Ok(Self {
             backend: Backend::Direct(client),
             ttl_secs: ttl.as_secs().max(1),
@@ -305,5 +341,67 @@ mod tests {
     fn a_sub_second_ttl_is_floored_to_one_second() {
         let s = RedisSessionStore::from_url("redis://h:6379", Duration::from_millis(10)).unwrap();
         assert_eq!(s.ttl_secs, 1);
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    /// The defect this exists for: a misconfigured redis URL put the password
+    /// into a startup error, and startup errors go to the container log.
+    #[test]
+    fn a_password_never_survives_into_the_error_text() {
+        // `.err()` rather than `unwrap_err()`: the latter needs the Ok type to
+        // be Debug, and deriving Debug on a store holding a live client is not
+        // worth doing to satisfy a test.
+        let err = RedisSessionStore::from_url("redis://user:hunter2@:::bad", Duration::from_secs(60))
+            .err()
+            .expect("a malformed redis url should fail to parse");
+        let text = format!("{err:#}");
+        assert!(!text.contains("hunter2"), "password leaked into the error: {text}");
+        assert!(text.contains("***"), "should say a credential was elided: {text}");
+    }
+
+    #[test]
+    fn userinfo_is_replaced_and_the_host_survives() {
+        assert_eq!(
+            redact_url_userinfo("redis://user:pass@session-redis:6379/0"),
+            "redis://***@session-redis:6379/0"
+        );
+        // Username-only is still userinfo.
+        assert_eq!(
+            redact_url_userinfo("rediss://alice@host:6379"),
+            "rediss://***@host:6379"
+        );
+    }
+
+    #[test]
+    fn a_url_without_credentials_is_untouched() {
+        let u = "redis://session-redis:6379/0";
+        assert_eq!(redact_url_userinfo(u), u);
+    }
+
+    /// `@` after the authority is not userinfo. Redacting on the first `@`
+    /// anywhere would mangle the host out of a perfectly safe URL.
+    #[test]
+    fn an_at_sign_in_the_path_is_not_treated_as_credentials() {
+        let u = "redis://session-redis:6379/db@2";
+        assert_eq!(redact_url_userinfo(u), u);
+    }
+
+    /// A password may legitimately contain `@`, so the split must be on the
+    /// LAST one in the authority or part of the secret survives.
+    #[test]
+    fn a_password_containing_an_at_sign_is_fully_redacted() {
+        let out = redact_url_userinfo("redis://user:p@ss@host:6379");
+        assert_eq!(out, "redis://***@host:6379");
+        assert!(!out.contains("p@ss"));
+    }
+
+    #[test]
+    fn a_non_url_is_returned_whole() {
+        assert_eq!(redact_url_userinfo("not-a-url"), "not-a-url");
+        assert_eq!(redact_url_userinfo(""), "");
     }
 }
