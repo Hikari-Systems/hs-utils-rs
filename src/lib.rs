@@ -43,5 +43,7 @@ pub mod controller;
 #[cfg(feature = "consent-bridge")]
 pub mod hydra_bridge;
 
-#[cfg(feature = "consent-bridge")]
+// Its own feature, not consent-bridge's: this hook talks to Kratos and
+// image-service and knows nothing about Hydra. See the Cargo.toml comment.
+#[cfg(feature = "avatar-hook")]
 pub mod avatar_hook;

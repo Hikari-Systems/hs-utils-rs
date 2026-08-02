@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.28.0"
+version = "0.29.0"
 edition = "2021"
 
 [features]
@@ -75,11 +75,32 @@ otel = [
 # Adds `otel::axum_trace_layer()` — a tower-http TraceLayer emitting HTTP
 # semantic-convention attributes and adopting the inbound traceparent.
 otel-axum = ["otel", "dep:axum", "dep:tower-http"]
+# Kratos post-flow webhook that ingests a provider avatar into image-service
+# (`POST /api/hooks/post-flow`). Needs axum, and reqwest/multipart to upload the
+# image. Nothing else.
+#
+# It has its own feature because it has no relationship to Hydra. Until v0.29.0
+# it was gated behind `consent-bridge` purely by adjacency — `avatar_hook` sits
+# next to `hydra_bridge` in lib.rs and its dependencies were a subset of that
+# feature's. In fact `reqwest/multipart` was in that set BECAUSE of this module;
+# `hydra_bridge` never uses multipart. So the feature's dependency list was
+# shaped by a module its name does not mention.
+#
+# The cost was real: a service wanting Kratos avatar ingest had to compile an
+# entire Hydra login/consent provider it does not use. botsafely-controller is
+# exactly that case — no `hydra` block, login through `web_login` — so the
+# capability was simply unreachable for it.
+avatar-hook = ["dep:axum", "dep:reqwest", "reqwest/multipart"]
 # Ory Hydra login/consent/logout provider bridge (axum). A reusable port of the
 # hs-login-controller bridge: resolves the Kratos identity and accepts/rejects
 # Hydra login/consent/logout challenges via Hydra's admin API. Mount its router
 # on a public path (`/api/oauth/*`).
-consent-bridge = ["dep:axum", "dep:reqwest", "reqwest/multipart"]
+#
+# Implies `avatar-hook`: the two are genuinely used together (the bridge
+# surfaces as a claim the `pictureId` this hook writes), and keeping the
+# implication means anything already enabling `consent-bridge` still finds
+# `avatar_hook` where it expects it.
+consent-bridge = ["dep:axum", "dep:reqwest", "avatar-hook"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
