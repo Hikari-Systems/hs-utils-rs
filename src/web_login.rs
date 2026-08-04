@@ -505,7 +505,11 @@ const MAX_LOGGED_LEN: usize = 256;
 /// escapes it, and this caps the length so it cannot flood the stream either —
 /// the same reasoning that bounds `url.query` and `user_agent.original` in
 /// `crate::otel`, which these fields would otherwise sidestep.
-fn log_safe(s: &str) -> String {
+///
+/// `pub(crate)` so the shared session stores bound *their* downstream error text
+/// with this helper rather than a copy of it — sqlx and redis `Display` output
+/// is downstream-derived and can carry a newline just as a query parameter can.
+pub(crate) fn log_safe(s: &str) -> String {
     if s.len() <= MAX_LOGGED_LEN {
         return s.to_string();
     }

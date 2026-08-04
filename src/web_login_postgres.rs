@@ -49,7 +49,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use crate::web_login::{Session, WebSessionStore, DEFAULT_SESSION_TTL_SECS};
+use crate::web_login::{log_safe, Session, WebSessionStore, DEFAULT_SESSION_TTL_SECS};
 
 /// Default session table name, used unless overridden via
 /// [`PgSessionStore::with_table`].
@@ -180,6 +180,32 @@ fn validate_table_name(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+// **No error path below names the `sid`, and that is load-bearing.** The
+// `hs_session` value is an unsigned bearer credential — possession is
+// authentication — and these are the *error* branches, so during a database
+// outage they fire for every in-flight authenticated request at once: naming it
+// writes the whole logged-in fleet's live credentials into the container log,
+// which then leaves the building with the logs. Nothing derived from it is an
+// acceptable stand-in either — a truncation is still a partial disclosure of a
+// credential, and a hash is a stable handle to one — so the sid is *dropped*
+// rather than redacted. The invariant, so it survives a refactor of these same
+// lines: the sid never enters a formatted string in this module, not a message,
+// not an `anyhow::Context`, not an error.
+//
+// What a reader gets instead is `session.store` / `session.op` / `session.table`
+// as fields, plus whatever spans enclose the call — the fmt layer renders the
+// scope as a prefix. **How much that is depends on the consumer, so do not read
+// it as a guarantee.** `auth.gate` is this crate's only span and it wraps
+// `decide` alone, so it covers the gate's `load`/`store` and NOT `callback`'s;
+// an `http.server` span exists only in a service that installs one
+// (`otel::axum_trace_layer`), which botsafely-controller does and two of the
+// three consumers of this store do not. Where neither applies the line stands on
+// its own fields. That is accepted: correlation is a compensating control, and
+// dropping the credential is right with or without it.
+// `error.message` is a **bare `&str`, never `%e`**: sqlx' `Display` output
+// is downstream-derived, and `%` emits bytes raw, so a newline in it would forge
+// a whole log line. `session.*` take `%` because they are compile-time literals
+// and a validated identifier.
 #[async_trait]
 impl WebSessionStore for PgSessionStore {
     async fn load(&self, sid: &str) -> Option<Session> {
@@ -191,7 +217,13 @@ impl WebSessionStore for PgSessionStore {
         let data = match res {
             Ok(v) => v?,
             Err(e) => {
-                tracing::error!("web_login pg load {sid}: {e}");
+                tracing::error!(
+                    session.store = %"postgres",
+                    session.op = %"load",
+                    session.table = %self.table,
+                    error.message = log_safe(&e.to_string()).as_str(),
+                    "web_login pg load failed"
+                );
                 return None; // fail open
             }
         };
@@ -199,7 +231,13 @@ impl WebSessionStore for PgSessionStore {
         match serde_json::from_value::<Session>(data) {
             Ok(s) => Some(s),
             Err(e) => {
-                tracing::error!("web_login pg load {sid}: malformed payload: {e}");
+                tracing::error!(
+                    session.store = %"postgres",
+                    session.op = %"load",
+                    session.table = %self.table,
+                    error.message = log_safe(&e.to_string()).as_str(),
+                    "web_login pg load: malformed payload"
+                );
                 None
             }
         }
@@ -209,7 +247,13 @@ impl WebSessionStore for PgSessionStore {
         let data = match serde_json::to_value(session) {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("web_login pg store {sid}: serialize failed: {e}");
+                tracing::error!(
+                    session.store = %"postgres",
+                    session.op = %"store",
+                    session.table = %self.table,
+                    error.message = log_safe(&e.to_string()).as_str(),
+                    "web_login pg store: serialize failed"
+                );
                 return;
             }
         };
@@ -222,7 +266,13 @@ impl WebSessionStore for PgSessionStore {
             .await;
 
         if let Err(e) = res {
-            tracing::error!("web_login pg store {sid}: {e}");
+            tracing::error!(
+                session.store = %"postgres",
+                session.op = %"store",
+                session.table = %self.table,
+                error.message = log_safe(&e.to_string()).as_str(),
+                "web_login pg store failed"
+            );
         }
     }
 
@@ -232,7 +282,13 @@ impl WebSessionStore for PgSessionStore {
             .execute(&self.pool)
             .await;
         if let Err(e) = res {
-            tracing::error!("web_login pg remove {sid}: {e}");
+            tracing::error!(
+                session.store = %"postgres",
+                session.op = %"remove",
+                session.table = %self.table,
+                error.message = log_safe(&e.to_string()).as_str(),
+                "web_login pg remove failed"
+            );
         }
     }
 }

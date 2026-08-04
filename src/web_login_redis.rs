@@ -43,7 +43,7 @@ use redis::sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServer
 use redis::{AsyncCommands, RedisConnectionInfo, TlsMode};
 use tokio::sync::Mutex;
 
-use crate::web_login::{Session, WebSessionStore};
+use crate::web_login::{log_safe, Session, WebSessionStore};
 
 /// Connection settings for the redis Sentinel cluster backing the session
 /// store. Mirrors the `session.redis` config block / `session__redis__*` env
@@ -206,6 +206,45 @@ impl RedisSessionStore {
     }
 }
 
+// **No error path below names the `sid` — nor the `key`, and the second half is
+// the trap.** `hs_session` is an unsigned bearer credential (possession is
+// authentication), and these are the *error* branches, so during a redis outage
+// they fire for every in-flight authenticated request at once. Swapping `{sid}`
+// for `{key}` reads like a redaction and is not one: `Self::key` is
+// `DEFAULT_PREFIX + sid`, so it discloses the entire credential behind fourteen
+// characters of fixed prefix. Nothing derived from the sid is acceptable either
+// — a truncation is still a partial disclosure, a hash is a stable handle to a
+// credential — so it is *dropped* rather than redacted. The invariant, so it
+// survives a refactor of these same lines: the sid never enters a formatted
+// string in this module, not a message, not an `anyhow::Context`, not an error.
+//
+// What a reader gets instead is `session.store` / `session.op` as fields, plus
+// whatever spans enclose the call — the fmt layer renders the scope as a prefix.
+// **How much that is depends on the consumer, so do not read it as a
+// guarantee.** `auth.gate` is this crate's only span and it wraps `decide`
+// alone, so it covers the gate's `load`/`store` and NOT `callback`'s; an
+// `http.server` span exists only in a service that installs one
+// (`otel::axum_trace_layer`), which botsafely-controller does and two of the
+// three consumers of this store do not. Where neither applies the line stands on
+// its own fields. That is accepted: correlation is a compensating control, and
+// dropping the credential is right with or without it.
+// `error.message` is a **bare `&str`, never `%e`**: redis' `Display` output is
+// downstream-derived (it embeds the server's own error text), and `%` emits
+// bytes raw, so a newline in it would forge a whole log line. `session.*` take
+// `%` because they are compile-time literals.
+//
+// The two `connection failed` sites carry no sid, which is why this ticket left
+// them — but their `{e:#}` is NOT safe for the reason it looks safe, and the
+// distinction matters to whoever touches them next. The chain comes from
+// `conn()`, whose context is a fixed string plus a `RedisError`; it never
+// carries the URL, so `from_url`'s `redact_url_userinfo` — which guards
+// `Client::open` at construction — has nothing to do with these lines. What
+// `{e:#}` does render raw is `RedisError`'s `Display`, and an `ExtensionError`
+// takes its code and detail verbatim from the server's `-ERR` reply. That is
+// downstream-derived text on a `%`-equivalent sigil: the same log-forging shape
+// the paragraph above rejects, reachable from a hostile or compromised redis
+// rather than from caller input. Out of scope here because no credential is
+// disclosed; the fix is `log_safe(&format!("{e:#}"))` and it is filed.
 #[async_trait]
 impl WebSessionStore for RedisSessionStore {
     async fn load(&self, sid: &str) -> Option<Session> {
@@ -220,7 +259,12 @@ impl WebSessionStore for RedisSessionStore {
         let raw: Option<String> = match conn.get(&key).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("web_login redis load {sid}: {e}");
+                tracing::error!(
+                    session.store = %"redis",
+                    session.op = %"load",
+                    error.message = log_safe(&e.to_string()).as_str(),
+                    "web_login redis load failed"
+                );
                 return None;
             }
         };
@@ -228,7 +272,12 @@ impl WebSessionStore for RedisSessionStore {
         match serde_json::from_str::<Session>(&raw) {
             Ok(s) => Some(s),
             Err(e) => {
-                tracing::error!("web_login redis load {sid}: malformed payload: {e}");
+                tracing::error!(
+                    session.store = %"redis",
+                    session.op = %"load",
+                    error.message = log_safe(&e.to_string()).as_str(),
+                    "web_login redis load: malformed payload"
+                );
                 None
             }
         }
@@ -239,7 +288,12 @@ impl WebSessionStore for RedisSessionStore {
         let json = match serde_json::to_string(session) {
             Ok(j) => j,
             Err(e) => {
-                tracing::error!("web_login redis store {sid}: serialize failed: {e}");
+                tracing::error!(
+                    session.store = %"redis",
+                    session.op = %"store",
+                    error.message = log_safe(&e.to_string()).as_str(),
+                    "web_login redis store: serialize failed"
+                );
                 return;
             }
         };
@@ -252,7 +306,12 @@ impl WebSessionStore for RedisSessionStore {
         };
         let res: redis::RedisResult<()> = conn.set_ex(&key, json, self.ttl_secs).await;
         if let Err(e) = res {
-            tracing::error!("web_login redis store {sid}: {e}");
+            tracing::error!(
+                session.store = %"redis",
+                session.op = %"store",
+                error.message = log_safe(&e.to_string()).as_str(),
+                "web_login redis store failed"
+            );
         }
     }
 
@@ -263,7 +322,12 @@ impl WebSessionStore for RedisSessionStore {
         };
         let res: redis::RedisResult<()> = conn.del(&key).await;
         if let Err(e) = res {
-            tracing::error!("web_login redis remove {sid}: {e}");
+            tracing::error!(
+                session.store = %"redis",
+                session.op = %"remove",
+                error.message = log_safe(&e.to_string()).as_str(),
+                "web_login redis remove failed"
+            );
         }
     }
 }
