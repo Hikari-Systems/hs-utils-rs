@@ -580,6 +580,20 @@ async fn callback(
         return bad_request("could not resolve user");
     };
 
+    // Rotate the session id across the privilege change. This handler is where
+    // an anonymous row acquires a user's tokens, so keeping the id hands the
+    // finished session to anyone who already knew it — and the pre-login id is
+    // knowable by design: `gate` mints one for *any* anonymous caller and sets
+    // it as a cookie. Plant that value in a victim's browser, wait for them to
+    // log in, and the row it names is now theirs. Rotating here is what makes
+    // "a caller cannot influence the authenticated sid" actually true; the
+    // lazy-mint rule in `decide` is the same claim for the other direction.
+    //
+    // Store the new row before dropping the old one, so a failure between the
+    // two leaves the browser's current cookie still working rather than logging
+    // the user out. Leftover `redirects` move across: a second tab mid-flow will
+    // arrive here carrying the rotated cookie and must still find its own state.
+    let new_sid = uuid::Uuid::new_v4().to_string();
     {
         let mut sess = wl.store.load(&sid).await.unwrap_or_default();
         sess.redirects.remove(&state_key);
@@ -589,10 +603,14 @@ async fn callback(
         sess.refresh_token = token.refresh_token;
         sess.id_token = token.id_token;
         sess.expires_at = token.expires_in.map(|e| now_secs() + e);
-        wl.store.store(&sid, &sess).await;
+        wl.store.store(&new_sid, &sess).await;
     }
+    wl.store.remove(&sid).await;
     tracing::debug!(user = %resolved.user_id, "web_login: login complete, redirecting to {orig}");
-    see_other(&orig, None)
+    see_other(
+        &orig,
+        Some(build_set_cookie(&wl.cfg, &new_sid, request_is_https(&headers))),
+    )
 }
 
 /// Middleware (use with `from_fn_with_state(web_login.gate_state(fail_fast), gate)`)
@@ -659,19 +677,20 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
 
     // No cookie ⇒ nothing to load ⇒ the request cannot be authenticated. Asking
     // the store anyway would be a guaranteed miss on a made-up id.
-    let user = match &cookie_sid {
-        Some(sid) => wl
-            .store
-            .load(sid)
-            .await
-            .and_then(|s| s.user_id.clone().map(|uid| (uid, s.profile.clone()))),
+    //
+    // The whole session is kept rather than just the user it resolves to: the
+    // redirect branch needs to know whether the store *recognised* this cookie,
+    // and reuses the row it already has instead of reading it a second time.
+    let loaded = match &cookie_sid {
+        Some(sid) => wl.store.load(sid).await,
         None => None,
     };
 
-    if let Some((user_id, profile)) = user {
+    if let Some(user_id) = loaded.as_ref().and_then(|s| s.user_id.clone()) {
         span.record("auth.gate.outcome", "authenticated");
         span.record("auth.gate.session.minted", false);
         span.record("user.id", user_id.as_str());
+        let profile = loaded.and_then(|s| s.profile);
         return GateDecision::Pass(CurrentUser { user_id, profile });
     }
 
@@ -688,12 +707,24 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
 
     // Begin the authorization-code dance: stash state → original URL. This is
     // the only branch that needs a session id, so it is the one that mints it —
-    // and the only one that writes. The `load(..).unwrap_or_default()` below is
-    // what makes the lazy mint safe: with no row it yields a default session,
-    // takes the state insert and stores it, creating the row here instead. Break
-    // that and the callback finds no state and every login 400s.
-    let minted = cookie_sid.is_none();
-    let sid = cookie_sid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // and the only one that writes.
+    //
+    // Which id it writes under is the security-relevant part. Only a cookie the
+    // store actually recognises may be kept; anything else is replaced with a
+    // fresh uuid. Reusing an unrecognised value would take caller-supplied input
+    // straight to a primary key in storage the whole fleet shares — letting an
+    // anonymous caller both choose that key and fix a session id ahead of a
+    // victim's login. Its other half is the rotation in `callback`: one stops a
+    // chosen id from ever being written, the other stops a *minted* id from
+    // surviving into the authenticated session.
+    let (sid, mut sess, minted) = match (cookie_sid, loaded) {
+        // A session the store knows, still anonymous because the dance is in
+        // flight. Keep the id and add to the row — this is the row the redirect
+        // branch itself just created, and a second tab arrives holding it. It is
+        // also already loaded, so the reuse costs no second read.
+        (Some(sid), Some(sess)) => (sid, sess, false),
+        _ => (uuid::Uuid::new_v4().to_string(), Session::default(), true),
+    };
     let set_cookie = minted.then(|| build_set_cookie(&wl.cfg, &sid, request_is_https(headers)));
 
     let orig = uri
@@ -701,11 +732,8 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
     let state_key = uuid::Uuid::new_v4().to_string();
-    {
-        let mut sess = wl.store.load(&sid).await.unwrap_or_default();
-        sess.redirects.insert(state_key.clone(), orig);
-        wl.store.store(&sid, &sess).await;
-    }
+    sess.redirects.insert(state_key.clone(), orig);
+    wl.store.store(&sid, &sess).await;
     span.record("auth.gate.outcome", "redirect_to_login");
     span.record("auth.gate.session.minted", minted);
     GateDecision::Respond(see_other(&wl.authorize_url(&state_key, headers), set_cookie))
@@ -1106,6 +1134,13 @@ mod tests {
         let state_key = q.get("state").expect("state parameter").clone();
 
         assert_eq!(store.stores(), 1, "exactly one write");
+        assert_eq!(
+            store.loads(),
+            1,
+            "and exactly one read: the redirect branch reuses the session it \
+             already loaded to answer 'is this cookie known', rather than \
+             fetching the same row twice"
+        );
         let sess = store
             .inner
             .load("sid-midflow")
@@ -1122,6 +1157,203 @@ mod tests {
             "and the second flow's state is added alongside it"
         );
         assert_eq!(sess.redirects.len(), 2);
+    }
+
+    /// A caller-supplied session id must never become the key a row is written
+    /// under. The redirect branch is the one that writes, and it used to reuse
+    /// whatever `hs_session` value arrived — so an anonymous caller picked the
+    /// primary key in storage the whole fleet shares (the write amplification
+    /// the 401 fix closed only for the api tier), and could fix a session id
+    /// ahead of a victim's login.
+    ///
+    /// Only an id the store already knows may be kept — that case is
+    /// `a_second_login_flow_keeps_the_first_flows_state` above, and the two
+    /// together are the whole rule. Anything else is replaced, which is why the
+    /// response must also carry the freshly minted cookie.
+    #[tokio::test]
+    async fn an_unknown_cookie_is_never_reused_as_the_session_key() {
+        let store = Arc::new(CountingStore::new());
+        let resp = gated_app(store.clone(), false)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/dash")
+                    .header(header::COOKIE, "hs_session=attacker-chosen-sid")
+                    .header("x-forwarded-proto", "https")
+                    .header("x-forwarded-host", "app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(
+            store.inner.load("attacker-chosen-sid").await.is_none(),
+            "a caller-supplied session id must never become a stored key"
+        );
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("an unrecognised cookie must be replaced with a minted sid")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let sid = cookie
+            .strip_prefix("hs_session=")
+            .expect("cookie names the session")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_ne!(sid, "attacker-chosen-sid");
+        uuid::Uuid::parse_str(&sid).expect("the replacement is a server-generated uuid");
+        assert!(
+            store.inner.load(&sid).await.is_some(),
+            "the state is stored under the minted id instead"
+        );
+    }
+
+    /// A throwaway provider serving the only two endpoints [`callback`] calls:
+    /// the token endpoint and userinfo. stdlib sockets, no new dependency —
+    /// `callback` reaches the network, which is why it had no test at all, and
+    /// the session-id rotation below is not observable without driving it end to
+    /// end. Answers `Connection: close` so each request gets its own accept.
+    fn oauth_provider_stub() -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                // Drain headers, then the body, so the client sees a clean
+                // exchange rather than a reset mid-POST.
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if len > 0 {
+                    let mut body = vec![0u8; len];
+                    let _ = reader.read_exact(&mut body);
+                }
+
+                let json = if path.starts_with("/token") {
+                    r#"{"access_token":"at-1","token_type":"bearer","expires_in":3600,"id_token":"idt-1"}"#
+                } else {
+                    r#"{"sub":"kratos-identity-9"}"#
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    json.len(),
+                    json
+                );
+                let _ = stream.flush();
+            }
+        });
+        base
+    }
+
+    /// Logging in must rotate the session id. The pre-login id was handed to (or
+    /// arrived from) an unauthenticated browser, and this handler is where the
+    /// row it names acquires the user's tokens — so without rotation anyone
+    /// holding that id holds the session the moment the victim logs in. Getting
+    /// hold of one is not the hard part: `gate` mints and sets a sid for any
+    /// anonymous caller. Planting it in the victim's browser is the whole attack.
+    ///
+    /// Rotation carries the remaining `redirects` across, so a second tab still
+    /// mid-flow finds its state under the new id instead of 400-ing.
+    #[tokio::test]
+    async fn logging_in_rotates_the_session_id() {
+        let base = oauth_provider_stub();
+        let mut c = cfg();
+        c.token_url = format!("{base}/token");
+        c.profile_url = format!("{base}/userinfo");
+
+        let store = Arc::new(CountingStore::new());
+        let mut seeded = Session::default();
+        seeded.redirects.insert("st-1".into(), "/dash?tab=runs".into());
+        seeded.redirects.insert("st-2".into(), "/other".into());
+        store.inner.store("pre-login-sid", &seeded).await;
+
+        // `fallback: false` keeps the resolver off the network entirely: with no
+        // fallback it never fetches, so the unroutable admin URL is never used.
+        let resolver = Arc::new(KratosUserResolver::new(
+            "http://kratos.invalid:4434",
+            "https://hikari-systems.com/",
+            false,
+        ));
+        let resp = WebLogin::with_store(c, resolver, store.clone())
+            .callback_router()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/oauth2/callback?code=auth-code&state=st-1")
+                    .header(header::COOKIE, "hs_session=pre-login-sid")
+                    .header("x-forwarded-proto", "https")
+                    .header("x-forwarded-host", "app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/dash?tab=runs"
+        );
+
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("a rotated id is useless unless the browser is told about it")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let new_sid = cookie
+            .strip_prefix("hs_session=")
+            .expect("cookie names the session")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_ne!(new_sid, "pre-login-sid");
+        assert!(cookie.contains("Secure"), "the edge was HTTPS");
+
+        assert!(
+            store.inner.load("pre-login-sid").await.is_none(),
+            "the pre-login id must not survive the privilege change"
+        );
+        let sess = store
+            .inner
+            .load(&new_sid)
+            .await
+            .expect("the session moved to the rotated id");
+        assert_eq!(sess.user_id.as_deref(), Some("kratos-identity-9"));
+        assert_eq!(sess.access_token.as_deref(), Some("at-1"));
+        assert!(
+            !sess.redirects.contains_key("st-1"),
+            "the consumed state is dropped"
+        );
+        assert_eq!(
+            sess.redirects.get("st-2").map(String::as_str),
+            Some("/other"),
+            "a second flow still in flight must move across with it"
+        );
     }
 
     /// An already-logged-in request passes through untouched: the store is read
