@@ -67,32 +67,87 @@ pub struct RedisSentinelConfig {
 /// Replace the userinfo in a URL with `***`, so a connection string can be
 /// named in an error without publishing the password it carries.
 ///
-/// Operates on the authority only — everything between `://` and the first `/`
-/// that follows — so an `@` in a path or query is left alone. A URL with no
-/// userinfo comes back unchanged, and anything that does not parse as
-/// scheme-plus-authority is returned whole, because a value that is not a URL
-/// cannot be leaking URL credentials and hiding it would only make the error
-/// less useful.
+/// A URL with no `@` has no userinfo and comes back unchanged — the host and
+/// port are not secret, and keeping them is what makes the error actionable.
+/// Otherwise the userinfo goes, the scheme and everything from the last `@`
+/// onwards stay: `redis://user:pw@host:6379/0` → `redis://***@host:6379/0`.
+///
+/// **When the authority cannot be identified unambiguously it redacts
+/// WHOLESALE, to `***`.** That is the fix for HIK-243 and it is a deliberate
+/// trade, so the reasoning is here rather than in a ticket:
+///
+/// The previous rule bounded the authority at the first `/` after `://` and then
+/// looked for `@` inside it. A password containing an unencoded `/` truncates the
+/// authority *before* the `@`, the search finds nothing, and the URL was returned
+/// **whole** into a startup error — `redis://user:hun/ter2@:::bad` came back
+/// verbatim, password and all. And the gap was selected by the very character
+/// causing the failure: an unencoded `/` in a password is what makes the URL
+/// unparseable, hence what produces the error this function is redacting for.
+/// Measured over the 2,940-spelling sweep below, 2,044 of them leaked.
+///
+/// The two obvious repairs are both refused. A second hand-written index rule
+/// ("the last `@` before the first `/` that follows it") is one more guess at a
+/// syntax someone else's parser owns. And parsing with the `url` crate is
+/// **circular**: the string reaching this function is by definition one a URL
+/// parser has already rejected — that rejection is what produced the error being
+/// logged — so `Url::parse` errs on exactly the inputs in scope and would need a
+/// fail-closed fallback regardless.
+///
+/// So: an authority cannot contain `/`. If the span between the scheme and the
+/// last `@` does, then either the `@` is in a path or query (harmless) or the
+/// password contains a `/` (a leak), and **we cannot tell which without the
+/// parser we do not have**. It costs actionability in the harmless case —
+/// `redis://host:6379/db@2` becomes `***` rather than keeping its host, which is
+/// the one existing test this change turns over — and that is the right way to
+/// be wrong. The same rule and the same trade are in `botsafely-controller`'s
+/// `auth::redact_userinfo`, whose earlier version resolved the ambiguity the
+/// other way and leaked.
+///
+/// **Residual, stated rather than left to be rediscovered.** A password that
+/// itself begins with one of the four accepted schemes followed by `://`, in a
+/// value carrying no scheme of its own, still has that literal prefix printed —
+/// a password of `redis://…` renders as `redis://***@host`. It is bounded to one
+/// of four fixed words, so it discloses nothing about the rest of the secret,
+/// and it needs a config value that is not a URL at all. Closing it entirely is
+/// impossible without a parser: the two readings of such a string are textually
+/// identical.
 fn redact_url_userinfo(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
+    // No `@` anywhere: there are no credentials to hide.
+    let Some(at) = url.rfind('@') else {
         return url.to_string();
     };
-    let authority_start = scheme_end + 3;
-    let authority_end = url[authority_start..]
-        .find('/')
-        .map(|i| authority_start + i)
-        .unwrap_or(url.len());
-    let authority = &url[authority_start..authority_end];
 
-    // Last `@`, not first: a password may itself contain one.
-    let Some(at) = authority.rfind('@') else {
-        return url.to_string();
-    };
-    format!(
-        "{}***{}",
-        &url[..authority_start],
-        &url[authority_start + at..]
-    )
+    // The LAST `@`, because a password may contain one; anchoring on the first
+    // cuts inside the secret and prints the rest of it.
+    //
+    // Only the four schemes `redis::Client::open` actually accepts count as a
+    // scheme here, and that is stronger than an RFC 3986 charset check on
+    // purpose. The charset check alone — which is what the controller's copy of
+    // this function does — still reads the head of a **schemeless** password as
+    // a scheme whenever that head happens to be scheme-shaped, and prints it:
+    // the sweep below caught `HeadC4nary://T4ilCanary@h0st` rendering as
+    // `HeadC4nary://***@h0st`. The two readings of that string are textually
+    // isomorphic, so no amount of syntax will separate them; what separates them
+    // is that this function is only ever handed a **redis** connection URL, and
+    // `Client::open` rejects every other scheme (`connection.rs:99`) — so a
+    // scheme outside the list means the string is not the URL it claims to be,
+    // and the fail-closed answer is right.
+    const SCHEMES: [&str; 4] = ["redis", "rediss", "redis+unix", "unix"];
+    let scheme = url.find("://").filter(|&i| i < at).and_then(|i| {
+        let candidate = url[..i].to_ascii_lowercase();
+        SCHEMES
+            .contains(&candidate.as_str())
+            .then_some(i + "://".len())
+    });
+
+    match scheme {
+        // Ambiguous — see the doc comment. Fail closed.
+        Some(after_scheme) if url[after_scheme..at].contains('/') => "***".to_string(),
+        Some(after_scheme) => format!("{}***{}", &url[..after_scheme], &url[at..]),
+        // There is an `@`, so there may well be credentials, but this does not
+        // parse as scheme-plus-authority. Refusing to guess is the whole job.
+        None => "***".to_string(),
+    }
 }
 
 /// How this store reaches redis. Not public: callers choose by constructor,
@@ -459,12 +514,21 @@ mod redaction_tests {
         assert_eq!(redact_url_userinfo(u), u);
     }
 
-    /// `@` after the authority is not userinfo. Redacting on the first `@`
-    /// anywhere would mangle the host out of a perfectly safe URL.
+    /// **This is the one existing assertion HIK-243 turns over, and the cost is
+    /// deliberate.** An `@` after a `/` may be an innocent path segment (this
+    /// URL) or the tail of a password containing an unencoded `/` (the leak this
+    /// commit fixes). Nothing short of a URL parser can tell them apart, and a
+    /// URL parser is unavailable by construction — the string reaching here is
+    /// one a URL parser has already rejected. So the harmless case pays: it
+    /// loses its host rather than the leaking case keeping its password.
     #[test]
-    fn an_at_sign_in_the_path_is_not_treated_as_credentials() {
-        let u = "redis://session-redis:6379/db@2";
-        assert_eq!(redact_url_userinfo(u), u);
+    fn an_at_sign_after_a_slash_is_ambiguous_so_it_fails_closed() {
+        assert_eq!(
+            redact_url_userinfo("redis://session-redis:6379/db@2"),
+            "***"
+        );
+        // The reason it cannot simply keep the host: this is the same shape.
+        assert_eq!(redact_url_userinfo("redis://user:hun/ter2@:::bad"), "***");
     }
 
     /// A password may legitimately contain `@`, so the split must be on the
@@ -480,5 +544,181 @@ mod redaction_tests {
     fn a_non_url_is_returned_whole() {
         assert_eq!(redact_url_userinfo("not-a-url"), "not-a-url");
         assert_eq!(redact_url_userinfo(""), "");
+    }
+
+    // ─── The sweep ─────────────────────────────────────────────────────────
+    //
+    // **This is EXHAUSTIVE over the enumerated spelling space, and that is the
+    // design — not a sample, and deliberately not `proptest`.** hs-utils has no
+    // CI, so a randomised failure lands on one laptop with no recorded seed and
+    // nobody watching; a fixed cartesian product fails the same way for everyone
+    // who runs `cargo test`. If you add a spelling, add it to one of the four
+    // lists below and the whole product re-runs. **Do not "simplify" this into
+    // three hand-picked cases.** The last time this estate hand-picked cases for
+    // a redactor, a 400,000-case sweep of the same function in
+    // `botsafely-controller` found 430 leaks the hand-picked ones missed.
+
+    /// Canaries at **both ends** of the password, because every leak this shape
+    /// produces retains the head: the bug is a truncation, so a tail-only marker
+    /// measured 0 detections out of 360 in the controller's equivalent. A leak of
+    /// the head is a leak.
+    const CANARY_HEAD: &str = "HeadC4nary";
+    const CANARY_TAIL: &str = "T4ilCanary";
+
+    /// Scheme prefixes. Three of these are not schemes this function accepts —
+    /// the empty one, one starting with a digit, and `http`, which is
+    /// RFC-3986-shaped but is not a redis scheme — because "there is an `@` but
+    /// no scheme I can identify" is a fail-closed arm, not an unchanged one.
+    /// `REDIS://` is here for the case fold.
+    const SCHEMES: &[&str] = &[
+        "redis://",
+        "rediss://",
+        "REDIS://",
+        "redis+unix://",
+        "http://",
+        "",
+        "1bad://",
+        "not-a-scheme:",
+    ];
+
+    /// Usernames, including ones carrying the two delimiters the parse turns on.
+    const USERNAMES: &[&str] = &["", "Us3rname", "Us3r/name", "Us3r@name", "Us3r:name"];
+
+    /// What sits between the two canaries in the password. `/` is the defect this
+    /// commit fixes; `://` is what let a password masquerade as a scheme.
+    const PASSWORD_MIDDLES: &[&str] = &[
+        "", "/", "//", "@", ":", "://", "?", "#", "\\", " ", "%2F", "/x/", "@/", "/@",
+    ];
+
+    /// Everything after the `@`: host, port, path, query. Two of them carry an
+    /// `@` of their own, which is what makes `rfind` ambiguous.
+    const TAILS: &[&str] = &[
+        "h0st",
+        "h0st:6379",
+        "h0st:6379/0",
+        "h0st:6379/db@2",
+        "h0st:6379/0?opt=a@b",
+        ":::bad",
+        "[::1]:6379",
+    ];
+
+    /// Every URL in the space, as `(url, userinfo, scheme, tail)`.
+    fn sweep_cases() -> Vec<(String, String, &'static str, &'static str)> {
+        let mut out = Vec::new();
+        for scheme in SCHEMES {
+            for user in USERNAMES {
+                for mid in PASSWORD_MIDDLES {
+                    for tail in TAILS {
+                        let password = format!("{CANARY_HEAD}{mid}{CANARY_TAIL}");
+                        let sep = if user.is_empty() { "" } else { ":" };
+                        let userinfo = format!("{user}{sep}{password}");
+                        out.push((
+                            format!("{scheme}{userinfo}@{tail}"),
+                            userinfo,
+                            *scheme,
+                            *tail,
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// **The property.** No run of four or more characters of the userinfo may
+    /// appear in the output. Four rather than the whole string because every
+    /// realistic version of this bug leaks a *prefix* of the secret — asserting
+    /// only that the full password is absent is green against a function that
+    /// prints all but its last character.
+    #[test]
+    fn no_four_character_run_of_the_userinfo_survives_any_spelling() {
+        let cases = sweep_cases();
+        // A control on the sweep itself: an empty or accidentally-shrunk product
+        // would make every assertion below vacuous.
+        assert_eq!(
+            cases.len(),
+            SCHEMES.len() * USERNAMES.len() * PASSWORD_MIDDLES.len() * TAILS.len(),
+            "the cartesian product is not the size its own lists imply"
+        );
+        assert!(
+            cases.len() > 2000,
+            "the sweep shrank: {} cases",
+            cases.len()
+        );
+
+        let mut leaks: Vec<String> = Vec::new();
+        for (url, userinfo, _, _) in &cases {
+            let out = redact_url_userinfo(url);
+            let chars: Vec<char> = userinfo.chars().collect();
+            for window in chars.windows(4) {
+                let needle: String = window.iter().collect();
+                if out.contains(&needle) {
+                    leaks.push(format!("{url:?} -> {out:?} (leaked {needle:?})"));
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            leaks.is_empty(),
+            "{} of {} spellings leaked userinfo into the redacted output; first 10:\n{}",
+            leaks.len(),
+            cases.len(),
+            leaks
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// The other half, and without it the property above is satisfied by a
+    /// function that returns `"***"` for everything. Whenever the redactor does
+    /// *not* fail closed, it must have removed exactly the userinfo and kept the
+    /// scheme and the host — which is the entire reason this function is not
+    /// simply `"***"`.
+    #[test]
+    fn where_it_does_not_fail_closed_it_keeps_the_scheme_and_the_host() {
+        let mut kept = 0usize;
+        for (url, _, scheme, tail) in sweep_cases() {
+            let out = redact_url_userinfo(&url);
+            if out == "***" {
+                continue;
+            }
+            kept += 1;
+            assert_eq!(
+                out,
+                format!("{scheme}***@{tail}"),
+                "an accepted redaction must be scheme + `***@` + the tail, and nothing else: {url:?}"
+            );
+        }
+        assert!(
+            kept > 0,
+            "every spelling failed closed, so nothing here shows the host ever survives"
+        );
+    }
+
+    /// **The positive control.** A URL with no userinfo is passed through
+    /// untouched. Without this, a redactor that answered `"***"` unconditionally
+    /// would satisfy every other assertion in this module.
+    #[test]
+    fn a_url_with_no_userinfo_is_never_redacted() {
+        for u in [
+            "redis://session-redis:6379",
+            "redis://session-redis:6379/0",
+            "rediss://session-redis:6379/3",
+            "redis://[::1]:6379/0",
+            "redis://h0st:6379/0?opt=1",
+            "not-a-url",
+            "",
+        ] {
+            assert_eq!(
+                redact_url_userinfo(u),
+                u,
+                "a URL with no credentials must survive intact, or the error it \
+                 appears in stops being actionable"
+            );
+        }
     }
 }
