@@ -83,12 +83,14 @@ pub struct RedisSentinelConfig {
 /// verbatim, password and all. And the gap was selected by the very character
 /// causing the failure: an unencoded `/` in a password is what makes the URL
 /// unparseable, hence what produces the error this function is redacting for.
-/// Measured over the sweep below, 2,576 of its 3,920 spellings leaked. **Those
-/// two figures are derived, not transcribed** —
-/// `the_sweep_measures_what_the_doc_comment_claims` re-runs the pre-fix body
-/// over the same lists and asserts both, so adding a spelling turns that test
-/// red rather than leaving this sentence quietly false. It carried `2,940` and
-/// `2,044` for one revision, which were the numbers before `http://` and
+/// Measured over the sweep below, 2,576 of its 3,920 spellings leaked. **Both
+/// figures are still literals — here and in the test — but neither can go
+/// quietly stale:** `the_sweep_measures_what_the_doc_comment_claims` re-runs the
+/// pre-fix body over the same lists and asserts both, so adding a spelling turns
+/// that test red and its message says to come and update this sentence. That is
+/// weaker than deriving the numbers and stronger than writing them down once;
+/// the failure mode it removes is the silent one. This sentence carried `2,940`
+/// and `2,044` for one revision, which were the numbers before `http://` and
 /// `1bad://` joined `SCHEMES` in the very commit that quoted them.
 ///
 /// The two obvious repairs are both refused. A second hand-written index rule
@@ -149,8 +151,16 @@ pub struct RedisSentinelConfig {
 /// query-carried-credential row, and a leak in that family cannot appear in it
 /// however large it grows. An exhaustive product is exhaustive over the space it
 /// enumerates and silent about the rest, which is easy to misread as coverage.
-/// That family has its own table,
-/// `query_carried_credentials_fail_closed_for_every_scheme_and_spelling`.
+///
+/// That family has its own coverage, and it is deliberately **not** a second
+/// hand-written table — the first attempt was one, and it was green while
+/// `?pa<TAB>ss=` handed redis a live password. A table contains the spellings
+/// its author already thought of, and this bug class exists precisely because
+/// nobody's list is complete. So
+/// `no_spelling_the_crate_reads_as_a_credential_survives_redaction` asks
+/// `redis::IntoConnectionInfo` what the crate actually reads out of each URL and
+/// asserts a relation between the two answers, rather than asserting a verdict
+/// anyone typed.
 fn redact_url_userinfo(url: &str) -> String {
     // Before anything to do with `@`: for two of the four schemes the credential
     // is not in the userinfo and there is no `@` to find. See the doc comment.
@@ -203,7 +213,20 @@ fn redact_url_userinfo(url: &str) -> String {
 /// The query starts at the first `?` and ends at the first `#`, which is what
 /// the parser redis uses does; no `?` means no query and therefore no
 /// query-carried credential for it to read.
+///
+/// **ASCII tab, LF and CR are removed from the whole input first, because that
+/// is the step `Url::parse` performs before it decides anything.** Without it
+/// `?pa<TAB>ss=hunter2` is `pass` to redis and an unrecognised name here, and
+/// the URL — password and all — was returned verbatim: 108 of the 180
+/// credential-bearing spellings in
+/// `no_spelling_the_crate_reads_as_a_credential_survives_redaction`'s corpus.
+/// `from_url`'s `trim()` does not help; it takes those bytes off the ends, not
+/// out of the middle. Removing them from the **raw** input rather than from the
+/// decoded name is what mirrors the parser's order: `?p%09ass=` is a
+/// percent-encoded tab, decoded afterwards, so redis reads it as `p<TAB>ass` and
+/// it is correctly *not* a credential.
 fn carries_query_credentials(url: &str) -> bool {
+    let url: String = url.replace(['\t', '\n', '\r'], "");
     let Some(q) = url.find('?') else {
         return false;
     };
@@ -224,8 +247,20 @@ fn carries_query_credentials(url: &str) -> bool {
 /// read by redis as `pass` and a plain textual match would walk straight past
 /// it. Undecodable bytes are irrelevant: the only names being compared are
 /// ASCII, so anything that does not decode to them cannot match either way.
-/// (`+` is form-decoded to a space by that same parser and is deliberately not
-/// handled here — no spelling containing a space decodes to `user` or `pass`.)
+///
+/// **This is one of two transforms between the raw URL and the name redis
+/// compares, and it is the second of them.** The first — removal of every ASCII
+/// tab, LF and CR — happens in [`carries_query_credentials`] on the raw string,
+/// because that is where `Url::parse` does it, and the order is load-bearing
+/// rather than incidental: `?p%09ass=` is a percent-encoded tab that survives
+/// the removal and decodes here to `p<TAB>ass`, which redis does **not** read as
+/// `pass`. Do the removal after this decode and that spelling starts failing
+/// closed for no reason. Both directions are pinned by the differential corpus.
+///
+/// One transform is deliberately absent: `+` is form-decoded to a space by that
+/// same parser and is not handled here, because no spelling containing a space
+/// decodes to `user` or `pass`. `?pa+ss=` is in the differential corpus and the
+/// crate agrees it is not a credential.
 fn percent_decode_name(name: &str) -> String {
     let bytes = name.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -711,39 +746,257 @@ mod redaction_tests {
         assert_eq!(percent_decode_name("pass%zz"), "pass%zz");
         assert_eq!(percent_decode_name("%2"), "%2");
         assert_eq!(percent_decode_name(""), "");
+        // The ordering claim, at the decoder's own level: `%09` is a tab, and
+        // it is decoded *after* the caller has removed the raw tabs — so this
+        // must come back containing one, not collapse to `pass`. If it ever
+        // returns `pass`, the two transforms have been folded together and
+        // `?p%09ass=` starts failing closed for a spelling redis does not read.
+        assert_eq!(percent_decode_name("p%09ass"), "p\tass");
         // Undecodable bytes must not panic; they simply cannot match either name.
         assert_ne!(percent_decode_name("%ff%fe"), "pass");
     }
 
-    /// Every spelling of the same family. A small table rather than a product,
-    /// and it exists because the big sweep below structurally **cannot** see this
-    /// shape: it has no unix-scheme row and no query-credential row.
-    #[test]
-    fn query_carried_credentials_fail_closed_for_every_scheme_and_spelling() {
-        // The tcp schemes are here even though redis ignores `?pass=` on them:
-        // an operator who wrote one still put a live password into a string that
-        // is about to be logged, and redis not reading it does not unpublish it.
-        const SCHEMES: &[&str] = &[
-            "unix://",
-            "redis+unix://",
-            "UNIX://",
-            "redis://h0st:6379",
-            "rediss://h0st:6379",
-        ];
-        // `%70ass` / `%75ser` because `Url::query_pairs` percent-decodes the
-        // parameter *name*, so a plain textual `pass=` match is a hole. The
-        // case-folded ones redis does not read, for the reason above.
-        const NAMES: &[&str] = &["pass", "user", "%70ass", "%75ser", "PASS", "User"];
-        const PLACEMENTS: &[&str] = &["{n}=S3cret", "db=0&{n}=S3cret", "{n}=S3cret#frag"];
+    // ─── The query-credential differential ─────────────────────────────────
+    //
+    // **The oracle here is the redis crate itself, not a list of spellings
+    // someone thought of.** The first version of this family's coverage was a
+    // hand-written `NAMES` table — `pass`, `user`, `%70ass`, `%75ser`, `PASS`,
+    // `User` — and it was green while `?pa<TAB>ss=` handed redis a live
+    // password and this function returned the URL verbatim. A table can only
+    // ever contain the spellings its author already knew about, and the whole
+    // reason this bug class keeps recurring is that nobody's list is complete.
+    //
+    // So instead of asserting what *we* think redis reads, every case asks
+    // `redis::IntoConnectionInfo` — the same code path `Client::open` runs —
+    // and the assertion is a **relation between the two answers**: if redis
+    // recovered the canary as a username or a password, the redacted string
+    // must not contain it. Adding a spelling to the corpus needs no matching
+    // change to any expectation.
 
-        for scheme in SCHEMES {
-            for name in NAMES {
-                for placement in PLACEMENTS {
-                    let url = format!("{scheme}/s.sock?{}", placement.replace("{n}", name));
-                    let out = redact_url_userinfo(&url);
-                    assert_eq!(out, "***", "credential survived: {url} -> {out}");
+    /// The canary a query-carried credential is spelt with. Plain ASCII so no
+    /// decoding step can alter it between the URL and either answer.
+    const QUERY_CANARY: &str = "S3cretC4nary";
+
+    /// Scheme plus the path that scheme needs to parse at all — a socket path
+    /// for the unix family, a db index for tcp. The two tcp ones are here
+    /// because redis does **not** read `?pass=` on them, so they are the
+    /// corpus's own over-refusal material: this function fails closed on them
+    /// anyway, deliberately.
+    const Q_BASES: &[&str] = &[
+        "unix:///s.sock",
+        "redis+unix:///s.sock",
+        "UNIX:///s.sock",
+        "redis://h0st:6379/0",
+        "rediss://h0st:6379/0",
+    ];
+
+    /// Parameter names. **The list is deliberately not grouped by expected
+    /// verdict** — the crate supplies the verdict, and labelling a row here
+    /// would be the typed-in expectation this whole test exists to replace.
+    /// What the mix is for:
+    ///
+    /// * `pass` / `user` / `%70ass` / `%75ser` — the plain and percent-encoded
+    ///   spellings the hand-written table already had.
+    /// * `pa<TAB>ss`, `pass<TAB>`, `<TAB>pass`, `pa<LF>ss`, `pa<CR>ss`,
+    ///   `us<TAB>er` — **the family that table missed.** `Url::parse` removes
+    ///   those three bytes from the whole input before it splits a parameter,
+    ///   so redis reads every one of them as `pass` / `user`.
+    /// * `p%09ass` — their control, and the reason the removal has to happen on
+    ///   the raw string. It is a percent-encoded tab, decoded *after* the
+    ///   removal step, so redis reads it as `p<TAB>ass`. Fold the two
+    ///   transforms together and this row and the ones above disagree with the
+    ///   crate in opposite directions.
+    /// * `PASS` / `User` — `query.get("pass")` is case-sensitive, so the crate
+    ///   does not read these; this function fails closed on them anyway.
+    /// * `pa+ss`, `%2570ass` — one decode step too few and one too many.
+    /// * `passx`, `opt` — not credential-shaped at all, so the corpus holds
+    ///   cases that must come back untouched.
+    const Q_NAMES: &[&str] = &[
+        "pass", "user", "%70ass", "%75ser", "pa\tss", "pass\t", "\tpass", "pa\nss", "pa\rss",
+        "us\ter", "PASS", "User", "p%09ass", "pa+ss", "%2570ass", "passx", "opt",
+    ];
+
+    /// Where in the query the parameter sits, including past a `#` and
+    /// duplicated.
+    const Q_PLACEMENTS: &[&str] = &[
+        "{n}={v}",
+        "db=0&{n}={v}",
+        "{n}={v}&protocol=3",
+        "{n}={v}#frag",
+        "x=1&{n}={v}&y=2",
+        "{n}={v}&{n}={v}",
+    ];
+
+    fn query_corpus() -> Vec<String> {
+        let mut out = Vec::new();
+        for base in Q_BASES {
+            for name in Q_NAMES {
+                for placement in Q_PLACEMENTS {
+                    let query = placement.replace("{n}", name).replace("{v}", QUERY_CANARY);
+                    out.push(format!("{base}?{query}"));
                 }
             }
+        }
+        out
+    }
+
+    /// What the redis crate itself recovers from a URL: `true` if the canary
+    /// comes back as the username or the password. A URL the crate refuses to
+    /// parse has no answer and is reported as such by the caller.
+    fn redis_reads_the_canary(url: &str) -> Option<bool> {
+        use redis::IntoConnectionInfo;
+        let info = url.into_connection_info().ok()?;
+        Some(
+            info.redis.username.as_deref() == Some(QUERY_CANARY)
+                || info.redis.password.as_deref() == Some(QUERY_CANARY),
+        )
+    }
+
+    /// `carries_query_credentials` as it stood before the tab/LF/CR removal was
+    /// added, kept only so the differential below has a control. Do not call it
+    /// from anything but that test.
+    fn tab_blind_carries_query_credentials(url: &str) -> bool {
+        let Some(q) = url.find('?') else {
+            return false;
+        };
+        let query = url[q + 1..].split('#').next().unwrap_or("");
+        query.split('&').any(|param| {
+            let name = param.split('=').next().unwrap_or("");
+            matches!(
+                percent_decode_name(name).to_ascii_lowercase().as_str(),
+                "user" | "pass"
+            )
+        })
+    }
+
+    /// Count the spellings on which a redactor publishes a credential the redis
+    /// crate really reads. Parameterised over the credential-detector so the
+    /// pre-fix body can be measured on the identical corpus.
+    fn under_refusals(carries: fn(&str) -> bool) -> Vec<String> {
+        let mut out = Vec::new();
+        for url in query_corpus() {
+            if redis_reads_the_canary(&url) != Some(true) {
+                continue;
+            }
+            // Mirrors `redact_url_userinfo` with the detector swapped. It must
+            // NOT call the real function on the else branch: that would consult
+            // the shipped detector again and the substituted one could never be
+            // seen to miss anything. No case in this corpus carries an `@`, so
+            // with the detector answering "no" the rest of that function is a
+            // pass-through — asserted rather than assumed, because a corpus that
+            // later grew an `@` would silently model the wrong function.
+            let out_str = if carries(&url) {
+                "***".to_string()
+            } else {
+                assert!(!url.contains('@'), "corpus case carries an `@`: {url}");
+                url.clone()
+            };
+            if out_str.contains(QUERY_CANARY) {
+                out.push(format!("{url:?} -> {out_str:?}"));
+            }
+        }
+        out
+    }
+
+    /// **The property, with the crate as the oracle.** If `redis` recovers the
+    /// canary from a URL, the redaction of that URL must not contain it.
+    ///
+    /// `#[cfg(unix)]` because `url_to_unix_connection_info` is itself
+    /// `#[cfg(unix)]` — off unix the crate refuses every `unix://` URL, so the
+    /// credential half of the corpus would be empty and the whole thing
+    /// vacuously green. This crate ships in Linux containers.
+    #[cfg(unix)]
+    #[test]
+    fn no_spelling_the_crate_reads_as_a_credential_survives_redaction() {
+        let corpus = query_corpus();
+        assert_eq!(
+            corpus.len(),
+            Q_BASES.len() * Q_NAMES.len() * Q_PLACEMENTS.len(),
+            "the cartesian product is not the size its own lists imply"
+        );
+
+        // The control that stops "zero under-refusals" being satisfied by a
+        // corpus redis reads no credential out of at all.
+        let credential_cases = corpus
+            .iter()
+            .filter(|u| redis_reads_the_canary(u) == Some(true))
+            .count();
+        assert_eq!(
+            credential_cases, 180,
+            "the number of spellings the crate reads a credential from changed; \
+             if a name was added or the crate's parsing moved, re-derive it"
+        );
+
+        let leaks = under_refusals(carries_query_credentials);
+        assert!(
+            leaks.is_empty(),
+            "{} of {credential_cases} spellings the redis crate reads a credential \
+             from published it; first 10:\n{}",
+            leaks.len(),
+            leaks
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// **The control, and it is what makes the green above mean something.**
+    /// Every assertion in the test before this one is "nothing leaked", which a
+    /// corpus incapable of leaking would satisfy just as well. Running the
+    /// tab-blind body over the identical corpus is the measurement that the
+    /// corpus can detect the defect it was built for: 108 of the 180
+    /// credential-bearing spellings — exactly and only those whose name carries
+    /// an ASCII tab, LF or CR — came back verbatim, password and all.
+    #[cfg(unix)]
+    #[test]
+    fn the_differential_can_see_the_defect_it_was_built_for() {
+        let missed = under_refusals(tab_blind_carries_query_credentials);
+        assert_eq!(
+            missed.len(),
+            108,
+            "the corpus changed size or shape; re-derive this figure and the one \
+             in `carries_query_credentials`' doc comment. First 10:\n{}",
+            missed
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            missed
+                .iter()
+                .all(|m| m.contains("\\t") || m.contains("\\n") || m.contains("\\r")),
+            "the tab-blind body missed something outside the tab/LF/CR family, so \
+             the doc comment's account of the gap is wrong: {missed:?}"
+        );
+    }
+
+    /// **The deliberate over-refusal, pinned against the crate rather than
+    /// against belief.** On a tcp scheme redis reads no credential out of the
+    /// query at all — so `?pass=` there is an operator's secret sitting in a
+    /// string about to be logged, not a credential redis uses. Failing closed
+    /// on it anyway is a choice, and this is the assertion that says so out
+    /// loud, with the crate confirming the premise.
+    #[cfg(unix)]
+    #[test]
+    fn a_query_password_fails_closed_on_the_tcp_schemes_that_ignore_it() {
+        for url in [
+            "redis://h0st:6379/0?pass=S3cretC4nary",
+            "rediss://h0st:6379/0?user=alice&pass=S3cretC4nary",
+        ] {
+            assert_eq!(
+                redis_reads_the_canary(url),
+                Some(false),
+                "premise broken: the crate now reads a query credential on tcp: {url}"
+            );
+            assert_eq!(
+                redact_url_userinfo(url),
+                "***",
+                "a query-carried password must fail closed whatever the scheme: {url}"
+            );
         }
     }
 
@@ -751,23 +1004,47 @@ mod redaction_tests {
     /// `session_store.rs` hands `session.redis.url[0]` straight to `from_url`,
     /// and for these two schemes `Client::open` *parses* the URL and fails
     /// afterwards — so the error is real and the credential is inside it.
+    ///
+    /// The tab spelling is here rather than only in the differential because
+    /// this is the path that actually reaches a container log, and `from_url`'s
+    /// `trim()` is the thing that looks as though it already handled it: it
+    /// removes tabs from the **ends** of the config value and does nothing to an
+    /// interior one.
     #[test]
     fn a_query_string_password_never_survives_into_the_error_text() {
-        let err = RedisSessionStore::from_url(
+        for url in [
             "unix:///run/redis.sock?pass=hunter2&db=notanumber",
-            Duration::from_secs(60),
-        )
-        .err()
-        .expect("an invalid db index should fail to open");
-        let text = format!("{err:#}");
-        assert!(
-            !text.contains("hunter2"),
-            "password leaked into the error: {text}"
-        );
-        assert!(
-            text.contains("***"),
-            "should say a credential was elided: {text}"
-        );
+            "unix:///run/redis.sock?pa\tss=hunter2&db=notanumber",
+            "unix:///run/redis.sock?us\ter=alice&pa\nss=hunter2&db=notanumber",
+        ] {
+            let err = RedisSessionStore::from_url(url, Duration::from_secs(60))
+                .err()
+                .expect("an invalid db index should fail to open");
+            let text = format!("{err:#}");
+            assert!(
+                !text.contains("hunter2"),
+                "password leaked into the error for {url:?}: {text}"
+            );
+            assert!(
+                text.contains("***"),
+                "should say a credential was elided for {url:?}: {text}"
+            );
+        }
+    }
+
+    /// **Where the tab removal stops, and why it does not need to go further.**
+    /// It is confined to `carries_query_credentials`; the userinfo scan below it
+    /// still reads the raw string. That is not an oversight — a tab spliced into
+    /// the scheme costs the `://` or the scheme match, and both of those arms
+    /// already fail closed. Pinned so nobody "completes" the fix by stripping
+    /// the tabs from the whole of `redact_url_userinfo`, which would start
+    /// handing the *userinfo* path a string it never received.
+    #[test]
+    fn a_tab_in_the_scheme_still_fails_closed_by_the_existing_arms() {
+        // `redis\t` is not one of the four accepted schemes.
+        assert_eq!(redact_url_userinfo("redis\t://u:hunter2@h0st"), "***");
+        // The `://` itself is broken, so there is no scheme at all.
+        assert_eq!(redact_url_userinfo("redis:/\t/u:hunter2@h0st"), "***");
     }
 
     /// A password may legitimately contain `@`, so the split must be on the
