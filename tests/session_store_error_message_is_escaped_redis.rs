@@ -34,6 +34,16 @@
 //! rendered output and the *escaped* spelling of the newline (`\` followed by
 //! `n`, two characters). Both are taken over rendered text rather than over
 //! fields, because what a forged line lands in is the container log.
+//!
+//! **`log_safe` is a second property and it needs a second reply.** The escaping
+//! comes from recording the value as a bare `&str`; all `log_safe`
+//! (`web_login.rs:512`) adds on top is a 256-byte cap. So a run driven only by
+//! the short reply above stays green when `log_safe` is dropped from both sites
+//! — measured — while a hostile redis answering with a megabyte `-ERR` detail
+//! writes a megabyte log line and nothing goes red. The second pair of
+//! operations is therefore answered with a reply whose detail runs well past the
+//! cap and ends in a canary, and the cap is what those assertions turn on: the
+//! canary absent, the truncation marker present.
 #![cfg(feature = "web-login-redis")]
 
 use std::io::{Read as _, Write as _};
@@ -57,11 +67,31 @@ const FORGED: &[u8] =
 /// The marker a forged line would start with, if one were forged.
 const FORGED_LINE_START: &str = "2026-08-06T00:00:00.000000Z";
 
-/// The scripted handshake reply: `SELECT` fails, both `CLIENT SETINFO`s
-/// succeed. Order matches `connection_setup_pipeline`, which emits `SELECT`
-/// first and `check_connection_setup` reads by index.
-fn handshake_reply() -> Vec<u8> {
-    let mut v = FORGED.to_vec();
+/// `log_safe`'s cap, i.e. `web_login::MAX_LOGGED_LEN`. Not importable — the
+/// constant is private — so it is restated here and the reply below is sized
+/// against it with room to spare rather than exactly.
+const MAX_LOGGED_LEN: usize = 256;
+
+/// The last thing an over-long reply says. It sits past the cap, so it appears
+/// in the log only if nothing truncated the value.
+const LONG_TAIL_CANARY: &str = "T4ILOFAV3RYLONGREPLY";
+
+/// A `-ERR` whose detail runs well past `MAX_LOGGED_LEN`. Carries the same bare
+/// LF as `FORGED`, so this pair asserts the escaping *and* the cap rather than
+/// trading one for the other.
+fn long_forged() -> Vec<u8> {
+    let mut s = String::from("-ERR select refused verbosely\n2026-08-06T00:00:00.000000Z  INFO ");
+    s.push_str(&"P".repeat(4 * MAX_LOGGED_LEN));
+    s.push_str(LONG_TAIL_CANARY);
+    s.push_str("\r\n");
+    s.into_bytes()
+}
+
+/// The scripted handshake reply: `SELECT` fails with `err`, both
+/// `CLIENT SETINFO`s succeed. Order matches `connection_setup_pipeline`, which
+/// emits `SELECT` first and `check_connection_setup` reads by index.
+fn handshake_reply(err: &[u8]) -> Vec<u8> {
+    let mut v = err.to_vec();
     v.extend_from_slice(b"+OK\r\n+OK\r\n");
     v
 }
@@ -119,19 +149,21 @@ fn read_a_message(sock: &mut TcpStream) -> Vec<u8> {
     buf
 }
 
-/// Answer `connections` handshakes with the forged `SELECT` failure. Every store
-/// operation opens a fresh connection, so N connections is N operations.
-fn spawn_stub(connections: usize) -> u16 {
+/// Answer one handshake per entry in `replies`, each with the forged `SELECT`
+/// failure it names. Every store operation opens a fresh connection, so the Nth
+/// operation gets the Nth reply — which is how the short and the long reply are
+/// driven from one subscriber.
+fn spawn_stub(replies: Vec<Vec<u8>>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
-        for _ in 0..connections {
+        for reply in replies {
             let Ok((mut sock, _)) = listener.accept() else {
                 return;
             };
             sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
             read_a_message(&mut sock);
-            let _ = sock.write_all(&handshake_reply());
+            let _ = sock.write_all(&handshake_reply(&reply));
             let _ = sock.flush();
             // Hold the socket open long enough for the client to consume the
             // reply; dropping it immediately surfaces as a connection reset,
@@ -162,10 +194,17 @@ async fn a_hostile_redis_cannot_forge_a_log_line_through_a_connection_failure() 
         .try_init()
         .expect("this binary installs exactly one subscriber");
 
-    // Two connections: `load`'s `conn()` and `store`'s. `remove`'s connection
-    // failure is silent at this pin and belongs to HIK-241, so it is not driven
-    // here — driving it would assert on a line that does not exist yet.
-    let port = spawn_stub(2);
+    // Four connections: `load`'s `conn()` and `store`'s, twice over — once with
+    // the short reply for the escaping, once with the over-long one for the cap.
+    // `remove`'s connection failure is silent at this pin and belongs to
+    // HIK-241, so it is not driven here — driving it would assert on a line that
+    // does not exist yet.
+    let port = spawn_stub(vec![
+        FORGED.to_vec(),
+        FORGED.to_vec(),
+        long_forged(),
+        long_forged(),
+    ]);
 
     // `/3` is what makes the handshake emit `SELECT`; see the header.
     let store = RedisSessionStore::from_url(
@@ -174,6 +213,9 @@ async fn a_hostile_redis_cannot_forge_a_log_line_through_a_connection_failure() 
     )
     .expect("a plain redis url parses; from_url performs no I/O");
 
+    store.load(SID).await;
+    store.store(SID, &Session::default()).await;
+    // The same two operations again, answered with the over-long reply.
     store.load(SID).await;
     store.store(SID, &Session::default()).await;
 
@@ -192,19 +234,21 @@ async fn a_hostile_redis_cannot_forge_a_log_line_through_a_connection_failure() 
              this run proves nothing.\n----- full captured output -----\n{rendered}"
         );
     }
-    assert!(
-        rendered.contains("select refused"),
-        "the server's own error text never reached the log, so the vehicle did not carry \
-         attacker-chosen bytes.\n----- full captured output -----\n{rendered}"
-    );
+    for text in ["select refused", "select refused verbosely"] {
+        assert!(
+            rendered.contains(text),
+            "the server's own error text {text:?} never reached the log, so the vehicle did \
+             not carry attacker-chosen bytes.\n----- full captured output -----\n{rendered}"
+        );
+    }
 
     // THE PROPERTY, oracle 1: the reply chose the bytes, it must not choose the
-    // line count. Two operations, two lines.
+    // line count. Four operations, four lines.
     let lines: Vec<&str> = rendered.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         lines.len(),
-        2,
-        "a `-ERR` reply containing a newline forged {} log line(s) out of 2 operations.\n\
+        4,
+        "a `-ERR` reply containing a newline forged {} log line(s) out of 4 operations.\n\
          ----- full captured output -----\n{rendered}",
         lines.len()
     );
@@ -226,5 +270,31 @@ async fn a_hostile_redis_cannot_forge_a_log_line_through_a_connection_failure() 
         !lines.iter().any(|l| l.starts_with(FORGED_LINE_START)),
         "a line in the log stream was written by the redis server, not by this service.\n\
          ----- full captured output -----\n{rendered}"
+    );
+
+    // THE SECOND PROPERTY: `log_safe`'s cap. Nothing above is sensitive to it —
+    // drop `log_safe` from both sites and every assertion so far stays green,
+    // because the escaping comes from the bare `&str`. What the cap stops is a
+    // hostile redis choosing the *length* of our log line as well as its bytes.
+    assert!(
+        !rendered.contains(LONG_TAIL_CANARY),
+        "the tail of a {}-byte reply reached the log, so the error text was not capped and a \
+         hostile redis chooses how much it writes.\n----- full captured output -----\n{rendered}",
+        long_forged().len()
+    );
+    assert!(
+        rendered.contains('…'),
+        "no truncation marker, so nothing was capped — check `log_safe` is still applied at \
+         both `connection failed` sites.\n----- full captured output -----\n{rendered}"
+    );
+    // And the cap has to bind on the line that was over it, not merely somewhere
+    // in the capture: without this a marker anywhere would satisfy the assertion
+    // above. `MAX_LOGGED_LEN` bounds the field, and the rest of the line (the
+    // timestamp, level and the other two fields) is fixed overhead of ~200 B.
+    let longest = lines.iter().map(|l| l.len()).max().unwrap_or_default();
+    assert!(
+        longest < 2 * MAX_LOGGED_LEN,
+        "the longest rendered line is {longest} B against a {MAX_LOGGED_LEN} B field cap, so \
+         the reply's length still reached the log.\n----- full captured output -----\n{rendered}"
     );
 }

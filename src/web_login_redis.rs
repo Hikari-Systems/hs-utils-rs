@@ -83,7 +83,13 @@ pub struct RedisSentinelConfig {
 /// verbatim, password and all. And the gap was selected by the very character
 /// causing the failure: an unencoded `/` in a password is what makes the URL
 /// unparseable, hence what produces the error this function is redacting for.
-/// Measured over the 2,940-spelling sweep below, 2,044 of them leaked.
+/// Measured over the sweep below, 2,576 of its 3,920 spellings leaked. **Those
+/// two figures are derived, not transcribed** —
+/// `the_sweep_measures_what_the_doc_comment_claims` re-runs the pre-fix body
+/// over the same lists and asserts both, so adding a spelling turns that test
+/// red rather than leaving this sentence quietly false. It carried `2,940` and
+/// `2,044` for one revision, which were the numbers before `http://` and
+/// `1bad://` joined `SCHEMES` in the very commit that quoted them.
 ///
 /// The two obvious repairs are both refused. A second hand-written index rule
 /// ("the last `@` before the first `/` that follows it") is one more guess at a
@@ -103,6 +109,30 @@ pub struct RedisSentinelConfig {
 /// `auth::redact_userinfo`, whose earlier version resolved the ambiguity the
 /// other way and leaked.
 ///
+/// **That cost is wider than the one example**, and reading `db@2` as the shape
+/// of it under-states what an operator loses. *Any* `@` anywhere past the
+/// authority collapses the whole string: `rediss://host:6379/0?opt=a@b` and
+/// `redis://user:pw@host:6379/0#frag@x` both render `***` (measured; pinned by
+/// `an_at_sign_after_a_slash_is_ambiguous_so_it_fails_closed`). The trade still
+/// goes this way — an `@` in a query or fragment is rare, and a password
+/// containing a `/` is exactly what produces the errors this guards — but the
+/// blast radius is "a lost hostname on any URL with a stray `@`", not one
+/// contrived path segment.
+///
+/// **Credentials are not only ever in the userinfo, and for two of the four
+/// schemes they are never there.** `unix` and `redis+unix` take username and
+/// password from the **query string** — `query.get("user")` / `query.get("pass")`
+/// at `connection.rs:424-446` — and such a URL has no `@` at all, so the rule
+/// above returned it verbatim at its first branch:
+/// `unix:///run/redis.sock?pass=hunter2&db=notanumber` came back whole, out of a
+/// config value `session_store.rs` hands straight to `from_url`. So
+/// [`carries_query_credentials`] runs **first** and fails closed on a hit,
+/// whatever the scheme: an operator who writes `?pass=` on a `redis://` URL has
+/// still put a live password into a string about to be logged, and redis quietly
+/// ignoring it there does not unpublish it. It fails closed rather than blanking
+/// the value alone because a raw `&` inside a password splits it into what looks
+/// like a second parameter, and blanking one value would print the tail.
+///
 /// **Residual, stated rather than left to be rediscovered.** A password that
 /// itself begins with one of the four accepted schemes followed by `://`, in a
 /// value carrying no scheme of its own, still has that literal prefix printed —
@@ -111,7 +141,23 @@ pub struct RedisSentinelConfig {
 /// and it needs a config value that is not a URL at all. Closing it entirely is
 /// impossible without a parser: the two readings of such a string are textually
 /// identical.
+///
+/// **And a note on what the sweep can and cannot see, because the query-string
+/// hole above was invisible to it and would have stayed so.** `sweep_cases` is
+/// exhaustive over *its* four lists, and every case it builds is
+/// `scheme + userinfo + "@" + tail` — so it has no unix-scheme row and no
+/// query-carried-credential row, and a leak in that family cannot appear in it
+/// however large it grows. An exhaustive product is exhaustive over the space it
+/// enumerates and silent about the rest, which is easy to misread as coverage.
+/// That family has its own table,
+/// `query_carried_credentials_fail_closed_for_every_scheme_and_spelling`.
 fn redact_url_userinfo(url: &str) -> String {
+    // Before anything to do with `@`: for two of the four schemes the credential
+    // is not in the userinfo and there is no `@` to find. See the doc comment.
+    if carries_query_credentials(url) {
+        return "***".to_string();
+    }
+
     // No `@` anywhere: there are no credentials to hide.
     let Some(at) = url.rfind('@') else {
         return url.to_string();
@@ -148,6 +194,62 @@ fn redact_url_userinfo(url: &str) -> String {
         // parse as scheme-plus-authority. Refusing to guess is the whole job.
         None => "***".to_string(),
     }
+}
+
+/// True if the string carries a `user=` or `pass=` query parameter — the place
+/// `unix` / `redis+unix` URLs keep their credentials. See
+/// [`redact_url_userinfo`], which fails closed on a hit.
+///
+/// The query starts at the first `?` and ends at the first `#`, which is what
+/// the parser redis uses does; no `?` means no query and therefore no
+/// query-carried credential for it to read.
+fn carries_query_credentials(url: &str) -> bool {
+    let Some(q) = url.find('?') else {
+        return false;
+    };
+    let query = url[q + 1..].split('#').next().unwrap_or("");
+    query.split('&').any(|param| {
+        let name = param.split('=').next().unwrap_or("");
+        matches!(
+            percent_decode_name(name).to_ascii_lowercase().as_str(),
+            "user" | "pass"
+        )
+    })
+}
+
+/// Percent-decode a query parameter *name* far enough to compare it with the
+/// two that matter.
+///
+/// `Url::query_pairs` decodes the name as well as the value, so `?%70ass=` is
+/// read by redis as `pass` and a plain textual match would walk straight past
+/// it. Undecodable bytes are irrelevant: the only names being compared are
+/// ASCII, so anything that does not decode to them cannot match either way.
+/// (`+` is form-decoded to a space by that same parser and is deliberately not
+/// handled here — no spelling containing a space decodes to `user` or `pass`.)
+fn percent_decode_name(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = (bytes[i] == b'%' && i + 2 < bytes.len())
+            .then(|| Some(hex_nibble(bytes[i + 1])? * 16 + hex_nibble(bytes[i + 2])?))
+            .flatten();
+        match decoded {
+            Some(b) => {
+                out.push(b);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    (b as char).to_digit(16).map(|d| d as u8)
 }
 
 /// How this store reaches redis. Not public: callers choose by constructor,
@@ -299,10 +401,20 @@ impl RedisSessionStore {
 // bare LF in that reply is not a terminator and survives into the error text. A
 // hostile or compromised redis could therefore append whole forged lines to this
 // service's log stream — the same shape the paragraph above rejects, reached from
-// downstream rather than from caller input. They now take the same four fields as
-// the eight sites below, and `error.message` is a bare `&str` on all ten: that is
-// what makes the fmt layer escape the newline instead of emitting it.
-// `tests/session_store_error_message_is_escaped_redis.rs` drives both of them.
+// downstream rather than from caller input. They now carry the same **three**
+// fields as the five other `tracing::error!` sites in this impl —
+// `session.store`, `session.op`, `error.message` — and `error.message` is a bare
+// `&str` on all seven: that is what makes the fmt layer escape the newline
+// instead of emitting it. `tests/session_store_error_message_is_escaped_redis.rs`
+// drives both of them, including the over-256-byte reply that exercises
+// `log_safe`'s cap.
+//
+// **Three, not four, and this store is not symmetric with the Postgres one.**
+// `web_login_postgres` has five sites carrying four fields, the extra being
+// `session.table`; redis has no table, so there is nothing for it to carry. The
+// two stores get flattened to one shape every time someone summarises them —
+// botsafely-controller's `CLAUDE.md` records correcting exactly that once
+// already — so the counts are spelt out per store rather than shared.
 #[async_trait]
 impl WebSessionStore for RedisSessionStore {
     async fn load(&self, sid: &str) -> Option<Session> {
@@ -412,12 +524,15 @@ mod tests {
     #[test]
     fn from_url_accepts_the_forms_that_replace_the_sentinel_fields() {
         for url in [
-            "redis://session-redis:6379",       // plain
-            "redis://session-redis:6379/3",     // db index
-            "redis://user:pass@host:6379/1",    // credentials
-            "rediss://host:6379",               // TLS
+            "redis://session-redis:6379",    // plain
+            "redis://session-redis:6379/3",  // db index
+            "redis://user:pass@host:6379/1", // credentials
+            "rediss://host:6379",            // TLS
         ] {
-            assert!(RedisSessionStore::from_url(url, TTL).is_ok(), "should parse: {url}");
+            assert!(
+                RedisSessionStore::from_url(url, TTL).is_ok(),
+                "should parse: {url}"
+            );
         }
     }
 
@@ -439,7 +554,10 @@ mod tests {
     /// Pre-existing guard, pinned so the refactor to `Backend` did not drop it.
     #[test]
     fn from_sentinel_still_rejects_an_empty_host_list() {
-        let cfg = RedisSentinelConfig { master_name: "mymaster".into(), ..Default::default() };
+        let cfg = RedisSentinelConfig {
+            master_name: "mymaster".into(),
+            ..Default::default()
+        };
         assert!(RedisSessionStore::from_sentinel(cfg, TTL).is_err());
     }
 
@@ -487,12 +605,19 @@ mod redaction_tests {
         // `.err()` rather than `unwrap_err()`: the latter needs the Ok type to
         // be Debug, and deriving Debug on a store holding a live client is not
         // worth doing to satisfy a test.
-        let err = RedisSessionStore::from_url("redis://user:hunter2@:::bad", Duration::from_secs(60))
-            .err()
-            .expect("a malformed redis url should fail to parse");
+        let err =
+            RedisSessionStore::from_url("redis://user:hunter2@:::bad", Duration::from_secs(60))
+                .err()
+                .expect("a malformed redis url should fail to parse");
         let text = format!("{err:#}");
-        assert!(!text.contains("hunter2"), "password leaked into the error: {text}");
-        assert!(text.contains("***"), "should say a credential was elided: {text}");
+        assert!(
+            !text.contains("hunter2"),
+            "password leaked into the error: {text}"
+        );
+        assert!(
+            text.contains("***"),
+            "should say a credential was elided: {text}"
+        );
     }
 
     #[test]
@@ -529,6 +654,120 @@ mod redaction_tests {
         );
         // The reason it cannot simply keep the host: this is the same shape.
         assert_eq!(redact_url_userinfo("redis://user:hun/ter2@:::bad"), "***");
+        // And the cost is not confined to a contrived path segment — any `@`
+        // past the authority does it. Pinned so the doc comment's account of the
+        // blast radius cannot drift from the behaviour.
+        assert_eq!(redact_url_userinfo("rediss://host:6379/0?opt=a@b"), "***");
+        assert_eq!(
+            redact_url_userinfo("redis://user:pw@host:6379/0#frag@x"),
+            "***"
+        );
+    }
+
+    /// **Two of the four accepted schemes never put the credential in the
+    /// userinfo at all.** `unix` and `redis+unix` take it from the query string
+    /// (`connection.rs:424-446`), and such a URL carries no `@`, so the userinfo
+    /// rule returns it verbatim at its very first branch.
+    #[test]
+    fn credentials_in_the_query_string_fail_closed() {
+        for url in [
+            "unix:///run/redis.sock?pass=hunter2&db=notanumber",
+            "redis+unix:///run/r.sock?user=alice&pass=hunter2&protocol=9",
+        ] {
+            let out = redact_url_userinfo(url);
+            assert_eq!(
+                out, "***",
+                "query-carried credentials leaked: {url} -> {out}"
+            );
+        }
+    }
+
+    /// The other side of that rule, and without it the cheapest way to satisfy
+    /// the one above is to fail closed on any `?` at all. The query parameters
+    /// redis reads that are *not* credentials — `db`, `protocol` — must leave the
+    /// URL actionable, which is the whole reason this is not simply `"***"`.
+    #[test]
+    fn ordinary_query_parameters_do_not_fail_closed() {
+        for url in [
+            "redis://h0st:6379/0?protocol=3",
+            "unix:///run/redis.sock?db=3&protocol=3",
+            "rediss://h0st:6379/0?opt=1",
+        ] {
+            assert_eq!(redact_url_userinfo(url), url, "needlessly redacted: {url}");
+        }
+    }
+
+    /// The decoder is what stops `?%70ass=` walking past the check, so it is
+    /// tested directly rather than only through the table below: a bug in it
+    /// publishes a password.
+    #[test]
+    fn a_query_parameter_name_is_decoded_the_way_the_url_parser_decodes_it() {
+        assert_eq!(percent_decode_name("pass"), "pass");
+        assert_eq!(percent_decode_name("%70ass"), "pass");
+        assert_eq!(percent_decode_name("%70%61%73%73"), "pass");
+        // Not a valid escape, so it stays as written — which is also what
+        // `Url::query_pairs` does with it.
+        assert_eq!(percent_decode_name("pass%"), "pass%");
+        assert_eq!(percent_decode_name("pass%zz"), "pass%zz");
+        assert_eq!(percent_decode_name("%2"), "%2");
+        assert_eq!(percent_decode_name(""), "");
+        // Undecodable bytes must not panic; they simply cannot match either name.
+        assert_ne!(percent_decode_name("%ff%fe"), "pass");
+    }
+
+    /// Every spelling of the same family. A small table rather than a product,
+    /// and it exists because the big sweep below structurally **cannot** see this
+    /// shape: it has no unix-scheme row and no query-credential row.
+    #[test]
+    fn query_carried_credentials_fail_closed_for_every_scheme_and_spelling() {
+        // The tcp schemes are here even though redis ignores `?pass=` on them:
+        // an operator who wrote one still put a live password into a string that
+        // is about to be logged, and redis not reading it does not unpublish it.
+        const SCHEMES: &[&str] = &[
+            "unix://",
+            "redis+unix://",
+            "UNIX://",
+            "redis://h0st:6379",
+            "rediss://h0st:6379",
+        ];
+        // `%70ass` / `%75ser` because `Url::query_pairs` percent-decodes the
+        // parameter *name*, so a plain textual `pass=` match is a hole. The
+        // case-folded ones redis does not read, for the reason above.
+        const NAMES: &[&str] = &["pass", "user", "%70ass", "%75ser", "PASS", "User"];
+        const PLACEMENTS: &[&str] = &["{n}=S3cret", "db=0&{n}=S3cret", "{n}=S3cret#frag"];
+
+        for scheme in SCHEMES {
+            for name in NAMES {
+                for placement in PLACEMENTS {
+                    let url = format!("{scheme}/s.sock?{}", placement.replace("{n}", name));
+                    let out = redact_url_userinfo(&url);
+                    assert_eq!(out, "***", "credential survived: {url} -> {out}");
+                }
+            }
+        }
+    }
+
+    /// The end-to-end half, and the reason this family is not hypothetical:
+    /// `session_store.rs` hands `session.redis.url[0]` straight to `from_url`,
+    /// and for these two schemes `Client::open` *parses* the URL and fails
+    /// afterwards — so the error is real and the credential is inside it.
+    #[test]
+    fn a_query_string_password_never_survives_into_the_error_text() {
+        let err = RedisSessionStore::from_url(
+            "unix:///run/redis.sock?pass=hunter2&db=notanumber",
+            Duration::from_secs(60),
+        )
+        .err()
+        .expect("an invalid db index should fail to open");
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("hunter2"),
+            "password leaked into the error: {text}"
+        );
+        assert!(
+            text.contains("***"),
+            "should say a credential was elided: {text}"
+        );
     }
 
     /// A password may legitimately contain `@`, so the split must be on the
@@ -625,6 +864,25 @@ mod redaction_tests {
         out
     }
 
+    /// Which spellings leak, under whichever redactor is handed in. Taking the
+    /// function as an argument is what lets the pre-fix body be measured over
+    /// the same lists — see `the_sweep_measures_what_the_doc_comment_claims`.
+    fn leaking_spellings(redactor: fn(&str) -> String) -> Vec<String> {
+        let mut leaks = Vec::new();
+        for (url, userinfo, _, _) in &sweep_cases() {
+            let out = redactor(url);
+            let chars: Vec<char> = userinfo.chars().collect();
+            for window in chars.windows(4) {
+                let needle: String = window.iter().collect();
+                if out.contains(&needle) {
+                    leaks.push(format!("{url:?} -> {out:?} (leaked {needle:?})"));
+                    break;
+                }
+            }
+        }
+        leaks
+    }
+
     /// **The property.** No run of four or more characters of the userinfo may
     /// appear in the output. Four rather than the whole string because every
     /// realistic version of this bug leaks a *prefix* of the secret — asserting
@@ -646,18 +904,7 @@ mod redaction_tests {
             cases.len()
         );
 
-        let mut leaks: Vec<String> = Vec::new();
-        for (url, userinfo, _, _) in &cases {
-            let out = redact_url_userinfo(url);
-            let chars: Vec<char> = userinfo.chars().collect();
-            for window in chars.windows(4) {
-                let needle: String = window.iter().collect();
-                if out.contains(&needle) {
-                    leaks.push(format!("{url:?} -> {out:?} (leaked {needle:?})"));
-                    break;
-                }
-            }
-        }
+        let leaks = leaking_spellings(redact_url_userinfo);
 
         assert!(
             leaks.is_empty(),
@@ -670,6 +917,55 @@ mod redaction_tests {
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n")
+        );
+    }
+
+    /// The redactor as it stood before HIK-243, kept only so the sweep can be
+    /// measured against it. Do not call it from anything but the test below.
+    fn pre_hik243_redact(url: &str) -> String {
+        let Some(scheme_end) = url.find("://") else {
+            return url.to_string();
+        };
+        let authority_start = scheme_end + 3;
+        let authority_end = url[authority_start..]
+            .find('/')
+            .map(|i| authority_start + i)
+            .unwrap_or(url.len());
+        let Some(at) = url[authority_start..authority_end].rfind('@') else {
+            return url.to_string();
+        };
+        format!(
+            "{}***{}",
+            &url[..authority_start],
+            &url[authority_start + at..]
+        )
+    }
+
+    /// **Two things at once, and the second is why it is written this way.**
+    ///
+    /// It shows the sweep can *detect* the defect it was built for: every
+    /// assertion above is "no leak", which a sweep of spellings none of which
+    /// could ever leak would also satisfy. Running the pre-fix body over the same
+    /// lists is the control that gives those greens their meaning.
+    ///
+    /// And it holds the two figures quoted in `redact_url_userinfo`'s doc comment
+    /// — 3,920 spellings, 2,576 of them leaking. They are **derived here rather
+    /// than transcribed there**, because the pair that sentence carried before was
+    /// `(2,940, 2,044)`: correct for the lists as they stood, and stale from the
+    /// moment `http://` and `1bad://` were added to `SCHEMES` in the same commit
+    /// that quoted it. Add a spelling and this goes red, which is the point — a
+    /// prose numeral over a growing set goes quietly false instead.
+    #[test]
+    fn the_sweep_measures_what_the_doc_comment_claims() {
+        assert_eq!(
+            sweep_cases().len(),
+            3_920,
+            "the sweep changed size; update `redact_url_userinfo`'s doc comment to match"
+        );
+        assert_eq!(
+            leaking_spellings(pre_hik243_redact).len(),
+            2_576,
+            "the pre-fix leak count changed; update `redact_url_userinfo`'s doc comment to match"
         );
     }
 
