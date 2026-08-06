@@ -233,18 +233,21 @@ impl RedisSessionStore {
 // bytes raw, so a newline in it would forge a whole log line. `session.*` take
 // `%` because they are compile-time literals.
 //
-// The two `connection failed` sites carry no sid, which is why this ticket left
-// them — but their `{e:#}` is NOT safe for the reason it looks safe, and the
-// distinction matters to whoever touches them next. The chain comes from
-// `conn()`, whose context is a fixed string plus a `RedisError`; it never
-// carries the URL, so `from_url`'s `redact_url_userinfo` — which guards
-// `Client::open` at construction — has nothing to do with these lines. What
-// `{e:#}` does render raw is `RedisError`'s `Display`, and an `ExtensionError`
-// takes its code and detail verbatim from the server's `-ERR` reply. That is
-// downstream-derived text on a `%`-equivalent sigil: the same log-forging shape
-// the paragraph above rejects, reachable from a hostile or compromised redis
-// rather than from caller input. Out of scope here because no credential is
-// disclosed; the fix is `log_safe(&format!("{e:#}"))` and it is filed.
+// The two `connection failed` sites carry no sid, so they were left interpolated
+// for one release — and the reason that was wrong is worth keeping, because it is
+// not the reason it looks like. The chain comes from `conn()`, whose context is a
+// fixed string plus a `RedisError`; it never carries the URL, so `from_url`'s
+// `redact_url_userinfo` — which guards `Client::open` at construction — has
+// nothing to do with these lines, and no credential is disclosed by them. What
+// `{e:#}` rendered raw is `RedisError`'s `Display`, which reproduces the server's
+// own `-ERR` reply **verbatim**: the RESP line parser terminates on CRLF, so a
+// bare LF in that reply is not a terminator and survives into the error text. A
+// hostile or compromised redis could therefore append whole forged lines to this
+// service's log stream — the same shape the paragraph above rejects, reached from
+// downstream rather than from caller input. They now take the same four fields as
+// the eight sites below, and `error.message` is a bare `&str` on all ten: that is
+// what makes the fmt layer escape the newline instead of emitting it.
+// `tests/session_store_error_message_is_escaped_redis.rs` drives both of them.
 #[async_trait]
 impl WebSessionStore for RedisSessionStore {
     async fn load(&self, sid: &str) -> Option<Session> {
@@ -252,7 +255,12 @@ impl WebSessionStore for RedisSessionStore {
         let mut conn = match self.conn().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("web_login redis load: connection failed: {e:#}");
+                tracing::error!(
+                    session.store = %"redis",
+                    session.op = %"load",
+                    error.message = log_safe(&format!("{e:#}")).as_str(),
+                    "web_login redis load: connection failed"
+                );
                 return None; // fail open
             }
         };
@@ -300,7 +308,12 @@ impl WebSessionStore for RedisSessionStore {
         let mut conn = match self.conn().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("web_login redis store: connection failed: {e:#}");
+                tracing::error!(
+                    session.store = %"redis",
+                    session.op = %"store",
+                    error.message = log_safe(&format!("{e:#}")).as_str(),
+                    "web_login redis store: connection failed"
+                );
                 return;
             }
         };
