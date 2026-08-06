@@ -77,12 +77,25 @@
 //!
 //! **It does not follow data flow, so a name sanctioned in VALUE position can
 //! still be rebound** — that is the residual, stated plainly rather than as a
-//! cost in list edits, because it costs none. Five of the eleven value-position
-//! names are ordinary binding names: `e`, `url`, `hosts`, `name`, `table`. Write
-//! `let e = format!("{sid}");` above one of these sites and the lint passes. What
-//! the position split bought is that the *field-name* components — `session`,
-//! `store`, `op`, `error`, `message` — are no longer usable that way, and
-//! `message` was the one an actual reviewer reached for first.
+//! cost in list edits, because it costs none. Write `let e = format!("{sid}");`
+//! above one of these sites and the lint passes.
+//!
+//! **Every name in [`ALLOWED_VALUE_IDENTS`] is rebindable, not some readable
+//! subset of them**, and an earlier revision of this paragraph said "five of the
+//! eleven … are ordinary binding names", listing `e`, `url`, `hosts`, `name`,
+//! `table` — a plausibility judgement about which names *look* like bindings,
+//! published in the shape of an enumeration. It is wrong, and the reason it is
+//! wrong is worth more than the corrected number: the shadowing `let` sits
+//! **outside every scanned invocation**, so the lint never sees it, and what the
+//! name is used for *at the site* has no bearing on whether it can be rebound
+//! *above* it. Measured — `let format = std::format!("sid={sid} err={e}");` with
+//! `error.message = format.as_str()` is green, and `format` was on the
+//! supposedly-safe half of that split as a helper name. `log_safe`, `as_str`,
+//! `to_string`, `is_empty` and `redact_url_userinfo` behave identically.
+//!
+//! What the position split bought is that the *field-name* components —
+//! `session`, `store`, `op`, `error`, `message` — are no longer usable that way,
+//! and `message` was the one an actual reviewer reached for first.
 //!
 //! Closing the rest needs data flow, i.e. a real Rust parser over these two
 //! modules, which is a different tool and its own ticket. It is also why the
@@ -346,6 +359,19 @@ struct Stripped {
 /// lint cannot detect its own blindness, so the blindness has to be asserted
 /// somewhere the main assertion is not.
 ///
+/// **This file's three `redis://***@…` lines — 434, 439 and 462 — do each
+/// contain a literal `/*`**, from the `/` of `://` meeting the first `*` of the
+/// redaction. HIK-246 asserted in a commit message that there was no `/*`
+/// anywhere in either store file; that was false, and it is corrected here
+/// because the sentence above is the one a future reader will reason from. The
+/// conclusion it was offered against is unchanged, for a reason worth stating
+/// rather than restating the claim: a non-string-aware stripper reaches the
+/// `//` branch *first* — it is tested before the `/*` refusal — and blanks to
+/// end of line, so the `/*` refusal never fires and those three sites do not
+/// make string-awareness load-bearing. The sibling-review citation therefore
+/// stays, and so does the measurement, which is what actually carries the
+/// argument.
+///
 /// It matters here more than it looks. The postgres `malformed payload` site
 /// cannot be reached offline, so **this lint is the only oracle covering it**. A
 /// scanner that can be blinded leaves that site with no coverage at all, while
@@ -362,14 +388,78 @@ struct Stripped {
 /// * **`/* … */` block comments.** Scanning for `*/` is the unbounded-swallow
 ///   shape above, and Rust nests them, so the naive version stops early and the
 ///   careful version is a parser. Neither module has one.
-/// * **A char literal holding a quote.** It would open a phantom string running
-///   to the next `"` anywhere in the file. Handling it properly means telling `'`
-///   apart from a lifetime (`'a`, `'static`), which is again a parser.
+/// * **A char literal holding a quote or a body delimiter** — `"`, or any of
+///   `(` `)` `{` `}` `[` `]`. Handling it properly means telling `'` apart from
+///   a lifetime (`'a`, `'static`), which is again a parser.
 ///
 /// Both are reported through [`Stripped::unsupported`] and fail the test with a
 /// message saying what to do. **Fail loud beats handle-approximately**: if
 /// either construct ever arrives in these files, someone is told, rather than
 /// the lint quietly covering less than it claims.
+///
+/// # Why the char-literal refusal covers brackets and not just the quote
+///
+/// The refusal is written here, in the stripper, but **it is the only thing
+/// standing between a char literal and [`invocations`]** — and the two are
+/// blinded by different characters, so a refusal scoped to the quote left the
+/// larger half open. The quote is *this* function's hazard: it opens a phantom
+/// string running to the next `"` anywhere in the file. The six brackets are the
+/// **body matcher's** hazard: `invocations` counts them to find where a body
+/// ends, and it is string-aware but not char-literal-aware, so one closer inside
+/// a char literal ends the body early and everything after it is never read.
+///
+/// Not a theoretical widening. Measured at the postgres `malformed payload`
+/// site — the one this lint is the *only* oracle for:
+///
+/// ```ignore
+/// session.table = %')',        // <- closes the body, for the scanner
+/// session.correlator = %sid,   // <- never scanned
+/// ```
+///
+/// The scanned body ended at `session.table = %'`, every name in it sanctioned,
+/// and the suite was 13/13 green with a complete session-id disclosure and
+/// `unsupported` empty. It compiles, and `rustfmt --emit stdout` leaves it
+/// byte-identical — the same standard [`invocations`]' delimiter argument
+/// applies to `error!{ … }`. The redis twin renders
+/// `session.table=) session.correlator=a7f3c1d9-…`.
+///
+/// The three *openers* are refused as well, though they over-run rather than
+/// truncate — the safe direction, because the offence stays inside the body —
+/// since an over-running body swallows unrelated source and then fails on names
+/// that are not the offence. One diagnosis beats two, and a symmetric rule
+/// spares the next reader working out which three are the dangerous ones.
+///
+/// This is exactly the failure this section's own standard names: a stripper's
+/// characteristic failure is going blind, and a real offence inside the
+/// swallowed span is then reported clean. The stripper honoured that; the body
+/// matcher did not, and the refusal is what now covers both.
+///
+/// # KNOWN RESIDUAL: a raw string literal is neither handled nor refused
+///
+/// The refusal above covers char literals. Rust has a **third** literal form
+/// this scanner does not recognise — `r"…"`, `r#"…"#`, `br"…"` — and in a raw
+/// string `\` is not an escape, so the `escaped` flag desynchronises. Measured,
+/// on this state machine:
+///
+/// ```ignore
+/// let a = r"C:\";
+/// let b = "redis://x"; tracing::error!(leak = %sid, "m");
+/// ```
+///
+/// The `\"` closing `r"C:\"` is read as an escaped quote, so the string never
+/// ends; the next real `"` closes it instead, leaving `redis://x` as *code*,
+/// whose `//` then blanks the rest of the line. The whole `error!` is replaced
+/// by spaces and the lint reports clean. **A silent blind, and `unsupported` is
+/// empty.**
+///
+/// Not fixed here, deliberately: it is a different construct from the one this
+/// round was scoped to, and the fix — a refusal on the `r"` / `r#` / `br"`
+/// prefixes, in the shape of the two above — deserves its own review rather
+/// than riding along. **Neither module contains a raw string literal today**
+/// (verified: no `r"` or `r#"` token in either file), so the gap is latent, not
+/// live. It is recorded here rather than only in a ticket because a scanner
+/// that documents two refusals and has three hazards is claiming a completeness
+/// it does not have — which is the failure this whole section is about.
 fn strip_comments(text: &str) -> Stripped {
     let mut out = String::with_capacity(text.len());
     let mut unsupported = Vec::new();
@@ -404,8 +494,8 @@ fn strip_comments(text: &str) -> Stripped {
             } else {
                 if c == '/' && chars.get(i + 1) == Some(&'*') {
                     unsupported.push((lineno, "/* … */ block comment"));
-                } else if c == '\'' && char_literal_hides_a_quote(&chars, i) {
-                    unsupported.push((lineno, "char literal holding a quote"));
+                } else if c == '\'' && char_literal_hides_a_delimiter(&chars, i) {
+                    unsupported.push((lineno, "char literal holding a quote or a delimiter"));
                 } else if c == '"' {
                     in_string = true;
                     escaped = false;
@@ -421,32 +511,48 @@ fn strip_comments(text: &str) -> Stripped {
     }
 }
 
-/// Does the `'` at `at` open a char literal that contains a `"`?
+/// Every character that steers one of the scanners, and so must never reach one
+/// wrapped in a char literal: the `"` that opens a string for all four of them,
+/// and the six brackets [`invocations`] counts to find the end of a body.
+///
+/// `'` itself is deliberately absent — `'\''` steers nothing, and refusing it
+/// would fail loudly on ordinary source.
+const SCANNER_DELIMITERS: &[char] = &['"', '(', ')', '{', '}', '[', ']'];
+
+/// Does the `'` at `at` open a char literal holding one of
+/// [`SCANNER_DELIMITERS`]?
 ///
 /// **Matching the three literal characters `'`, `"`, `'` is not enough, and that
 /// was a demonstrated gap**: `'\"'` is the same character escaped, it compiles,
 /// and it opened the very phantom string the refusal exists to prevent while
 /// leaving the lint 9/9 green with nothing in `unsupported`. So the rule is
-/// "a char literal whose body contains a quote", which covers both spellings,
-/// the byte forms `b'"'` / `b'\"'` (the `b` sits before the `'` and is ignored),
-/// and — because a `\u{…}` escape is refused wholesale rather than decoded —
-/// `'\u{22}'` as well. Refusing every `\u{…}` char literal is the deliberate
-/// over-approximation: decoding one is a parser, and neither module has one.
+/// "a char literal whose body contains one of those characters", which covers
+/// both spellings, the byte forms `b'"'` / `b'\"'` (the `b` sits before the `'`
+/// and is ignored), and — because a `\u{…}` escape is refused wholesale rather
+/// than decoded — `'\u{22}'` as well. Refusing every `\u{…}` char literal is the
+/// deliberate over-approximation: decoding one is a parser, and neither module
+/// has one.
 ///
-/// **Do not overstate it: this was a demonstrated gap in the refusal, not a
-/// demonstrated silent blind.** Nobody got a leak through it. The phantom string
-/// it opens makes the *stripper* stop reading comments, but `invocations` starts
-/// each body scan with fresh string state, so the bodies are still read — and an
-/// attempt to weaponise it ran the body away over the rest of the file and
-/// failed loudly on unrelated names. It is fixed because a refusal that a one-
-/// character escape walks past is not a refusal, not because a leak hid behind
-/// it.
+/// **The quote and the six brackets are the same refusal but not the same
+/// hazard**, and the bracket half was the one that mattered: see
+/// [`strip_comments`]' second section for the `session.table = %')'` measurement
+/// that closed a scanned body two lines before a `%sid`.
+///
+/// **Do not overstate the quote half: that was a demonstrated gap in the
+/// refusal, not a demonstrated silent blind.** Nobody got a leak through it. The
+/// phantom string it opens makes the *stripper* stop reading comments, but
+/// `invocations` starts each body scan with fresh string state, so the bodies are
+/// still read — and an attempt to weaponise it ran the body away over the rest of
+/// the file and failed loudly on unrelated names. It was fixed because a refusal
+/// that a one-character escape walks past is not a refusal, not because a leak
+/// hid behind it. The bracket half is the opposite: a silent blind, weaponised,
+/// green.
 ///
 /// The lookahead is **bounded** (the longest char literal is `'\u{10FFFF}'`, and
 /// a newline ends the search), so this cannot itself become the unbounded scan
 /// it is guarding against. A lifetime — `'a`, `'static` — has no closing `'`
-/// within the bound, or encloses no quote if a later lifetime supplies one.
-fn char_literal_hides_a_quote(chars: &[char], at: usize) -> bool {
+/// within the bound, or encloses no delimiter if a later lifetime supplies one.
+fn char_literal_hides_a_delimiter(chars: &[char], at: usize) -> bool {
     let end = (at + 13).min(chars.len());
     for j in (at + 1)..end {
         if chars[j] == '\n' {
@@ -454,10 +560,45 @@ fn char_literal_hides_a_quote(chars: &[char], at: usize) -> bool {
         }
         if chars[j] == '\'' && chars[j - 1] != '\\' {
             let body: String = chars[at + 1..j].iter().collect();
-            return body.contains('"') || body.contains("\\u{");
+            if !is_char_literal_body(&body) {
+                // Two lifetimes, not a literal. Widening from the quote to the
+                // brackets made this reachable and the negative rows in
+                // `a_char_literal_holding_a_quote_is_reported_in_every_spelling`
+                // caught it: in `fn f<'a, 'b>(x: &'a str, …)` the `'b` closes on
+                // the `'a` seven characters later, and the span between them
+                // holds a `(`. Refusing that fails loudly on ordinary generic
+                // source, which is how a lint people cannot keep green gets
+                // deleted. A `"` between two lifetimes is a real string quote
+                // and the stripper already tracks it, so nothing is lost.
+                return false;
+            }
+            // The source characters are the whole question: these scanners read
+            // text, so a delimiter only steers one if it is *written*. That is
+            // why no escape needs decoding, and why B5's separate `\u{…}`
+            // refusal is now subsumed rather than dropped — `\u{` cannot be
+            // spelled without a brace, which is itself a delimiter. By the same
+            // token `'\x29'` needs no clause: it is a legal spelling of `')'`
+            // but contains no bracket, so it steers nothing.
+            return body.contains(SCANNER_DELIMITERS);
         }
     }
     false
+}
+
+/// Is `body` — what sits between the two `'` — a char-literal body at all,
+/// rather than the gap between two lifetimes?
+///
+/// One character, or an escape. Deliberately does not validate *which* escape —
+/// an invalid one does not compile, so these files cannot contain it, and the
+/// caller rules on the escape's written characters rather than on what it
+/// denotes.
+fn is_char_literal_body(body: &str) -> bool {
+    let mut cs = body.chars();
+    match cs.next() {
+        Some('\\') => true,
+        Some(_) => cs.next().is_none(),
+        None => false,
+    }
 }
 
 fn is_word(c: char) -> bool {
@@ -496,6 +637,16 @@ fn skip_ws(chars: &[char], mut i: usize) -> usize {
 /// Strings are skipped while matching the delimiter, so a `(` inside a message
 /// cannot end the scan early, and nesting is counted, so a `format!(…)` argument
 /// stays inside the body rather than truncating it.
+///
+/// **It is string-aware but NOT char-literal-aware, and that is delegated, not
+/// overlooked.** A closer inside a char literal — `session.table = %')'` — would
+/// end the body two lines before a `%sid`, which is a silent blind of exactly
+/// the kind [`strip_comments`] refuses to have. The guard is `strip_comments`'
+/// char-literal refusal, which runs first and covers all four scanners rather
+/// than each of them re-deriving it; see its second section for the
+/// measurement. Do not make this loop char-literal-aware and drop that refusal —
+/// [`arg_ranges`], [`field_value_split`] and [`raw_identifiers`] count the same
+/// brackets and would each still be blind.
 fn invocations(text: &str) -> Vec<(usize, String, String)> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
@@ -1055,22 +1206,95 @@ mod scanner {
         ] {
             assert_eq!(
                 strip_comments(src).unsupported,
-                vec![(1, "char literal holding a quote")],
+                vec![(1, "char literal holding a quote or a delimiter")],
                 "not reported: {src:?}"
             );
         }
         // Ordinary char literals and lifetimes are not refused, or every file
-        // with a `&'static str` in it would fail loudly for no reason.
+        // with a `&'static str` in it would fail loudly for no reason. The last
+        // three are the only char literals on today's tree —
+        // `web_login_redis.rs:82,88` and `web_login_postgres.rs:170` — so a
+        // widening that caught them would be red on the real files, not here.
         for src in [
             "let c = 'a';\n",
             "let c = '\\'';\n",
             "let c = '\\\\';\n",
             "let c = '\\n';\n",
             "fn f<'a, 'b>(x: &'a str, y: &'b str) -> &'static str { \"z\" }\n",
+            "let c = '/';\n",
+            "let c = '@';\n",
+            "let c = b'_';\n",
         ] {
             assert!(
                 strip_comments(src).unsupported.is_empty(),
                 "falsely refused: {src:?}"
+            );
+        }
+    }
+
+    /// **B6.** The half B5 left open. B5 refused a char literal holding a
+    /// **quote**, which is the hazard for `strip_comments`. A char literal
+    /// holding one of the six **bracket** characters is the hazard for
+    /// [`invocations`], which counts them to find the end of a body — and that
+    /// half was neither refused nor handled.
+    ///
+    /// At the postgres `malformed payload` site, `session.table = %')'` ended
+    /// the scanned body at `session.table = %'`, so a `session.correlator = %sid`
+    /// two lines later was never read. Measured: 13/13 green, `unsupported`
+    /// empty, and the same shape at the reachable redis site renders
+    /// `session.table=) session.correlator=a7f3c1d9-4e62-4b8a-9d15-c0ffee5ed17e`
+    /// — the whole seeded sid.
+    ///
+    /// **Which row evades depends on the invocation's own delimiter, and the
+    /// table below is about the scanned BODY, not about the verdict.** Only a
+    /// char literal holding the *matching* closer truncates: at the real,
+    /// paren-delimited postgres site `')'` is green and `'}'` / `']'` are red,
+    /// because a brace does not close a paren. `'}'` is a live evasion against
+    /// the brace spelling `tracing::error! { … }`, which B2 established compiles
+    /// and survives `rustfmt` — measured green at cfc0b33 in exactly that
+    /// combination, and refused now. And `b')'` truncates identically but is
+    /// caught incidentally, on the stray `b` the byte prefix leaves in Value
+    /// position — red for a reason that names neither `correlator` nor `sid`,
+    /// which is a diagnosis nobody should be asked to rely on. Refusing all
+    /// seven removes the need to reason about any of this.
+    ///
+    /// Each row asserts twice, and the second assertion is the one that
+    /// outlives this implementation. The first pins the mechanism actually
+    /// chosen — a loud refusal. The second states the *property*: whatever the
+    /// scanner does with such a source, the offending name must not fall
+    /// outside the body it reads. A future scanner that lexes char literals
+    /// properly instead of refusing them satisfies the second and is free to
+    /// drop the first.
+    #[test]
+    fn a_char_literal_holding_a_delimiter_cannot_truncate_a_scanned_body() {
+        for src in [
+            // The three closers, one per body delimiter, each truncating.
+            r#"error!(a = %')', leak = %sid, "m");"#,
+            "error!{ a = %'}', leak = %sid, \"m\" }",
+            r#"error![ a = %']', leak = %sid, "m" ];"#,
+            // The byte spelling: the `b` sits before the `'` and is ignored.
+            r#"error!(a = %b')', leak = %sid, "m");"#,
+            // The three openers. These over-run rather than truncate, which is
+            // the safe direction — but the body then swallows unrelated source
+            // and fails on names that are not the offence, so they are refused
+            // for the same reason and diagnosed by the same message.
+            r#"error!(a = %'(', leak = %sid, "m");"#,
+            r#"error!(a = %'{', leak = %sid, "m");"#,
+            r#"error!(a = %'[', leak = %sid, "m");"#,
+        ] {
+            let stripped = strip_comments(src);
+            assert_eq!(
+                stripped.unsupported,
+                vec![(1, "char literal holding a quote or a delimiter")],
+                "not refused: {src:?}"
+            );
+            assert!(
+                !stripped.unsupported.is_empty()
+                    || invocations(&stripped.text)
+                        .iter()
+                        .any(|(_, _, body)| body.contains("leak")),
+                "scanned past a char literal in silence, and the leak fell outside \
+                 the body: {src:?}"
             );
         }
     }
