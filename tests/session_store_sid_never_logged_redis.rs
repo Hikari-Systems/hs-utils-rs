@@ -36,6 +36,9 @@ use tracing_subscriber::prelude::*;
 /// the substring sweep means something.
 const SID: &str = "a7f3c1d9-4e62-4b8a-9d15-c0ffee5ed17e";
 
+/// Sweep width; see the postgres sibling for why it is 6 and not 8.
+const WINDOW: usize = 6;
+
 /// The two `CLIENT SETINFO` replies redis-rs reads before handing the caller a
 /// connection.
 const HANDSHAKE_REPLY: &[u8] = b"+OK\r\n+OK\r\n";
@@ -77,9 +80,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
     }
 }
 
-/// Fail if any 8-character window of the sentinel sid — hyphenated or not,
-/// case-insensitively — appears in the rendered log. Eight characters because a
-/// partial disclosure is a disclosure; see the postgres sibling.
+/// Fail if any [`WINDOW`]-character window of the sentinel sid — hyphenated or
+/// not, case-insensitively — appears in the rendered log. A short window because
+/// a partial disclosure is a disclosure; see the postgres sibling.
 fn assert_no_sid_fragment(rendered: &str) {
     let haystack = rendered.to_ascii_lowercase();
     let forms = [
@@ -88,7 +91,7 @@ fn assert_no_sid_fragment(rendered: &str) {
     ];
     for form in &forms {
         let chars: Vec<char> = form.chars().collect();
-        for window in chars.windows(8) {
+        for window in chars.windows(WINDOW) {
             let needle: String = window.iter().collect();
             if haystack.contains(&needle) {
                 let line = rendered
@@ -96,7 +99,7 @@ fn assert_no_sid_fragment(rendered: &str) {
                     .find(|l| l.to_ascii_lowercase().contains(&needle))
                     .unwrap_or("<no single line matched — the leak spans lines>");
                 panic!(
-                    "the session id leaked into the log stream: the 8-character window \
+                    "the session id leaked into the log stream: the {WINDOW}-character window \
                      {needle:?} of the sentinel sid is present.\n\
                      offending line: {line}\n\
                      ----- full captured output -----\n{rendered}\

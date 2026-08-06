@@ -42,6 +42,21 @@ use tracing_subscriber::prelude::*;
 /// to matter is the whole string.
 const SID: &str = "a7f3c1d9-4e62-4b8a-9d15-c0ffee5ed17e";
 
+/// Sweep width, in characters.
+///
+/// **Six, not eight (HIK-246).** The 8 it replaces was itself defeatable: a
+/// 7-character correlator passed the sweep *and* the old source lint, which is
+/// one of the four evasions that ticket measured. Six narrows that gap — but do
+/// not let the number carry the argument. Any window can be undercut by one, and
+/// the mechanism that actually stops a correlator is the identifier allow-list
+/// in `session_store_sid_source_lint.rs`; this is a backstop that catches the
+/// same thing in the **rendered output**, which no source scanner can see.
+///
+/// Not lower than 6: at 4 the hex alphabet starts colliding with unrelated text
+/// in the captured stream, and a sweep that fails for a coincidence is a sweep
+/// somebody deletes.
+const WINDOW: usize = 6;
+
 /// `Arc<Mutex<Vec<u8>>>` is not itself a `MakeWriter` (tracing-subscriber's
 /// `Arc<W>` impl wants `&W: Write`, which `Mutex<Vec<u8>>` is not), so the
 /// shared buffer needs this one-line newtype to be usable as one.
@@ -71,11 +86,11 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
     }
 }
 
-/// Fail if any 8-character window of the sentinel sid — hyphenated or not,
-/// case-insensitively — appears anywhere in the rendered log.
+/// Fail if any [`WINDOW`]-character window of the sentinel sid — hyphenated or
+/// not, case-insensitively — appears anywhere in the rendered log.
 ///
-/// **Eight characters, not the whole value, because a partial disclosure is a
-/// disclosure.** This is what makes "log the first 8 chars as a correlator"
+/// **A window, not the whole value, because a partial disclosure is a
+/// disclosure.** This is what makes "log the first few chars as a correlator"
 /// *fail* rather than quietly pass. It cannot detect a hash, and does not claim
 /// to: a digest shares no substring with its input.
 fn assert_no_sid_fragment(rendered: &str) {
@@ -86,7 +101,7 @@ fn assert_no_sid_fragment(rendered: &str) {
     ];
     for form in &forms {
         let chars: Vec<char> = form.chars().collect();
-        for window in chars.windows(8) {
+        for window in chars.windows(WINDOW) {
             let needle: String = window.iter().collect();
             if haystack.contains(&needle) {
                 let line = rendered
@@ -94,7 +109,7 @@ fn assert_no_sid_fragment(rendered: &str) {
                     .find(|l| l.to_ascii_lowercase().contains(&needle))
                     .unwrap_or("<no single line matched — the leak spans lines>");
                 panic!(
-                    "the session id leaked into the log stream: the 8-character window \
+                    "the session id leaked into the log stream: the {WINDOW}-character window \
                      {needle:?} of the sentinel sid is present.\n\
                      offending line: {line}\n\
                      ----- full captured output -----\n{rendered}\
