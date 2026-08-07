@@ -102,6 +102,33 @@
 //! behavioural arms are not deleted: a source scanner can show the source looks
 //! right, never that the **rendered output** is clean.
 //!
+//! **Second residual, independent of the first and broader than it: the scan is
+//! BY NAME, so a log statement reached through a macro or a helper that is not
+//! on [`INVOCATIONS`] is not scanned at all.** A site spelled `my_log!(sid)` or
+//! `report(sid)` matches no needle, so its body is never read and whatever the
+//! callee does with the value is invisible — and only these two files are
+//! `include_str!`d, so the callee's own `tracing::error!` is out of scope even
+//! when it is in this crate. Unlike the rebinding residual, this one is not
+//! closable by a lexical rule at all: the name of the offending helper is not
+//! knowable in advance, which is the whole difference between it and the
+//! constructs [`strip_comments`] refuses.
+//!
+//! Not hypothetical in shape. `log_safe` is exactly such a helper — declared in
+//! `src/web_login.rs`, imported by both stores, named at ten sites. It formats
+//! and truncates and logs nothing, which is why it is sanctioned in
+//! [`ALLOWED_VALUE_IDENTS`]; but that is a fact about `web_login.rs`, which this
+//! lint does not read, and it would not notice the day it stopped being true.
+//!
+//! **What bounds it today is a grep, not an assertion.** Neither store defines
+//! or pulls in a macro of its own — no `macro_rules!`, no `include!`, no
+//! `#[macro_use]` — and the only macros either file invokes beyond the scanned
+//! set are `format!`, `vec!` and, inside `#[cfg(test)]` modules, `assert!` /
+//! `assert_eq!`. None of those reaches a log: `format!` builds a `String` that
+//! some *scanned* invocation then has to name, and the `assert*!` ones publish
+//! only a panic message, only from a test binary. Nothing re-runs that grep —
+//! the same standing weakness the raw-string residual was closed to remove,
+//! kept here because there is no lexical rule to replace it with.
+//!
 //! Deliberately scoped to the two web-login stores. It is **not** extended to
 //! `src/mcp_resource_server/db_session_store.rs`, which has the same shape but a
 //! different trust claim and its own ticket: a test that is red for another
@@ -388,7 +415,14 @@ struct Stripped {
 ///
 /// * **`/* … */` block comments.** Scanning for `*/` is the unbounded-swallow
 ///   shape above, and Rust nests them, so the naive version stops early and the
-///   careful version is a parser. Neither module has one.
+///   careful version is a parser. Neither module has one. **A nested one reports
+///   twice**: the refusal fires per `/*`, not per comment, and the scan does not
+///   skip the body it refuses, so `/* outer /* inner */ still outer */` pushes
+///   two entries against the same line. That is harmless for the main lint,
+///   which only asserts [`Stripped::unsupported`] is *empty* — but B6 and B7
+///   assert **exact** vectors, so a future nested-comment row has to expect two.
+///   Measured rather than reasoned:
+///   `[(319, "/* … */ block comment"), (319, "/* … */ block comment")]`.
 /// * **A char literal holding a quote or a body delimiter** — `"`, or any of
 ///   `(` `)` `{` `}` `[` `]`. Handling it properly means telling `'` apart from
 ///   a lifetime (`'a`, `'static`), which is again a parser.
@@ -476,6 +510,50 @@ struct Stripped {
 /// `remove` — the one method this repo's `CLAUDE.md` standingly tells a bumper
 /// to check — each compiling clean with the lint 14/14 green.
 ///
+/// **The precondition, which the two examples encode but the prose around them
+/// did not state.** "A raw string blinds the lint" is broader than what was
+/// demonstrated, and the gap matters because the next reader will reason from
+/// it. Desynchronising on its own hides **nothing**: [`strip_comments`] only
+/// ever replaces text on its `//` branch, so while the machine is out of step it
+/// is still copying the source through verbatim, and [`invocations`] starts
+/// every body scan with fresh string state. What hides the leak is the
+/// **re-synchronisation** — a later real `"` closes the runaway string, the text
+/// after it is read as code, and if that text carries a `//` *on the same line
+/// as, and before, a scanned invocation*, that invocation is blanked. Which is
+/// why both examples above put a `//`-bearing string literal on the `error!`
+/// line, and why the line-oriented `//` branch is what turns a desync into a
+/// blind.
+///
+/// Measured at `16bd876`, same site, same raw string, the two shapes differing
+/// only in whether `let _u = "redis://h";` shares the line:
+///
+/// ```ignore
+/// let _pat = r"weblogin:sess:\";          // raw string on its own line
+/// …
+/// tracing::error!(                        // and `error!` on its own lines
+///     session.store = %"redis", session.correlator = %sid, …
+/// );
+/// ```
+///
+/// → **13 passed, 1 FAILED**, naming `correlator` and `sid`. The simpler
+/// injection is **caught**.
+///
+/// ```ignore
+/// let _pat = r"weblogin:sess:\";
+/// …
+/// let _u = "redis://h"; tracing::error!(… session.correlator = %sid, …);
+/// ```
+///
+/// → **14 passed, 0 failed**, the same leak reported clean.
+///
+/// So the honest claim is narrower than "a raw string blinds the lint": a raw
+/// string **plus a same-line re-synchronising comment** blinds it. The refusal
+/// is still the right call, and for a reason the narrowing sharpens rather than
+/// weakens — the raw string is the half an author adds without noticing, while
+/// `web_login_redis.rs` already supplies the other half twenty times over in its
+/// own `redis://…` literals, so in *this* file the second condition is close to
+/// free.
+///
 /// **Why it is refused rather than left latent.** "Neither module contains a
 /// raw string today" was true, and it was a hand grep written into a doc
 /// comment — the thing this repo's own standard says is not a regression test.
@@ -489,6 +567,20 @@ struct Stripped {
 /// Everything else is a token tree and cannot be unbalanced. So this section
 /// can stop saying "approximately" and say what it covers, which is the
 /// completeness claim the rest of it is built on.
+///
+/// **Macro expansion does not qualify that claim, and an earlier account of it
+/// said otherwise.** HIK-246's commit message left a residual reading "the rule
+/// is lexical and cannot see a raw string produced by a macro expansion". That
+/// is not a hazard of this stripper at all: expansion happens in the compiler,
+/// after lexing, and cannot put text into the file being scanned. What the
+/// scanner reads is the bytes on disk, so the enumeration above is over the
+/// bytes on disk and is complete over them. The real residual in that
+/// neighbourhood is a different one — the scan is by *name*, so an invocation
+/// reached through a macro or helper not on [`INVOCATIONS`] is unscanned — and
+/// it belongs to the module header's "What it cannot do", where it now is. It is
+/// recorded as a correction rather than dropped because a residual described
+/// wrongly is worse than one described narrowly: it sends an auditor looking for
+/// a lexical hole that does not exist, past a name-resolution one that does.
 ///
 /// It costs nothing on plausible source. [`raw_string_starts_at`] requires the
 /// full `r` `#`* `"` prefix, so a raw *identifier* (`r#type`) is not touched —
@@ -631,10 +723,21 @@ const SCANNER_DELIMITERS: &[char] = &['"', '(', ')', '{', '}', '[', ']'];
 /// hid behind it. The bracket half is the opposite: a silent blind, weaponised,
 /// green.
 ///
-/// The lookahead is **bounded** (the longest char literal is `'\u{10FFFF}'`, and
-/// a newline ends the search), so this cannot itself become the unbounded scan
-/// it is guarding against. A lifetime — `'a`, `'static` — has no closing `'`
-/// within the bound, or encloses no delimiter if a later lifetime supplies one.
+/// The lookahead cannot itself become the unbounded scan it is guarding
+/// against — but **what bounds it is the caller, not either guard inside it**,
+/// and the prose here used to imply the reverse. [`strip_comments`] splits the
+/// file on `\n` and hands this function a single line, so the scan is bounded by
+/// the line whatever this function does. The `at + 13` ceiling (the longest char
+/// literal is `'\u{10FFFF}'`) and the `'\n'` arm are belt-and-braces against a
+/// future caller passing a longer slice; neither carries the boundedness
+/// argument today and neither is pinned. Measured, both mutants survive the
+/// whole suite at 15/15 — `end = chars.len()`, and the `'\n'` arm deleted. Read
+/// them as defence in depth, not as guards anything rests on; the line split is
+/// the guard.
+///
+/// A lifetime — `'a`, `'static` — either finds no closing `'` on the line at
+/// all, or lands on a span [`is_char_literal_body`] rejects as the gap between
+/// two lifetimes rather than a literal body; see the comment at that branch.
 ///
 /// **Finding the closing quote needs the escape state, not the previous
 /// character.** `chars[j - 1] != '\\'` was the first spelling and it reads the
