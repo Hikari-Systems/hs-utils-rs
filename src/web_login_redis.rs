@@ -83,15 +83,23 @@ pub struct RedisSentinelConfig {
 /// verbatim, password and all. And the gap was selected by the very character
 /// causing the failure: an unencoded `/` in a password is what makes the URL
 /// unparseable, hence what produces the error this function is redacting for.
-/// Measured over the sweep below, 2,842 of its 4,410 spellings leaked. **Both
-/// figures are still literals — here and in the test — but neither can go
-/// quietly stale:** `the_sweep_measures_what_the_doc_comment_claims` re-runs the
-/// pre-fix body over the same lists and asserts both, so adding a spelling turns
-/// that test red and its message says to come and update this sentence. That is
-/// weaker than deriving the numbers and stronger than writing them down once;
-/// the failure mode it removes is the silent one. This sentence carried `2,940`
-/// and `2,044` for one revision, which were the numbers before `http://` and
-/// `1bad://` joined `SCHEMES` in the very commit that quoted them.
+/// Most of the sweep below leaked under it, and **the two figures — how many
+/// spellings there are and how many of them leaked — are deliberately not
+/// written here.** They live in the `SWEEP_CASES` and `PRE_FIX_LEAKS` constants
+/// and nowhere else; `the_sweep_owns_both_figures_and_can_detect_the_defect`
+/// re-runs the pre-fix body over the same lists, asserts them, and prints the
+/// derived value beside the expected one if either moves. Run it if you want the
+/// numbers.
+///
+/// **That is a change of shape rather than of digits, and it was earned.** The
+/// pair used to be quoted in this sentence, and it went stale three times, each
+/// time in the very commit that moved the lists it is derived from: `(2,940,
+/// 2,044)` when `http://` and `1bad://` joined the sweep's `SCHEMES`, and again
+/// when `unix://` did — that third occurrence landing in a sentence which had
+/// just finished warning about the first two. Writing the warning demonstrably
+/// does not prevent the recurrence. A number that has to be hand-carried to a
+/// second place has now failed at it often enough that the repair is to stop
+/// carrying it, not to word the warning better.
 ///
 /// The two obvious repairs are both refused. A second hand-written index rule
 /// ("the last `@` before the first `/` that follows it") is one more guess at a
@@ -202,19 +210,36 @@ fn redact_url_userinfo(url: &str) -> String {
     // one revision, and deleting `"unix"` from the list here then survived the
     // whole suite.
     const SCHEMES: [&str; 4] = ["redis", "rediss", "redis+unix", "unix"];
-    // `filter(|&i| i < at)` is a **panic guard**, not a verdict, and no test can
-    // reach it today — do not delete it as dead. Both of the obvious mutations
-    // of this line (dropping the filter, and `find` → `rfind`) survive the suite
-    // and are *equivalent* rather than uncovered: for `and_then` to yield
-    // `Some`, `url[..i]` must equal one of the four words above, which contains
-    // no `://` and no `@`, so `i` is the only `://` position that can match and
-    // `at` is necessarily past it. Every other spelling reaches the `None` arm
-    // and fails closed either way, so the output is identical.
+    // `filter(|&i| i < at)` is **inert**, and it is not — and cannot become — a
+    // panic guard. An earlier note here said it was, on the grounds that a short
+    // or empty entry in `SCHEMES` would make `url[after_scheme..at]` below a
+    // reversed slice; that is false, and so is its own worked example. `a@b://c`
+    // with `""` in the list gives `at = 1` and `i = 3`, but `url[..i]` is `"a@b"`
+    // — not `""` — so `contains` is false and the arm is `None`.
     //
-    // What the filter defends is the future: add a short or empty entry to
-    // `SCHEMES` and that argument collapses — with `""` in the list,
-    // `a@b://c` gives `at = 1` and `i = 3`, and `url[6..1]` below is a reversed
-    // slice, i.e. a panic on the error path of a startup failure.
+    // The real guarantee is the scheme match, and it holds for **any** scheme
+    // list whose entries carry no `@` (no redis scheme can): if `url[..i]` equals
+    // such an entry then `url[i..i + 3]` is `://`, so no `@` sits at any index
+    // below `i + 3`, so the `at` already found is `>= after_scheme`
+    // unconditionally. Brute-forced rather than argued — every string of length
+    // ≤ 7 over `{a, b, @, :, /}`, 97,656 per list, against the four schemes above
+    // plus `+ ""`, `["a"]`, `[""]` and `["a", "b", ""]`, with the filter removed:
+    // **0 reversed slices in every list**. The same proof covers the third
+    // mutation of this line, `i < at` → `i <= at`; both it and dropping the filter
+    // outright differ on nothing (measured, 0 of 6,930 adversarial spellings).
+    // The line is left alone because removing it is provably a no-op either way
+    // and this round is prose — nothing rests on it.
+    //
+    // `find` → `rfind` is **not** in that class, and calling it equivalent was
+    // wrong. `rfind` returns a later `i`; `url[..i]` then fails the scheme match
+    // and the mutant falls to the `None` arm, so any tail carrying a `://` of its
+    // own separates them — `redis://u:pw@h://z` is `redis://***@h://z` here and
+    // `***` under the mutant, as are `…@h0st:6379/0?next=redis://other` and
+    // `…@h0st:6379/0#see://docs` (measured, 640 of those 6,930 spellings differ).
+    // Its accepted set is a strict subset of this one's, so the direction is
+    // fail-closed and no differing case leaks: actionability, never a secret.
+    // Recorded anyway, because a claim of equivalence is exactly what gets the
+    // next reader to write off a real difference.
     let scheme = url.find("://").filter(|&i| i < at).and_then(|i| {
         let candidate = url[..i].to_ascii_lowercase();
         SCHEMES
@@ -828,17 +853,31 @@ mod redaction_tests {
     /// actionability rather than a secret, but it is the same shape as the rest
     /// of this round.
     ///
-    /// **Residual, and it is the honest reading of this row.** Because the
-    /// fragment is excluded, `…#x&pass=SECRET` *is* returned whole. That is
-    /// deliberate — the rule mirrors the parser, and redis reads nothing after a
-    /// `#`, so it is not a credential redis uses — but it is a weaker posture
-    /// than the query gets, where a `?pass=` on a tcp scheme fails closed even
-    /// though redis ignores it too. The difference is that the query is a place
-    /// credentials legitimately live for two of the four schemes and a fragment
-    /// is a place they live for none, so a `pass=` there cannot be a
-    /// misconfiguration of a working URL. Left as-is rather than widened,
-    /// because widening it is a behaviour change and this commit is about giving
-    /// the stated rules oracles.
+    /// **Residual — and the justification this row first carried does not hold.**
+    /// Because the fragment is excluded, `…#x&pass=SECRET` *is* returned whole:
+    /// measured on the shipped function, `unix:///s.sock?db=3#x&pass=…`,
+    /// `redis://h0st:6379/0?db=3#x&pass=…` and `unix:///s.sock#pass=…` all come
+    /// back verbatim with the value published, and the crate reads a credential
+    /// out of none of them.
+    ///
+    /// The reason given was that the query "is a place credentials legitimately
+    /// live for two of the four schemes and a fragment is a place they live for
+    /// none". That does not separate the cases it is offered to separate. On a
+    /// **tcp** scheme the query is a place credentials live for none either, and
+    /// `redis://h0st:6379/0?pass=…` still fails closed — on the explicit ground
+    /// stated at [`redact_url_userinfo`], that an operator who wrote it has put a
+    /// live password into a string about to be logged and redis ignoring it there
+    /// does not unpublish it. That ground applies verbatim to the fragment, so
+    /// `redis://h0st:6379/0?db=3#x&pass=…` and `redis://h0st:6379/0?pass=…` — one
+    /// published whole, one collapsed to `***` — are told apart by this function
+    /// for a reason the distinction cannot supply.
+    ///
+    /// The honest statement is narrower: **the rule mirrors the parser, and the
+    /// tcp-query over-refusal is the one deliberate exception to that.**
+    /// Extending the same exception to the fragment is a behaviour change, so it
+    /// is filed as **HIK-265** rather than folded into a commit about giving the
+    /// stated rules oracles. Until it lands, the last row below pins the current
+    /// verdict — so the widening will turn this test red, which is the intent.
     #[test]
     fn ordinary_query_parameters_do_not_fail_closed() {
         for url in [
@@ -885,6 +924,16 @@ mod redaction_tests {
         // the decoder silently broken.
         assert_eq!(percent_decode_name("%7Aebra"), "zebra");
         assert_eq!(percent_decode_name("%7aebra"), "zebra");
+        // The other half of the same rule: **only** `%` starts an escape. Drop
+        // the `bytes[i] == b'%'` sentinel and every byte followed by two
+        // hex-digit characters is eaten as one, which is a real change the whole
+        // suite otherwise survives — no credential verdict can reach it either,
+        // because mangling needs two *adjacent* hex digits and neither `pass`
+        // (`a` alone) nor `user` (`e` alone) has a pair, in any case. Benign,
+        // then, but it is a documented decoder rule with no oracle, which is the
+        // shape this round exists to remove — so it costs one row rather than a
+        // footnote saying it does not matter.
+        assert_eq!(percent_decode_name("pa5ss"), "pa5ss");
     }
 
     // ─── The query-credential differential ─────────────────────────────────
@@ -1422,7 +1471,7 @@ mod redaction_tests {
 
     /// Which spellings leak, under whichever redactor is handed in. Taking the
     /// function as an argument is what lets the pre-fix body be measured over
-    /// the same lists — see `the_sweep_measures_what_the_doc_comment_claims`.
+    /// the same lists — see `the_sweep_owns_both_figures_and_can_detect_the_defect`.
     fn leaking_spellings(redactor: fn(&str) -> String) -> Vec<String> {
         let mut leaks = Vec::new();
         for (url, userinfo, _, _) in &sweep_cases() {
@@ -1497,6 +1546,12 @@ mod redaction_tests {
         )
     }
 
+    /// How many spellings the sweep builds, and how many of them the pre-fix
+    /// body leaked. **The only place either number exists.** Nothing else — prose
+    /// included — may restate them; the test below says why.
+    const SWEEP_CASES: usize = 4_410;
+    const PRE_FIX_LEAKS: usize = 2_842;
+
     /// **Two things at once, and the second is why it is written this way.**
     ///
     /// It shows the sweep can *detect* the defect it was built for: every
@@ -1504,24 +1559,29 @@ mod redaction_tests {
     /// could ever leak would also satisfy. Running the pre-fix body over the same
     /// lists is the control that gives those greens their meaning.
     ///
-    /// And it holds the two figures quoted in `redact_url_userinfo`'s doc comment
-    /// — 3,920 spellings, 2,576 of them leaking. They are **derived here rather
-    /// than transcribed there**, because the pair that sentence carried before was
-    /// `(2,940, 2,044)`: correct for the lists as they stood, and stale from the
-    /// moment `http://` and `1bad://` were added to `SCHEMES` in the same commit
-    /// that quoted it. Add a spelling and this goes red, which is the point — a
-    /// prose numeral over a growing set goes quietly false instead.
+    /// And it **owns** the two figures, as the two constants above.
+    /// `redact_url_userinfo`'s doc comment used to restate them, and that copy
+    /// went stale three times — each time in the same commit that moved the lists
+    /// the numbers are derived from, and the third time in a sentence which had
+    /// just finished narrating the first two. Warning harder was tried and did
+    /// not work, so the second copy is gone rather than corrected a fourth time.
+    /// If either number moves, the messages below print the derived value beside
+    /// the expected one: updating the constant is then the whole repair, and
+    /// there is no prose left to chase.
     #[test]
-    fn the_sweep_measures_what_the_doc_comment_claims() {
+    fn the_sweep_owns_both_figures_and_can_detect_the_defect() {
+        let cases = sweep_cases().len();
+        let leaks = leaking_spellings(pre_hik243_redact).len();
         assert_eq!(
-            sweep_cases().len(),
-            4_410,
-            "the sweep changed size; update `redact_url_userinfo`'s doc comment to match"
+            cases, SWEEP_CASES,
+            "the sweep now builds {cases} spellings, not {SWEEP_CASES}; set \
+             `SWEEP_CASES` to {cases} — it is the only place that number lives"
         );
         assert_eq!(
-            leaking_spellings(pre_hik243_redact).len(),
-            2_842,
-            "the pre-fix leak count changed; update `redact_url_userinfo`'s doc comment to match"
+            leaks, PRE_FIX_LEAKS,
+            "the pre-fix body now leaks {leaks} of {cases} spellings, not \
+             {PRE_FIX_LEAKS}; set `PRE_FIX_LEAKS` to {leaks} — it is the only \
+             place that number lives"
         );
     }
 
