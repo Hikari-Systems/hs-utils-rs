@@ -83,7 +83,7 @@ pub struct RedisSentinelConfig {
 /// verbatim, password and all. And the gap was selected by the very character
 /// causing the failure: an unencoded `/` in a password is what makes the URL
 /// unparseable, hence what produces the error this function is redacting for.
-/// Measured over the sweep below, 2,576 of its 3,920 spellings leaked. **Both
+/// Measured over the sweep below, 2,842 of its 4,410 spellings leaked. **Both
 /// figures are still literals — here and in the test — but neither can go
 /// quietly stale:** `the_sweep_measures_what_the_doc_comment_claims` re-runs the
 /// pre-fix body over the same lists and asserts both, so adding a spelling turns
@@ -124,7 +124,7 @@ pub struct RedisSentinelConfig {
 /// **Credentials are not only ever in the userinfo, and for two of the four
 /// schemes they are never there.** `unix` and `redis+unix` take username and
 /// password from the **query string** — `query.get("user")` / `query.get("pass")`
-/// at `connection.rs:424-446` — and such a URL has no `@` at all, so the rule
+/// at `connection.rs:438-439` — and such a URL has no `@` at all, so the rule
 /// above returned it verbatim at its first branch:
 /// `unix:///run/redis.sock?pass=hunter2&db=notanumber` came back whole, out of a
 /// config value `session_store.rs` hands straight to `from_url`. So
@@ -147,10 +147,19 @@ pub struct RedisSentinelConfig {
 /// **And a note on what the sweep can and cannot see, because the query-string
 /// hole above was invisible to it and would have stayed so.** `sweep_cases` is
 /// exhaustive over *its* four lists, and every case it builds is
-/// `scheme + userinfo + "@" + tail` — so it has no unix-scheme row and no
-/// query-carried-credential row, and a leak in that family cannot appear in it
-/// however large it grows. An exhaustive product is exhaustive over the space it
-/// enumerates and silent about the rest, which is easy to misread as coverage.
+/// `scheme + userinfo + "@" + tail` — so **every case carries an `@` and none
+/// carries a query-carried credential**, and a leak in that family cannot appear
+/// in it however large it grows. An exhaustive product is exhaustive over the
+/// space it enumerates and silent about the rest, which is easy to misread as
+/// coverage.
+///
+/// That sentence read "it has no unix-scheme row" until `unix://` was added to
+/// the sweep's `SCHEMES` to give this function's fourth accepted scheme an
+/// oracle. It does have one now, and the correction is worth making rather than
+/// deleting: the sweep's blindness to the query family was never about which
+/// schemes it lists, it is about the **shape** every case is built to, and a
+/// reader who fixed the first reading by adding a scheme would have believed the
+/// gap closed while it was untouched.
 ///
 /// That family has its own coverage, and it is deliberately **not** a second
 /// hand-written table — the first attempt was one, and it was green while
@@ -188,7 +197,24 @@ fn redact_url_userinfo(url: &str) -> String {
     // `Client::open` rejects every other scheme (`connection.rs:99`) — so a
     // scheme outside the list means the string is not the URL it claims to be,
     // and the fail-closed answer is right.
+    // All four of those schemes are in the sweep's `SCHEMES` too, and that is
+    // not duplication for its own sake: `unix://` was missing from the sweep for
+    // one revision, and deleting `"unix"` from the list here then survived the
+    // whole suite.
     const SCHEMES: [&str; 4] = ["redis", "rediss", "redis+unix", "unix"];
+    // `filter(|&i| i < at)` is a **panic guard**, not a verdict, and no test can
+    // reach it today — do not delete it as dead. Both of the obvious mutations
+    // of this line (dropping the filter, and `find` → `rfind`) survive the suite
+    // and are *equivalent* rather than uncovered: for `and_then` to yield
+    // `Some`, `url[..i]` must equal one of the four words above, which contains
+    // no `://` and no `@`, so `i` is the only `://` position that can match and
+    // `at` is necessarily past it. Every other spelling reaches the `None` arm
+    // and fails closed either way, so the output is identical.
+    //
+    // What the filter defends is the future: add a short or empty entry to
+    // `SCHEMES` and that argument collapses — with `""` in the list,
+    // `a@b://c` gives `at = 1` and `i = 3`, and `url[6..1]` below is a reversed
+    // slice, i.e. a panic on the error path of a startup failure.
     let scheme = url.find("://").filter(|&i| i < at).and_then(|i| {
         let candidate = url[..i].to_ascii_lowercase();
         SCHEMES
@@ -217,7 +243,7 @@ fn redact_url_userinfo(url: &str) -> String {
 /// **ASCII tab, LF and CR are removed from the whole input first, because that
 /// is the step `Url::parse` performs before it decides anything.** Without it
 /// `?pa<TAB>ss=hunter2` is `pass` to redis and an unrecognised name here, and
-/// the URL — password and all — was returned verbatim: 108 of the 180
+/// the URL — password and all — was returned verbatim: 126 of the 210
 /// credential-bearing spellings in
 /// `no_spelling_the_crate_reads_as_a_credential_survives_redaction`'s corpus.
 /// `from_url`'s `trim()` does not help; it takes those bytes off the ends, not
@@ -231,17 +257,32 @@ fn redact_url_userinfo(url: &str) -> String {
 /// also removes leading and trailing C0-controls-and-space from the whole input
 /// before anything else, which is not reproduced here — and `from_url`'s
 /// `str::trim` is no substitute, being Unicode-whitespace and so leaving
-/// `\x00`–`\x08` and `\x0e`–`\x1f` in place. It is **inert, for a structural
-/// reason rather than a lucky one**: this function reads only the slice after
-/// the first `?`, and a trim touches only the two ends of the string, so a byte
-/// it would have removed can never sit inside a parameter name. That reasoning
-/// is the guard; a sweep at review agreed with it — every byte `0x00`–`0x20`
-/// plus `0x7f`, `U+0085`, `U+00A0`, `U+FEFF` and `U+2028`, injected at 33
-/// positions across the query and userinfo families with the crate supplying the
-/// verdict, gave 554 crate-confirmed credential-bearing spellings and 0
-/// published — but **that was a point-in-time measurement and no test re-derives
-/// it**, so it is cited, not relied on. Add a rule here that reads outside the
-/// query and the gap stops being inert.
+/// `\x00`–`\x08` and `\x0e`–`\x1f` in place.
+///
+/// It is inert — but **not for the structural reason this comment gave until it
+/// was measured**, and the correction matters because the wrong reason is the
+/// more reassuring one. It said the trim "touches only the two ends of the
+/// string, so a byte it would have removed can never sit inside a parameter
+/// name". It can. A trailing byte sits inside a name whenever the last
+/// parameter has no `=`: measured, `unix:///s.sock?db=0&pass\x00` is read by the
+/// crate as the name `pass` — the trim removed the `\x00` — while this function
+/// reads `pass\x00` and answers **false**. The two genuinely disagree.
+///
+/// What makes it inert is the value, not the name: a name a trailing trim can
+/// reach is by construction the final one *and* carries no `=`, so the crate
+/// recovers an **empty** credential (`Some("")` on that URL) and there is no
+/// secret in the string for the disagreement to publish. The leading end is
+/// simply before the `?` and cannot reach a name at all. Both halves are pinned
+/// by `the_trimming_gap_reaches_a_name_but_never_a_value`, so the argument is
+/// now an assertion rather than a paragraph.
+///
+/// A sweep at review agreed with the conclusion — every byte `0x00`–`0x20` plus
+/// `0x7f`, `U+0085`, `U+00A0`, `U+FEFF` and `U+2028`, injected at 33 positions
+/// across the query and userinfo families with the crate supplying the verdict,
+/// gave 554 crate-confirmed credential-bearing spellings and 0 published — but
+/// **that was a point-in-time measurement and no test re-derives it**, so it is
+/// cited, not relied on. Add a rule here that reads outside the query, or one
+/// that gives a valueless parameter a meaning, and the gap stops being inert.
 fn carries_query_credentials(url: &str) -> bool {
     let url: String = url.replace(['\t', '\n', '\r'], "");
     let Some(q) = url.find('?') else {
@@ -718,7 +759,7 @@ mod redaction_tests {
 
     /// **Two of the four accepted schemes never put the credential in the
     /// userinfo at all.** `unix` and `redis+unix` take it from the query string
-    /// (`connection.rs:424-446`), and such a URL carries no `@`, so the userinfo
+    /// (`connection.rs:438-439`), and such a URL carries no `@`, so the userinfo
     /// rule returns it verbatim at its very first branch.
     #[test]
     fn credentials_in_the_query_string_fail_closed() {
@@ -775,12 +816,36 @@ mod redaction_tests {
     /// the one above is to fail closed on any `?` at all. The query parameters
     /// redis reads that are *not* credentials — `db`, `protocol` — must leave the
     /// URL actionable, which is the whole reason this is not simply `"***"`.
+    ///
+    /// **The last row is the second oracle on "the query ends at the first
+    /// `#`".** That sentence in `carries_query_credentials`' doc comment had one
+    /// — `Q_PLACEMENTS`' `{n}={v}#frag` row, which catches changing the split's
+    /// `.next()` to `.last()` — but that row puts the credential *before* the
+    /// `#`, so it only shows a fragment does not break detection. Nothing showed
+    /// the fragment was **excluded**: drop the `.split('#')` entirely and the
+    /// whole suite stayed green. The direction is over-refusal (a `pass=` parked
+    /// in a fragment would start collapsing the URL to `***`), so it costs
+    /// actionability rather than a secret, but it is the same shape as the rest
+    /// of this round.
+    ///
+    /// **Residual, and it is the honest reading of this row.** Because the
+    /// fragment is excluded, `…#x&pass=SECRET` *is* returned whole. That is
+    /// deliberate — the rule mirrors the parser, and redis reads nothing after a
+    /// `#`, so it is not a credential redis uses — but it is a weaker posture
+    /// than the query gets, where a `?pass=` on a tcp scheme fails closed even
+    /// though redis ignores it too. The difference is that the query is a place
+    /// credentials legitimately live for two of the four schemes and a fragment
+    /// is a place they live for none, so a `pass=` there cannot be a
+    /// misconfiguration of a working URL. Left as-is rather than widened,
+    /// because widening it is a behaviour change and this commit is about giving
+    /// the stated rules oracles.
     #[test]
     fn ordinary_query_parameters_do_not_fail_closed() {
         for url in [
             "redis://h0st:6379/0?protocol=3",
             "unix:///run/redis.sock?db=3&protocol=3",
             "rediss://h0st:6379/0?opt=1",
+            "unix:///run/redis.sock?db=3#x&pass=notacredential",
         ] {
             assert_eq!(redact_url_userinfo(url), url, "needlessly redacted: {url}");
         }
@@ -808,6 +873,18 @@ mod redaction_tests {
         assert_eq!(percent_decode_name("p%09ass"), "p\tass");
         // Undecodable bytes must not panic; they simply cannot match either name.
         assert_ne!(percent_decode_name("%ff%fe"), "pass");
+        // `hex_nibble`'s A–F path, in both cases. **No credential verdict can
+        // reach it** — every nibble of `pass`, `user` and their case variants is
+        // `0`–`7` (`p`=0x70, `a`=0x61, `s`=0x73, `u`=0x75, `e`=0x65, `r`=0x72,
+        // `P`=0x50, `A`=0x41, `S`=0x53, `U`=0x55, `E`=0x45, `R`=0x52) — so
+        // `to_digit(16)` → `to_digit(10)` survived the whole suite, this test
+        // included. That is a decoder documented as decoding percent-escapes
+        // with half its input alphabet unexercised, and the honest fix is a row
+        // rather than a footnote claiming it does not matter: the next name
+        // anyone adds here may well have an A–F nibble, and it would arrive with
+        // the decoder silently broken.
+        assert_eq!(percent_decode_name("%7Aebra"), "zebra");
+        assert_eq!(percent_decode_name("%7aebra"), "zebra");
     }
 
     // ─── The query-credential differential ─────────────────────────────────
@@ -870,8 +947,21 @@ mod redaction_tests {
         "us\ter", "PASS", "User", "p%09ass", "pa+ss", "%2570ass", "passx", "opt",
     ];
 
-    /// Where in the query the parameter sits, including past a `#` and
-    /// duplicated.
+    /// Where in the query the parameter sits, including past a `#`, past a
+    /// second `?`, and duplicated.
+    ///
+    /// **`{n}={v}&x=a?b` is what gives "the query starts at the FIRST `?`" an
+    /// oracle**, and it is here because that half of
+    /// [`carries_query_credentials`]' doc comment was pinned by nothing: no
+    /// other row in this list, and no literal in any hand-written test in this
+    /// module, contained a second `?`. Change the `find('?')` there to
+    /// `rfind('?')` and the whole suite stayed green while
+    /// `unix:///s.sock?pass=<canary>&db=notanumber&x=a?b` came back out of
+    /// `from_url` verbatim — the operator's password whole on the startup error
+    /// line, the same sink as the `?PASS=` mutant the previous commit closed. A
+    /// `?` is legal inside a query value and the parser does not re-split on
+    /// it, so a last-`?` reading discards exactly the slice the credential is
+    /// in. The `#` half of that sentence is pinned by the `{n}={v}#frag` row.
     const Q_PLACEMENTS: &[&str] = &[
         "{n}={v}",
         "db=0&{n}={v}",
@@ -879,6 +969,7 @@ mod redaction_tests {
         "{n}={v}#frag",
         "x=1&{n}={v}&y=2",
         "{n}={v}&{n}={v}",
+        "{n}={v}&x=a?b",
     ];
 
     fn query_corpus() -> Vec<String> {
@@ -937,11 +1028,37 @@ mod redaction_tests {
     /// query-carried credential on an `@`-less URL is never checked at all, and
     /// `no_spelling_the_crate_reads_as_a_credential_survives_redaction` stays
     /// **green**. What goes red is only the hand-written tests that call the
-    /// shipped function directly — `credentials_in_the_query_string_fail_closed`
-    /// and, above all,
-    /// `a_query_string_password_never_survives_into_the_error_text`, which drives
-    /// the production path through `from_url`. So do not delete those on the
-    /// grounds that the property subsumes them: it does not, and cannot.
+    /// shipped function directly, and the list is given rather than a count
+    /// because it grows:
+    ///
+    /// * `credentials_in_the_query_string_fail_closed`
+    /// * `a_credential_name_in_any_case_fails_closed`
+    /// * `a_query_password_fails_closed_on_the_tcp_schemes_that_ignore_it`
+    /// * `the_trimming_gap_reaches_a_name_but_never_a_value`
+    /// * `a_query_string_password_never_survives_into_the_error_text` — above
+    ///   all, because it is the one that drives the production path through
+    ///   `from_url`
+    ///
+    /// So do not delete any of those on the grounds that the property subsumes
+    /// them: it does not, and cannot.
+    ///
+    /// **A second, structural bound on the same coverage, and it is the one a
+    /// reader is most likely to assume away.** `redis_reads_the_canary` answers
+    /// `None` for any URL `Client::open` rejects, and the filter below keeps only
+    /// `Some(true)` — so **every case this function scores is a URL that parses
+    /// successfully**, and a URL that parses successfully never reaches
+    /// `redact_url_userinfo` in production at all: `from_url` calls the redactor
+    /// only inside `with_context` on the **error** path. This corpus therefore
+    /// measures the detector against the crate on the parse-success side, which
+    /// is where the oracle can exist, and says nothing directly about the inputs
+    /// the shipped code actually sees.
+    ///
+    /// End-to-end coverage of this family — a URL that parses far enough for the
+    /// crate to read the credential and *then* fails, so the error really is
+    /// built and the credential really is inside it — is the three literal rows
+    /// in `a_query_string_password_never_survives_into_the_error_text`, which get
+    /// there with `db=notanumber`. Three literals is the whole of it; that is the
+    /// gap, and it is stated rather than left to be inferred from a green tick.
     fn under_refusals(carries: fn(&str) -> bool) -> Vec<String> {
         let mut out = Vec::new();
         for url in query_corpus() {
@@ -997,7 +1114,7 @@ mod redaction_tests {
             .filter(|u| redis_reads_the_canary(u) == Some(true))
             .count();
         assert_eq!(
-            credential_cases, 180,
+            credential_cases, 210,
             "the number of spellings the crate reads a credential from changed; \
              if a name was added or the crate's parsing moved, re-derive it"
         );
@@ -1021,7 +1138,7 @@ mod redaction_tests {
     /// Every assertion in the test before this one is "nothing leaked", which a
     /// corpus incapable of leaking would satisfy just as well. Running the
     /// tab-blind body over the identical corpus is the measurement that the
-    /// corpus can detect the defect it was built for: 108 of the 180
+    /// corpus can detect the defect it was built for: 126 of the 210
     /// credential-bearing spellings — exactly and only those whose name carries
     /// an ASCII tab, LF or CR — came back verbatim, password and all.
     #[cfg(unix)]
@@ -1030,7 +1147,7 @@ mod redaction_tests {
         let missed = under_refusals(tab_blind_carries_query_credentials);
         assert_eq!(
             missed.len(),
-            108,
+            126,
             "the corpus changed size or shape; re-derive this figure and the one \
              in `carries_query_credentials`' doc comment. First 10:\n{}",
             missed
@@ -1047,6 +1164,73 @@ mod redaction_tests {
             "the tab-blind body missed something outside the tab/LF/CR family, so \
              the doc comment's account of the gap is wrong: {missed:?}"
         );
+    }
+
+    /// **The trimming-step gap, asserted instead of argued.**
+    /// `carries_query_credentials` mirrors `Url::parse`'s tab/LF/CR *stripping*
+    /// and not its *trimming* of leading and trailing C0-controls-and-space. Its
+    /// doc comment justified that as inert on the grounds that a trim "touches
+    /// only the two ends of the string, so a byte it would have removed can
+    /// never sit inside a parameter name" — which is **false**, and this test is
+    /// the measurement that says so plus the reason the conclusion survives
+    /// anyway.
+    ///
+    /// Row 1 is the disagreement: the crate trims the trailing `\0`, reads the
+    /// name as `pass` and hands back a password; we read `pass\0` and answer
+    /// `false`, so the URL is returned whole. Row 1 is also why that costs
+    /// nothing — the credential the crate recovers is the **empty string**,
+    /// because a name a trailing trim can reach is necessarily the last
+    /// parameter *and* carries no `=`, so there is no value in the string to
+    /// publish. Row 2 is its control: take the `\0` away and the very same URL
+    /// is a credential to both. Row 3 puts the byte at the leading end, which is
+    /// before the `?` and so cannot reach a name at all.
+    ///
+    /// If a future change gives a valueless parameter a meaning, or lets this
+    /// function read outside the query, row 1's `""` stops being harmless and
+    /// this test is where that shows up.
+    #[cfg(unix)]
+    #[test]
+    fn the_trimming_gap_reaches_a_name_but_never_a_value() {
+        use redis::IntoConnectionInfo;
+
+        // Row 1 — the two really do disagree, and the crate's credential is empty.
+        let leaky = "unix:///s.sock?db=0&pass\u{0}";
+        let info = leaky
+            .into_connection_info()
+            .expect("the crate parses a trailing-NUL unix url");
+        assert_eq!(
+            info.redis.password.as_deref(),
+            Some(""),
+            "the premise is that a trim-reachable name has no value; if the crate \
+             ever recovers a non-empty credential here the gap stops being inert"
+        );
+        assert!(
+            !carries_query_credentials(leaky),
+            "premise: we read the name as `pass\\0` and do not match it"
+        );
+        assert_eq!(
+            redact_url_userinfo(leaky),
+            leaky,
+            "nothing is redacted, which is only acceptable because there is no \
+             credential value in the string"
+        );
+
+        // Row 2 — the control. Without the trailing byte the name matches and
+        // the whole string fails closed, so row 1 is a real disagreement rather
+        // than a URL neither side reads.
+        let same_without_the_byte = "unix:///s.sock?db=0&pass";
+        assert!(carries_query_credentials(same_without_the_byte));
+        assert_eq!(redact_url_userinfo(same_without_the_byte), "***");
+
+        // Row 3 — the leading end is before the `?`, so it can never reach a
+        // name, and a real credential behind it still fails closed.
+        let leading = "\u{0}unix:///s.sock?pass=S3cretC4nary";
+        assert_eq!(
+            redis_reads_the_canary(leading),
+            Some(true),
+            "premise: the crate trims the leading NUL and reads the credential"
+        );
+        assert_eq!(redact_url_userinfo(leading), "***");
     }
 
     /// **The deliberate over-refusal, pinned against the crate rather than
@@ -1167,11 +1351,25 @@ mod redaction_tests {
     /// RFC-3986-shaped but is not a redis scheme — because "there is an `@` but
     /// no scheme I can identify" is a fail-closed arm, not an unchanged one.
     /// `REDIS://` is here for the case fold.
+    ///
+    /// **All four schemes `Client::open` accepts are present, and `unix://` was
+    /// the one missing.** `connection.rs:99` matches
+    /// `"redis" | "rediss" | "redis+unix" | "unix"`, so the list below carried
+    /// three of the four plus a case variant — and
+    /// `where_it_does_not_fail_closed_it_keeps_the_scheme_and_the_host` asserted
+    /// "exactly the four schemes `Client::open` accepts", a set its own contents
+    /// could not express. Measured: delete `"unix"` from the production `SCHEMES`
+    /// at [`redact_url_userinfo`] and the suite stayed green at 119/119, while
+    /// `unix://Us3rname:<canary>@/s.sock` went from `unix://***@/s.sock` to
+    /// `***`. That direction is fail-closed — actionability lost, never a secret
+    /// — which is why it was a gap rather than a defect, but it is the same
+    /// documented-behaviour-with-no-oracle shape as the two case folds.
     const SCHEMES: &[&str] = &[
         "redis://",
         "rediss://",
         "REDIS://",
         "redis+unix://",
+        "unix://",
         "http://",
         "",
         "1bad://",
@@ -1317,12 +1515,12 @@ mod redaction_tests {
     fn the_sweep_measures_what_the_doc_comment_claims() {
         assert_eq!(
             sweep_cases().len(),
-            3_920,
+            4_410,
             "the sweep changed size; update `redact_url_userinfo`'s doc comment to match"
         );
         assert_eq!(
             leaking_spellings(pre_hik243_redact).len(),
-            2_576,
+            2_842,
             "the pre-fix leak count changed; update `redact_url_userinfo`'s doc comment to match"
         );
     }
@@ -1362,9 +1560,16 @@ mod redaction_tests {
         }
         assert_eq!(
             kept_schemes,
-            BTreeSet::from(["redis://", "rediss://", "REDIS://", "redis+unix://"]),
-            "exactly the four schemes `Client::open` accepts must keep their host, \
-             in any case; every other spelling must fail closed"
+            BTreeSet::from([
+                "redis://",
+                "rediss://",
+                "REDIS://",
+                "redis+unix://",
+                "unix://",
+            ]),
+            "exactly the four schemes `Client::open` accepts (`connection.rs:99`), \
+             plus the one case variant that proves the fold, must keep their host; \
+             every other spelling must fail closed"
         );
     }
 
