@@ -225,6 +225,23 @@ fn redact_url_userinfo(url: &str) -> String {
 /// decoded name is what mirrors the parser's order: `?p%09ass=` is a
 /// percent-encoded tab, decoded afterwards, so redis reads it as `p<TAB>ass` and
 /// it is correctly *not* a credential.
+///
+/// **It mirrors the parser's stripping step and NOT its trimming step**, and the
+/// gap is written down rather than left to read as completeness. `Url::parse`
+/// also removes leading and trailing C0-controls-and-space from the whole input
+/// before anything else, which is not reproduced here — and `from_url`'s
+/// `str::trim` is no substitute, being Unicode-whitespace and so leaving
+/// `\x00`–`\x08` and `\x0e`–`\x1f` in place. It is **inert, for a structural
+/// reason rather than a lucky one**: this function reads only the slice after
+/// the first `?`, and a trim touches only the two ends of the string, so a byte
+/// it would have removed can never sit inside a parameter name. That reasoning
+/// is the guard; a sweep at review agreed with it — every byte `0x00`–`0x20`
+/// plus `0x7f`, `U+0085`, `U+00A0`, `U+FEFF` and `U+2028`, injected at 33
+/// positions across the query and userinfo families with the crate supplying the
+/// verdict, gave 554 crate-confirmed credential-bearing spellings and 0
+/// published — but **that was a point-in-time measurement and no test re-derives
+/// it**, so it is cited, not relied on. Add a rule here that reads outside the
+/// query and the gap stops being inert.
 fn carries_query_credentials(url: &str) -> bool {
     let url: String = url.replace(['\t', '\n', '\r'], "");
     let Some(q) = url.find('?') else {
@@ -717,6 +734,43 @@ mod redaction_tests {
         }
     }
 
+    /// **The over-refusal axis the differential structurally cannot see.**
+    /// `query.get("pass")` is case-sensitive, so redis does not read `?PASS=` —
+    /// but an operator who wrote it has still put a live password into a string
+    /// about to be logged, so `carries_query_credentials` folds the case and
+    /// fails closed anyway. Nothing asserted that until this test: `Q_NAMES`
+    /// carries `PASS` and `User` and its doc comment states the behaviour, but
+    /// `no_spelling_the_crate_reads_as_a_credential_survives_redaction` filters
+    /// to the spellings the crate *does* read, so those rows contribute nothing
+    /// to it — **taking the oracle from the crate is right for under-refusal and
+    /// blind to over-refusal.** Measured: delete the `.to_ascii_lowercase()` in
+    /// `carries_query_credentials` and the entire suite stayed green while
+    /// `?PASS=` printed the operator's password whole into the startup error.
+    ///
+    /// The premise — that the crate really does ignore these — is deliberately
+    /// not restated here. It is exactly what `credential_cases == 180` counts,
+    /// and that assertion goes red if the crate ever starts reading them. Either
+    /// answer is safe here, because this direction fails closed on both.
+    ///
+    /// The last row is the decode/fold **order**: `%50ASS` percent-decodes to
+    /// `PASS` and is folded afterwards. Fold the raw name first instead and it
+    /// decodes to `Pass`, which matches neither name.
+    #[test]
+    fn a_credential_name_in_any_case_fails_closed() {
+        for url in [
+            "unix:///s.sock?PASS=S3cretC4nary",
+            "redis+unix:///s.sock?User=S3cretC4nary",
+            "redis://h0st:6379/0?PaSs=S3cretC4nary",
+            "unix:///s.sock?%50ASS=S3cretC4nary",
+        ] {
+            let out = redact_url_userinfo(url);
+            assert_eq!(
+                out, "***",
+                "a credential name must fail closed whatever its case: {url} -> {out}"
+            );
+        }
+    }
+
     /// The other side of that rule, and without it the cheapest way to satisfy
     /// the one above is to fail closed on any `?` at all. The query parameters
     /// redis reads that are *not* credentials — `db`, `protocol` — must leave the
@@ -872,6 +926,22 @@ mod redaction_tests {
     /// Count the spellings on which a redactor publishes a credential the redis
     /// crate really reads. Parameterised over the credential-detector so the
     /// pre-fix body can be measured on the identical corpus.
+    ///
+    /// **This is a MODEL of `redact_url_userinfo`, not the function itself**, and
+    /// the difference bounds what the property test can ever prove. It has to be
+    /// one — the control's whole purpose is to swap the detector out, which the
+    /// shipped function does not let you do — but it means the property asserts
+    /// over a reimplementation of the control flow, so a defect in the *wiring*
+    /// is invisible to it. Measured: move the `carries_query_credentials` call in
+    /// `redact_url_userinfo` below the `rfind('@')` early return, so a
+    /// query-carried credential on an `@`-less URL is never checked at all, and
+    /// `no_spelling_the_crate_reads_as_a_credential_survives_redaction` stays
+    /// **green**. What goes red is only the hand-written tests that call the
+    /// shipped function directly — `credentials_in_the_query_string_fail_closed`
+    /// and, above all,
+    /// `a_query_string_password_never_survives_into_the_error_text`, which drives
+    /// the production path through `from_url`. So do not delete those on the
+    /// grounds that the property subsumes them: it does not, and cannot.
     fn under_refusals(carries: fn(&str) -> bool) -> Vec<String> {
         let mut out = Vec::new();
         for url in query_corpus() {
@@ -902,9 +972,14 @@ mod redaction_tests {
     /// canary from a URL, the redaction of that URL must not contain it.
     ///
     /// `#[cfg(unix)]` because `url_to_unix_connection_info` is itself
-    /// `#[cfg(unix)]` — off unix the crate refuses every `unix://` URL, so the
-    /// credential half of the corpus would be empty and the whole thing
-    /// vacuously green. This crate ships in Linux containers.
+    /// `#[cfg(unix)]` (`connection.rs:423`) — off unix the crate refuses every
+    /// `unix://` URL, and redis reads no query credential on the tcp schemes, so
+    /// there is nothing left for the corpus to measure. **Not because it would
+    /// be vacuously green:** `credential_cases == 180` would fail loudly against
+    /// 0, which is the control doing its job. The gate is here so a non-unix
+    /// build reports "not run" rather than "broken", and this crate ships in
+    /// Linux containers. Only gate a test that genuinely depends on that
+    /// `cfg` — see the tcp one below, which does not.
     #[cfg(unix)]
     #[test]
     fn no_spelling_the_crate_reads_as_a_credential_survives_redaction() {
@@ -980,7 +1055,13 @@ mod redaction_tests {
     /// string about to be logged, not a credential redis uses. Failing closed
     /// on it anyway is a choice, and this is the assertion that says so out
     /// loud, with the crate confirming the premise.
-    #[cfg(unix)]
+    ///
+    /// **Deliberately NOT `#[cfg(unix)]`, unlike its two neighbours.** Every URL
+    /// here is `redis://` or `rediss://`, which go through
+    /// `url_to_tcp_connection_info` — no `cfg` on it (`connection.rs:333`) — so
+    /// this passes on every target, and gating it would drop the only
+    /// over-refusal assertion on the scheme axis from non-unix builds for no
+    /// reason. It carried that gate for one revision by proximity.
     #[test]
     fn a_query_password_fails_closed_on_the_tcp_schemes_that_ignore_it() {
         for url in [
@@ -1251,24 +1332,39 @@ mod redaction_tests {
     /// *not* fail closed, it must have removed exactly the userinfo and kept the
     /// scheme and the host — which is the entire reason this function is not
     /// simply `"***"`.
+    ///
+    /// **The verdict is asserted per scheme, not as a count**, and that is the
+    /// same over-refusal hole as `a_credential_name_in_any_case_fails_closed`.
+    /// A bare `kept > 0` is satisfied by the lowercase rows alone, so `REDIS://`
+    /// — which `SCHEMES`' own comment says is "here for the case fold" —
+    /// asserted nothing: delete the `.to_ascii_lowercase()` from the scheme
+    /// match in `redact_url_userinfo` and every test in the crate stayed green
+    /// while `REDIS://u:pw@h0st` collapsed to `***`. Only actionability is lost
+    /// there, never a secret, but it is the identical documented-behaviour-with-
+    /// no-oracle shape. Naming the set also pins the negative: `http://`, the
+    /// empty scheme, `1bad://` and `not-a-scheme:` must never survive.
     #[test]
     fn where_it_does_not_fail_closed_it_keeps_the_scheme_and_the_host() {
-        let mut kept = 0usize;
+        use std::collections::BTreeSet;
+
+        let mut kept_schemes = BTreeSet::new();
         for (url, _, scheme, tail) in sweep_cases() {
             let out = redact_url_userinfo(&url);
             if out == "***" {
                 continue;
             }
-            kept += 1;
+            kept_schemes.insert(scheme);
             assert_eq!(
                 out,
                 format!("{scheme}***@{tail}"),
                 "an accepted redaction must be scheme + `***@` + the tail, and nothing else: {url:?}"
             );
         }
-        assert!(
-            kept > 0,
-            "every spelling failed closed, so nothing here shows the host ever survives"
+        assert_eq!(
+            kept_schemes,
+            BTreeSet::from(["redis://", "rediss://", "REDIS://", "redis+unix://"]),
+            "exactly the four schemes `Client::open` accepts must keep their host, \
+             in any case; every other spelling must fail closed"
         );
     }
 
