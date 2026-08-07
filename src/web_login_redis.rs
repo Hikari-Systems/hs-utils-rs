@@ -92,22 +92,28 @@ pub struct RedisSentinelConfig {
 /// numbers.
 ///
 /// **That is a change of shape rather than of digits, and it was earned.** The
-/// pair used to be quoted in two prose copies — this sentence, and the sweep
-/// test's own doc comment — each time restating what the assertions already
-/// held. Committed history records the copies going out of step once, and it
-/// is worth being exact about which one, because the obvious guess is wrong:
-/// at `d46977a`, when `unix://` joined the sweep's `SCHEMES`, **this** sentence
-/// was updated to `(4,410, 2,842)` and **the sweep test's own doc comment** was
-/// the one left at `(3,920, 2,576)` — three lines above the assertions that
-/// contradicted it. Earlier `(2,940, 2,044)` episodes are referred to in the
-/// prose of that era but are not traceable in committed history, so they are
-/// described here and not counted.
+/// pair used to be quoted in prose as well as asserted, and committed history
+/// records it going stale **twice, in different copies** — which is the whole
+/// argument, so both are named rather than counted:
 ///
-/// The lesson is sharper for being attributed correctly. The stale copy was the
-/// one *nobody had listed as a copy* — the warning about carrying the number
-/// lived in the sentence that then failed to carry it. Warning harder was
-/// already the previous repair and it did not work, which is why the second
-/// copy is gone rather than reworded.
+/// - At `089d603`, **this** sentence shipped `(2,940, 2,044)` while the sweep
+///   lists committed in the same file produce 8×5×14×7 = 3,920, and that
+///   commit's own message says `3,920 spellings` and `2,576 of 3,920`. Stale
+///   on arrival, contradicting its own commit.
+/// - At `d46977a`, when `unix://` joined the sweep's `SCHEMES`, **this**
+///   sentence was updated to `(4,410, 2,842)` and **the sweep test's own doc
+///   comment** — added at `09f7211` — was the one left at `(3,920, 2,576)`,
+///   three lines above the assertions contradicting it.
+///
+/// Both are derivable from `git show <sha>:src/web_login_redis.rs` plus
+/// arithmetic over the committed lists. Neither is a recollection.
+///
+/// **The lesson is in the pair, not in either one.** The offender was a
+/// different copy each time, so no rule of the form "watch that comment" was
+/// ever going to hold — the first failure was a comment stale against its own
+/// commit, the second a comment stale against assertions three lines below it.
+/// Warning harder was the repair after the first, and it did not survive the
+/// second. That is why there is now one owner instead of a better warning.
 ///
 /// The two obvious repairs are both refused. A second hand-written index rule
 /// ("the last `@` before the first `/` that follows it") is one more guess at a
@@ -1574,14 +1580,22 @@ mod redaction_tests {
     /// `(4,410, 2,842)` while **this doc comment** was left at
     /// `(3,920, 2,576)`, three lines above the assertions that contradicted it.
     ///
-    /// **The offender was this comment, not the other one**, and getting that
-    /// the wrong way round was itself a review finding — the first version of
-    /// this paragraph blamed `redact_url_userinfo`'s copy, which `git show
-    /// d46977a:src/web_login_redis.rs` disproves in one command. It matters
-    /// because the corrected history is the stronger argument: the copy that
-    /// went stale was the one *nobody had listed as a copy*, in the very
-    /// sentence that warned about carrying the number. That is why the repair
-    /// is one owner rather than a better warning.
+    /// **At `d46977a` the offender was this comment, not the other one** — and
+    /// getting that the wrong way round was itself a review finding, since the
+    /// first version of this paragraph blamed `redact_url_userinfo`'s copy,
+    /// which `git show d46977a:src/web_login_redis.rs` disproves in one
+    /// command.
+    ///
+    /// **Scope that to `d46977a`, though, because the other copy had its own
+    /// turn first.** At `089d603` `redact_url_userinfo`'s comment shipped
+    /// `(2,940, 2,044)` against lists producing 3,920 — stale against its own
+    /// commit message. Blaming either comment in general is therefore wrong,
+    /// and the second version of this paragraph did that too, in the opposite
+    /// direction, which is how the pair got written down properly.
+    ///
+    /// That is the argument for one owner. The offender was a different copy
+    /// each time, so no rule of the form "watch that comment" could have held;
+    /// only removing the copies could.
     ///
     /// If either number moves, the messages below print the derived value beside
     /// the expected one: updating the constant is then the whole repair, and
