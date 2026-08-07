@@ -359,9 +359,10 @@ struct Stripped {
 /// lint cannot detect its own blindness, so the blindness has to be asserted
 /// somewhere the main assertion is not.
 ///
-/// **This file's three `redis://***@…` lines — 434, 439 and 462 — do each
-/// contain a literal `/*`**, from the `/` of `://` meeting the first `*` of the
-/// redaction. HIK-246 asserted in a commit message that there was no `/*`
+/// **`web_login_redis.rs`'s three `redis://***@…` lines — its 434, 439 and 462,
+/// not this file's — do each contain a literal `/*`**, from the `/` of `://`
+/// meeting the first `*` of the redaction. HIK-246 asserted in a commit message
+/// that there was no `/*`
 /// anywhere in either store file; that was false, and it is corrected here
 /// because the sentence above is the one a future reader will reason from. The
 /// conclusion it was offered against is unchanged, for a reason worth stating
@@ -382,7 +383,7 @@ struct Stripped {
 /// has one — and which cannot run away, because an unterminated string literal
 /// does not compile and these files are compiled by this crate.
 ///
-/// The two constructs that *could* run away are refused, loudly, instead of
+/// The three constructs that *could* run away are refused, loudly, instead of
 /// being handled approximately:
 ///
 /// * **`/* … */` block comments.** Scanning for `*/` is the unbounded-swallow
@@ -391,11 +392,15 @@ struct Stripped {
 /// * **A char literal holding a quote or a body delimiter** — `"`, or any of
 ///   `(` `)` `{` `}` `[` `]`. Handling it properly means telling `'` apart from
 ///   a lifetime (`'a`, `'static`), which is again a parser.
+/// * **A raw string literal** — `r"…"`, `r#"…"#`, `br"…"`, `cr##"…"##`. Its
+///   body obeys neither of the two rules the `in_string`/`escaped` pair
+///   encodes, so the machine desynchronises against the *rest of the file*.
+///   See the closing section for both of the ways that happens.
 ///
-/// Both are reported through [`Stripped::unsupported`] and fail the test with a
-/// message saying what to do. **Fail loud beats handle-approximately**: if
-/// either construct ever arrives in these files, someone is told, rather than
-/// the lint quietly covering less than it claims.
+/// All three are reported through [`Stripped::unsupported`] and fail the test
+/// with a message saying what to do. **Fail loud beats handle-approximately**:
+/// if any of them ever arrives in these files, someone is told, rather than the
+/// lint quietly covering less than it claims.
 ///
 /// # Why the char-literal refusal covers brackets and not just the quote
 ///
@@ -434,32 +439,66 @@ struct Stripped {
 /// swallowed span is then reported clean. The stripper honoured that; the body
 /// matcher did not, and the refusal is what now covers both.
 ///
-/// # KNOWN RESIDUAL: a raw string literal is neither handled nor refused
+/// # Why a raw string is refused, and the TWO ways it desynchronises
 ///
-/// The refusal above covers char literals. Rust has a **third** literal form
-/// this scanner does not recognise — `r"…"`, `r#"…"#`, `br"…"` — and in a raw
-/// string `\` is not an escape, so the `escaped` flag desynchronises. Measured,
-/// on this state machine:
+/// This was carried for one round as a documented residual, and the account
+/// given there named **one** of the two triggers — which is worse than naming
+/// none, because an auditor reading it greps for the wrong thing and concludes
+/// the file is clean.
+///
+/// **Trigger 1, the one that was documented: a `\` before the closing quote.**
+/// In a raw string `\` is not an escape, so `escaped` is set by a character
+/// that does not escape anything:
 ///
 /// ```ignore
 /// let a = r"C:\";
 /// let b = "redis://x"; tracing::error!(leak = %sid, "m");
 /// ```
 ///
-/// The `\"` closing `r"C:\"` is read as an escaped quote, so the string never
-/// ends; the next real `"` closes it instead, leaving `redis://x` as *code*,
-/// whose `//` then blanks the rest of the line. The whole `error!` is replaced
-/// by spaces and the lint reports clean. **A silent blind, and `unsupported` is
-/// empty.**
+/// The `"` closing `r"C:\"` is read as escaped, so the string never ends; the
+/// next real `"` closes it instead, leaving `redis://x` as *code*, whose `//`
+/// then blanks the rest of the line. The whole `error!` is replaced by spaces
+/// and the lint reports clean.
 ///
-/// Not fixed here, deliberately: it is a different construct from the one this
-/// round was scoped to, and the fix — a refusal on the `r"` / `r#` / `br"`
-/// prefixes, in the shape of the two above — deserves its own review rather
-/// than riding along. **Neither module contains a raw string literal today**
-/// (verified: no `r"` or `r#"` token in either file), so the gap is latent, not
-/// live. It is recorded here rather than only in a ticket because a scanner
-/// that documents two refusals and has three hazards is claiming a completeness
-/// it does not have — which is the failure this whole section is about.
+/// **Trigger 2, which has no backslash in it at all: an odd number of inner
+/// `"`.**
+///
+/// ```ignore
+/// let d = r#"the " character is not legal in a key"#;
+/// ```
+///
+/// Each inner quote toggles `in_string`, so an odd count leaves the machine one
+/// state out of step with the source for the **rest of the file** — every real
+/// string read as code and every gap read as string. Embedded double quotes are
+/// the entire reason anyone reaches for the `r#"…"#` form, so this is the
+/// likelier of the two in practice, and it is invisible to a `\`-shaped grep.
+/// Both were measured at `16bd876` against a real leak inserted at redis'
+/// `remove` — the one method this repo's `CLAUDE.md` standingly tells a bumper
+/// to check — each compiling clean with the lint 14/14 green.
+///
+/// **Why it is refused rather than left latent.** "Neither module contains a
+/// raw string today" was true, and it was a hand grep written into a doc
+/// comment — the thing this repo's own standard says is not a regression test.
+/// It would have had to be re-run by a human after every future edit to these
+/// two files for the lint to keep meaning what it says.
+///
+/// The stronger argument is that **the enumeration closes here**. The places an
+/// unbalanced delimiter can hide in Rust are a closed set — line comments
+/// (handled), block comments (refused), string and byte-string literals
+/// (handled), char and byte-char literals (refused), raw strings (refused now).
+/// Everything else is a token tree and cannot be unbalanced. So this section
+/// can stop saying "approximately" and say what it covers, which is the
+/// completeness claim the rest of it is built on.
+///
+/// It costs nothing on plausible source. [`raw_string_starts_at`] requires the
+/// full `r` `#`* `"` prefix, so a raw *identifier* (`r#type`) is not touched —
+/// it cannot hide a delimiter, being `r#` plus an identifier and nothing else.
+/// And the `r"` that a grep for the sequence actually turns up in these files
+/// is the one inside `"mymaster".into()` (`web_login_redis.rs:374`), which sits
+/// within a string literal and so never reaches this branch at all. Measured on
+/// today's tree: 13 redis invocations and 6 postgres ones still scanned, 19 in
+/// total, and the whole `(file, line, label, body)` dump is byte-identical to
+/// `16bd876`'s.
 fn strip_comments(text: &str) -> Stripped {
     let mut out = String::with_capacity(text.len());
     let mut unsupported = Vec::new();
@@ -494,6 +533,8 @@ fn strip_comments(text: &str) -> Stripped {
             } else {
                 if c == '/' && chars.get(i + 1) == Some(&'*') {
                     unsupported.push((lineno, "/* … */ block comment"));
+                } else if raw_string_starts_at(&chars, i) {
+                    unsupported.push((lineno, "raw string literal"));
                 } else if c == '\'' && char_literal_hides_a_delimiter(&chars, i) {
                     unsupported.push((lineno, "char literal holding a quote or a delimiter"));
                 } else if c == '"' {
@@ -509,6 +550,48 @@ fn strip_comments(text: &str) -> Stripped {
         text: out,
         unsupported,
     }
+}
+
+/// Does a raw string literal start at `at`?
+///
+/// The prefix is `r`, any number of `#`, then `"`, optionally preceded by the
+/// byte or C marker: `r"…"`, `r#"…"#`, `r##"…"##`, `br"…"`, `cr#"…"#`.
+///
+/// **The quote is required, which is what keeps a raw *identifier* out of it.**
+/// `r#type` is legal Rust, cannot hide a delimiter — it is `r#` followed by an
+/// identifier and nothing else — and refusing it would be a loud false red on
+/// source that does nothing wrong. Stopping the scan at `r#`, which is the
+/// shorter rule, would do exactly that.
+///
+/// **The token boundary is load-bearing for the byte and C prefixes, and not
+/// for the reason you would guess.** The tempting justification is
+/// `"mymaster".into()` at `web_login_redis.rs:374`, which really does contain
+/// the two characters `r"` — but that sits inside a string literal, where
+/// [`strip_comments`] never reaches this function at all, so it pins nothing.
+/// What the boundary actually stops is a **double report**: in `br"…"` the `r`
+/// is itself a candidate start, preceded by `b`, so without the check the one
+/// literal is pushed to [`Stripped::unsupported`] twice. Measured — delete the
+/// guard and B7's `br"` row fails with two entries where it expects one.
+///
+/// So both halves of the rule are pinned, by different rows: drop the boundary
+/// and `br"` double-reports; stop the prefix scan at `r#` instead of requiring
+/// the quote and the raw-identifier row is falsely refused.
+fn raw_string_starts_at(chars: &[char], at: usize) -> bool {
+    if at > 0 && is_word(chars[at - 1]) {
+        return false;
+    }
+    let mut i = at;
+    if matches!(chars.get(i), Some('b') | Some('c')) {
+        i += 1;
+    }
+    if chars.get(i) != Some(&'r') {
+        return false;
+    }
+    i += 1;
+    while chars.get(i) == Some(&'#') {
+        i += 1;
+    }
+    chars.get(i) == Some(&'"')
 }
 
 /// Every character that steers one of the scanners, and so must never reach one
@@ -552,13 +635,36 @@ const SCANNER_DELIMITERS: &[char] = &['"', '(', ')', '{', '}', '[', ']'];
 /// a newline ends the search), so this cannot itself become the unbounded scan
 /// it is guarding against. A lifetime — `'a`, `'static` — has no closing `'`
 /// within the bound, or encloses no delimiter if a later lifetime supplies one.
+///
+/// **Finding the closing quote needs the escape state, not the previous
+/// character.** `chars[j - 1] != '\\'` was the first spelling and it reads the
+/// *closing* quote of `'\\'` — an ordinary backslash char literal — as escaped:
+/// the scan then runs on to the next `'` within the bound, and the span it
+/// lands on starts with `\`, so [`is_char_literal_body`] accepts it. Measured on
+/// compiling Rust containing no delimiter char literal at all:
+///
+/// ```ignore
+/// if c == '\\' { p('n'); }          // refused
+/// fn f() { g('\\', x); h('a'); }    // refused
+/// ```
+///
+/// Loud rather than silent, and it can suppress nothing later — [`strip_comments`]
+/// visits every `'` independently — but it is the exact failure this function's
+/// own existence is justified by, one construct along: a lint that fails on
+/// ordinary source is one people cannot keep green, and then it gets deleted.
+/// The two rows above are in B5.
 fn char_literal_hides_a_delimiter(chars: &[char], at: usize) -> bool {
     let end = (at + 13).min(chars.len());
+    let mut escaped = false;
     for j in (at + 1)..end {
         if chars[j] == '\n' {
             return false;
         }
-        if chars[j] == '\'' && chars[j - 1] != '\\' {
+        if escaped {
+            escaped = false;
+        } else if chars[j] == '\\' {
+            escaped = true;
+        } else if chars[j] == '\'' {
             let body: String = chars[at + 1..j].iter().collect();
             if !is_char_literal_body(&body) {
                 // Two lifetimes, not a literal. Widening from the quote to the
@@ -1224,6 +1330,15 @@ mod scanner {
             "let c = '/';\n",
             "let c = '@';\n",
             "let c = b'_';\n",
+            // `'\\'` with something after it on the same line. The row above
+            // passes for the wrong reason — nothing follows it, so the runaway
+            // scan finds no second `'` inside the bound. Reading the *closing*
+            // quote as escaped (`chars[j - 1] != '\\'`) ran on to the next `'`
+            // in the line and refused ordinary source holding no delimiter char
+            // literal at all. Loud, not silent, but a lint that fails on source
+            // like this is one people cannot keep green.
+            "if c == '\\\\' { p('n'); }\n",
+            "fn f() { g('\\\\', x); h('a'); }\n",
         ] {
             assert!(
                 strip_comments(src).unsupported.is_empty(),
@@ -1265,6 +1380,19 @@ mod scanner {
     /// outside the body it reads. A future scanner that lexes char literals
     /// properly instead of refusing them satisfies the second and is free to
     /// drop the first.
+    ///
+    /// **The property half discriminates on four of these seven rows, not on
+    /// seven**, and the claim is narrowed to that rather than restructured,
+    /// because for the other three it is genuinely satisfied without any
+    /// refusal — which is a fact about the input and not a weakness in the
+    /// test. Measured at `cfc0b33` with the refusal assertion removed: the
+    /// three closers and `b')'` failed on "the leak fell outside the body"; the
+    /// three **openers** passed, because over-running is the safe direction and
+    /// the leak stays inside the (too large) body. Those three are here for the
+    /// *diagnosis* argument two paragraphs up — one message instead of a
+    /// cascade of unrelated names — and it is the refusal assertion that
+    /// carries them. Read "the property half was checked alone" as a statement
+    /// about the test, not about every row in it.
     #[test]
     fn a_char_literal_holding_a_delimiter_cannot_truncate_a_scanned_body() {
         for src in [
@@ -1295,6 +1423,113 @@ mod scanner {
                         .any(|(_, _, body)| body.contains("leak")),
                 "scanned past a char literal in silence, and the leak fell outside \
                  the body: {src:?}"
+            );
+        }
+    }
+
+    /// **B7.** The third literal form, and — see [`strip_comments`]' closing
+    /// section — the last one there is.
+    ///
+    /// [`strip_comments`]' `in_string`/`escaped` pair is the state machine for
+    /// an *ordinary* string literal, and a raw string obeys neither of its
+    /// rules. **Two independent ways to desynchronise it, and there is a row
+    /// for each**, because an auditor who knows only the first would grep for a
+    /// trailing `\` and conclude the file was safe:
+    ///
+    /// * a `\` before the closing quote — `r"C:\"` — which the machine reads as
+    ///   an escaped quote, so the string never ends;
+    /// * an **odd number of inner `"`** — `r#"the " character"#` — which needs
+    ///   no backslash at all, and inner quotes are the entire reason anyone
+    ///   reaches for the `#` form.
+    ///
+    /// Both were measured green at `16bd876` against a real leak inserted at
+    /// redis' `remove`, the one method this repo's `CLAUDE.md` standingly tells
+    /// a bumper to check.
+    ///
+    /// The third row is the **control** for the second mechanism: an *even*
+    /// number of inner quotes re-synchronises, and the leak is then caught. It
+    /// is the measurement that shows the trigger is the parity, not the `#`.
+    ///
+    /// Each row asserts twice, as B6 does, and the second assertion here
+    /// discriminates on **five of the six rows** — every one but the control,
+    /// where the scanner happens to stay in step. Measured with the refusal
+    /// assertion removed: five failed on "the leak fell outside the body", the
+    /// control passed.
+    #[test]
+    fn a_raw_string_literal_is_reported_rather_than_desynchronising_the_scanner() {
+        for src in [
+            // Trigger 1: the trailing `\`. The `"` closing `r"C:\"` is read as
+            // escaped, so the next real `"` closes the phantom string instead
+            // and `redis://x` is left as *code* — whose `//` then blanks the
+            // rest of the line, leak and all.
+            r#"let a = r"C:\";
+let b = "redis://x"; error!(leak = %sid, "m");
+"#,
+            // Trigger 2: an odd number of inner `"`, no backslash anywhere.
+            r##"let d = r#"the " character is not legal in a key"#;
+let b = "redis://x"; error!(leak = %sid, "m");
+"##,
+            // The control for trigger 2: two inner quotes put the machine back
+            // in step, and the leak is seen. The trigger is the parity.
+            r##"let d = r#"a " b " c"#;
+let b = "redis://x"; error!(leak = %sid, "m");
+"##,
+            // The byte and C prefixes sit before the `r` and are ignored, the
+            // same way `b'"'`'s prefix is in B5.
+            r#"let a = br"C:\";
+let b = "redis://x"; error!(leak = %sid, "m");
+"#,
+            r#"let a = cr"C:\";
+let b = "redis://x"; error!(leak = %sid, "m");
+"#,
+            // Any number of hashes, which is what makes the prefix a scan for
+            // `r` `#`* `"` rather than a match on two fixed spellings. Spelled
+            // with the content that makes a second `#` necessary in the first
+            // place — an embedded `"#` — which is also an odd inner quote, so
+            // the row carries the property oracle and not only the mechanism
+            // one. `r##"x"##` was the first spelling here and does not: its
+            // quotes balance, so the scanner stays in step and the leak is
+            // seen. Measured, which is how that was found rather than assumed.
+            r###"let a = r##"contains a "# sequence"##;
+let b = "redis://x"; error!(leak = %sid, "m");
+"###,
+        ] {
+            let stripped = strip_comments(src);
+            assert_eq!(
+                stripped.unsupported,
+                vec![(1, "raw string literal")],
+                "not refused: {src:?}"
+            );
+            assert!(
+                !stripped.unsupported.is_empty()
+                    || invocations(&stripped.text)
+                        .iter()
+                        .any(|(_, _, body)| body.contains("leak")),
+                "scanned past a raw string in silence, and the leak fell outside \
+                 the body: {src:?}"
+            );
+        }
+
+        // Ordinary source that merely *contains* the two-character sequence is
+        // not refused, or the lint fails loudly on the tree it guards.
+        for src in [
+            // `r"` inside a string literal. This is a real line —
+            // `web_login_redis.rs:374` — and it is why grepping the store files
+            // for `r"` reports hits that are not raw strings.
+            "let cfg = C { master_name: \"mymaster\".into() };\n",
+            // A raw *identifier*. `r#` followed by an identifier character is
+            // not a raw string, and it cannot hide a delimiter: `r#` + ident is
+            // all it can ever be. Refusing it would be a false red on legal
+            // source for no gain, which is why the prefix scan requires the
+            // quote rather than stopping at `r#`.
+            "let r#type = 1; f(r#match);\n",
+            // A lifetime named `r`, and a char literal holding one.
+            "fn g<'r>(x: &'r str) -> &'r str { x }\n",
+            "let c = 'r';\n",
+        ] {
+            assert!(
+                strip_comments(src).unsupported.is_empty(),
+                "falsely refused: {src:?}"
             );
         }
     }
