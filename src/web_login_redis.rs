@@ -92,14 +92,22 @@ pub struct RedisSentinelConfig {
 /// numbers.
 ///
 /// **That is a change of shape rather than of digits, and it was earned.** The
-/// pair used to be quoted in this sentence, and it went stale three times, each
-/// time in the very commit that moved the lists it is derived from: `(2,940,
-/// 2,044)` when `http://` and `1bad://` joined the sweep's `SCHEMES`, and again
-/// when `unix://` did — that third occurrence landing in a sentence which had
-/// just finished warning about the first two. Writing the warning demonstrably
-/// does not prevent the recurrence. A number that has to be hand-carried to a
-/// second place has now failed at it often enough that the repair is to stop
-/// carrying it, not to word the warning better.
+/// pair used to be quoted in two prose copies — this sentence, and the sweep
+/// test's own doc comment — each time restating what the assertions already
+/// held. Committed history records the copies going out of step once, and it
+/// is worth being exact about which one, because the obvious guess is wrong:
+/// at `d46977a`, when `unix://` joined the sweep's `SCHEMES`, **this** sentence
+/// was updated to `(4,410, 2,842)` and **the sweep test's own doc comment** was
+/// the one left at `(3,920, 2,576)` — three lines above the assertions that
+/// contradicted it. Earlier `(2,940, 2,044)` episodes are referred to in the
+/// prose of that era but are not traceable in committed history, so they are
+/// described here and not counted.
+///
+/// The lesson is sharper for being attributed correctly. The stale copy was the
+/// one *nobody had listed as a copy* — the warning about carrying the number
+/// lived in the sentence that then failed to carry it. Warning harder was
+/// already the previous repair and it did not work, which is why the second
+/// copy is gone rather than reworded.
 ///
 /// The two obvious repairs are both refused. A second hand-written index rule
 /// ("the last `@` before the first `/` that follows it") is one more guess at a
@@ -1559,12 +1567,22 @@ mod redaction_tests {
     /// could ever leak would also satisfy. Running the pre-fix body over the same
     /// lists is the control that gives those greens their meaning.
     ///
-    /// And it **owns** the two figures, as the two constants above.
-    /// `redact_url_userinfo`'s doc comment used to restate them, and that copy
-    /// went stale three times — each time in the same commit that moved the lists
-    /// the numbers are derived from, and the third time in a sentence which had
-    /// just finished narrating the first two. Warning harder was tried and did
-    /// not work, so the second copy is gone rather than corrected a fourth time.
+    /// And it **owns** the two figures, as the two constants above. Two prose
+    /// copies used to restate them — `redact_url_userinfo`'s doc comment and
+    /// **this one** — and at `d46977a`, the commit that added `unix://` to the
+    /// sweep's `SCHEMES`, `redact_url_userinfo`'s copy was updated to
+    /// `(4,410, 2,842)` while **this doc comment** was left at
+    /// `(3,920, 2,576)`, three lines above the assertions that contradicted it.
+    ///
+    /// **The offender was this comment, not the other one**, and getting that
+    /// the wrong way round was itself a review finding — the first version of
+    /// this paragraph blamed `redact_url_userinfo`'s copy, which `git show
+    /// d46977a:src/web_login_redis.rs` disproves in one command. It matters
+    /// because the corrected history is the stronger argument: the copy that
+    /// went stale was the one *nobody had listed as a copy*, in the very
+    /// sentence that warned about carrying the number. That is why the repair
+    /// is one owner rather than a better warning.
+    ///
     /// If either number moves, the messages below print the derived value beside
     /// the expected one: updating the constant is then the whole repair, and
     /// there is no prose left to chase.
