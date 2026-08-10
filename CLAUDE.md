@@ -8,13 +8,22 @@ Guidance for AI assistants working on this codebase.
 
 `hs-utils` is the shared Rust utility crate for all Hikari Systems backend services. It is referenced via `git + tag` from each service's `Cargo.toml` — there is no workspace. Changes here affect every service that consumes it.
 
-Services currently using this crate:
+Data services currently using this crate:
 - `user-data-service-rs`
 - `conversation-data-service-rs`
 - `oauth2-data-service-rs`
 - `secret-service-rs`
 - `task-queue-service-rs`
 - `image-service-rs`
+
+**Controllers, which the list above does not cover.** They are the consumers of
+`web_login`, `session_store` and `controller` — the modules the data services do
+not touch — so a breaking change there reaches these repos and no others. The
+list was six data services and none of these when v0.32.0 broke all four:
+- `botsafely-controller`
+- `5drive-demo-controller`
+- `slackbot-controller`
+- `graph-d3-mcpui`
 
 ---
 
@@ -41,7 +50,31 @@ src/
 
 **Extend, don't duplicate.** If a service needs a variant of an existing function, add the variant here rather than implementing it locally. The goal is zero duplicated infrastructure code across services.
 
-**No breaking changes without a plan.** All 6 services consume this crate. Removing or renaming public items requires updating every service in the same PR/session. Adding new public items is always safe.
+**No breaking changes without a plan.** Every repo listed above consumes this crate. Removing or renaming public items requires updating each affected consumer in the same PR/session. Adding new public items is always safe.
+
+There is no CHANGELOG in this repo, so "the plan" cannot live in one. It goes in the section below — a short note per breaking release naming the signatures and, more importantly, naming the ones the compiler will **not** make a consumer look at. That distinction is what a bumper needs and cannot get from `cargo build`.
+
+---
+
+## Migrating consumers
+
+### v0.32.0 — `WebSessionStore` is fallible (HIK-241)
+
+All three trait methods changed. Any type implementing `WebSessionStore` outside this crate must change with them:
+
+```rust
+async fn load(&self, sid: &str)                     -> anyhow::Result<Option<Session>>;  // was Option<Session>
+async fn store(&self, sid: &str, session: &Session) -> anyhow::Result<()>;               // was ()
+async fn remove(&self, sid: &str)                   -> anyhow::Result<()>;               // was ()
+```
+
+`WebLogin::end_session` follows: `Option<String>` → `anyhow::Result<Option<String>>`.
+
+**`load` announces itself; `remove` does not, and that asymmetry is the whole point of this note.** A `store.load(&sid).await?` inside an `Option`-returning function stops compiling, so every call site is a build error you cannot miss. A bare `store.remove(&sid).await;` statement still compiles — it is only `unused_must_use`, a **warning**, and none of the four controller repos sets `deny(warnings)` or a `RUSTFLAGS` that would promote it. So after the bump a logout can keep answering "you are logged out" on a delete that failed, in a build whose only complaint is a line in a log nobody reads. That is the defect this release exists to remove, surviving into the first consumer that pins the fix.
+
+Grep each consumer for `.remove(` and `.store(` on a session store and rule on every hit. `botsafely-controller/src/routes/auth.rs` is the known one: it hand-rolls logout rather than calling `end_session`, so it owns the verdict itself.
+
+Posture to copy when deciding what an error costs, taken from this crate's own call sites: fail **open** where an unreadable row and an absent row deserve the same answer; fail **loud** where a write is what makes the next request work. The rule is generative and that is the point — the parenthetical list that used to sit here was the same three-site enumeration the `WebSessionStore` doc comment had just replaced for being short by `end_session`, reproduced two files away where nothing would catch it going stale again. For which sites take which, read the trait, not this. Do not read "the gate fails open" as "an outage keeps the site serving" — see `web_login::gate`.
 
 ---
 
@@ -116,7 +149,7 @@ The bounds require `actix-service` and `actix-http` as direct dependencies becau
 
 ## Common gotchas
 
-- Adding a new public function is a minor version bump (0.2.x). Removing or changing a public function is a breaking change — coordinate with all 6 services.
+- Adding a new public function is a minor version bump (0.2.x). Removing or changing a public function is a breaking change — coordinate with every consumer listed at the top of this file, and leave a note under "Migrating consumers".
 - `normalize_to_strings` converts numbers to strings, so `DbConfig.port` is always a string at deserialisation time. Don't add `port: u16` fields to `DbConfig` — keep them as `String` and parse in `build_pool`.
 - The `[SECRET]:` prefix must appear in the raw config JSON (before `prepare_config` runs). A secret reference injected via an env var override will not be resolved because `apply_env_overrides` runs after `prepare_config`.
 - `tracing::warn!` in `resolve_secrets` does not require the tracing subscriber to be initialised — messages before `logging::init` are silently dropped, which is correct behaviour.

@@ -217,12 +217,21 @@ const ALLOWED_FIELD_IDENTS: &[&str] = &["error", "message", "op", "session", "st
 /// They are startup-config and helper names, not request data, which is why they
 /// were acceptable to add — that is the standard, not "the build was red".
 ///
-/// **HIK-241 owes this list one line.** That ticket adds `anyhow` context
-/// strings to these same sites, and any binding it names that is not here will
-/// fail this test. That failure is the design working, not a defect in it: the
-/// fix is to add the *reviewed* name, with a bullet above saying why it cannot
-/// carry the sid — not to widen the list until the build is green, which is the
-/// same defeat by a friendlier route.
+/// **HIK-241 was owed a line here and needed none.** That ticket made
+/// `WebSessionStore` fallible and put an `anyhow` context string on every error
+/// branch in both stores — **thirteen** new `.context(` sites, five in
+/// `web_login_postgres.rs` and eight in `web_login_redis.rs` — and it added no
+/// name, because every one of those strings is a compile-time literal with no
+/// inline capture in it, so the scan finds no identifier in any of them. Written
+/// down rather than left implicit: the sentence this replaces sent the next
+/// reader looking for a line that was never added.
+///
+/// **The obligation itself is unchanged, which is what makes that outcome worth
+/// stating.** A site spelled `.context(format!("… {sid} …"))` names `sid` and
+/// fails this test; so does any other new binding. When that happens the fix is
+/// to add the *reviewed* name, with a bullet above saying why it cannot carry
+/// the sid — not to widen the list until the build is green, which is the same
+/// defeat by a friendlier route.
 const ALLOWED_VALUE_IDENTS: &[&str] = &[
     "as_str",
     "e",
@@ -585,12 +594,18 @@ struct Stripped {
 /// It costs nothing on plausible source. [`raw_string_starts_at`] requires the
 /// full `r` `#`* `"` prefix, so a raw *identifier* (`r#type`) is not touched —
 /// it cannot hide a delimiter, being `r#` plus an identifier and nothing else.
-/// And the `r"` that a grep for the sequence actually turns up in these files
-/// is the one inside `"mymaster".into()` (`web_login_redis.rs:374`), which sits
-/// within a string literal and so never reaches this branch at all. Measured on
-/// today's tree: 13 redis invocations and 6 postgres ones still scanned, 19 in
-/// total, and the whole `(file, line, label, body)` dump is byte-identical to
-/// `16bd876`'s.
+/// And every `r"` a grep for the sequence turns up in these files is the tail of
+/// a word inside a string literal (`"mymaster".into()`, `query.get("user")`),
+/// which never reaches this branch at all.
+///
+/// **No inventory count is quoted here, deliberately.** The sentence this
+/// replaces gave one, and HIK-241 falsified it the moment it put a `.context(`
+/// on every error branch in both stores: a numeral in an unowned comment goes
+/// stale on the next ticket that adds a logging site, which is most tickets in
+/// these two files. What this paragraph needs is only that the raw-string branch
+/// is not reached on this tree, which the observation above establishes without
+/// counting anything — and the scanner's liveness is the *test's* job, asserted
+/// per file rather than described here.
 fn strip_comments(text: &str) -> Stripped {
     let mut out = String::with_capacity(text.len());
     let mut unsupported = Vec::new();
@@ -1155,10 +1170,11 @@ fn no_tracing_or_anyhow_line_in_either_session_store_names_an_unsanctioned_bindi
         // prone to.
         //
         // **Per file, never summed.** A total across `STORES` cannot see one
-        // file go dark: postgres alone contributes six invocations, so a redis
+        // file go dark: postgres contributes invocations of its own, so a redis
         // scan that silently found nothing would still leave a healthy-looking
         // total. That matters concretely, because postgres' `malformed payload`
-        // site is one this lint is the *only* oracle for.
+        // site is one this lint is the *only* oracle for. (No count here either
+        // — see `strip_comments`' doc comment for why one does not survive.)
         //
         // Deliberately not a count, either. The assertion it replaced was
         // `>= 5`, which gave a confidently wrong diagnosis when it tripped: it

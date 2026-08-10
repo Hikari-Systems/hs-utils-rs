@@ -147,15 +147,46 @@ pub struct Session {
 
 /// Pluggable backing store for [`Session`]s, keyed by the `sid` cookie.
 ///
-/// Reads return `None` when the session is absent (or on a backend failure —
-/// stores should fail open so an outage degrades to "log in again" rather than
-/// erroring every request). Writes are best-effort. Implementations are
-/// responsible for expiry (TTL).
+/// `Ok(None)` from [`load`](WebSessionStore::load) means the session is absent;
+/// an `Err` means the backend could not be asked, which is a different thing and
+/// the caller decides what it costs. Implementations are responsible for expiry
+/// (TTL).
+///
+/// **The error is opaque.** Every implementation logs its own cause first, with
+/// HIK-236's fields (`session.store` / `session.op` / `error.message`), so a
+/// caller is not expected to inspect the value — its whole question is the
+/// boolean "did that land?". That is also why this is `anyhow::Result` and not a
+/// typed enum: an enum nobody matches on looks like a guarantee it is not making,
+/// which is the shape this signature exists to remove.
+///
+/// **Returning `()` was not "best effort", it was a claim nobody could check.**
+/// `callback` rotates the session id by storing the new row and then removing the
+/// old one, and it did both regardless of whether the first succeeded — so a
+/// store failure between them handed the browser a cookie naming a row that was
+/// never written, logging the user out at the moment they logged in and bouncing
+/// them back to the IdP.
+///
+/// Fail-open is still right where the answer to an unreadable row is the same as
+/// the answer to an absent one, and wrong where a write is what makes the next
+/// request work. **In this file the first group is every read except
+/// `callback`'s two** — the gate's, `access_token`'s, `id_token`'s and
+/// `end_session`'s, the last so that a lost `id_token_hint` cannot stop the
+/// destroy beneath it from being attempted. Stated as the rule rather than as a
+/// count, because a list of sites goes stale on the next one added and this
+/// enumeration was already short by `end_session` once. (`access_token`'s two
+/// write-backs are non-fatal for the mirror-image reason, given at the site:
+/// nothing's next request depends on them.)
+///
+/// Read that narrowly: it is a statement about individual call sites, **not** a
+/// promise that a store outage keeps a service serving. The gate's read failing
+/// open only reaches the branch below it, and on the browser tier that branch
+/// writes, fatally. The posture is per call site, and each one says which it
+/// took and why.
 #[async_trait]
 pub trait WebSessionStore: Send + Sync {
-    async fn load(&self, sid: &str) -> Option<Session>;
-    async fn store(&self, sid: &str, session: &Session);
-    async fn remove(&self, sid: &str);
+    async fn load(&self, sid: &str) -> anyhow::Result<Option<Session>>;
+    async fn store(&self, sid: &str, session: &Session) -> anyhow::Result<()>;
+    async fn remove(&self, sid: &str) -> anyhow::Result<()>;
 }
 
 /// In-process [`WebSessionStore`] (a `HashMap` with lazy TTL eviction). The
@@ -181,29 +212,34 @@ impl Default for InMemorySessionStore {
     }
 }
 
+/// Infallible in practice — a `HashMap` behind a `Mutex` has nothing to fail —
+/// so every method answers `Ok`. The signature is the trait's, which exists for
+/// the stores that reach the network.
 #[async_trait]
 impl WebSessionStore for InMemorySessionStore {
-    async fn load(&self, sid: &str) -> Option<Session> {
+    async fn load(&self, sid: &str) -> anyhow::Result<Option<Session>> {
         let mut map = self.map.lock().unwrap();
-        match map.get(sid) {
+        Ok(match map.get(sid) {
             Some((s, exp)) if *exp > Instant::now() => Some(s.clone()),
             Some(_) => {
                 map.remove(sid);
                 None
             }
             None => None,
-        }
+        })
     }
 
-    async fn store(&self, sid: &str, session: &Session) {
+    async fn store(&self, sid: &str, session: &Session) -> anyhow::Result<()> {
         self.map
             .lock()
             .unwrap()
             .insert(sid.to_string(), (session.clone(), Instant::now() + self.ttl));
+        Ok(())
     }
 
-    async fn remove(&self, sid: &str) {
+    async fn remove(&self, sid: &str) -> anyhow::Result<()> {
         self.map.lock().unwrap().remove(sid);
+        Ok(())
     }
 }
 
@@ -304,7 +340,11 @@ impl WebLogin {
     /// the TS `getAccessToken`). For consumers that need to call downstream
     /// APIs on the user's behalf; not needed for page-access checks.
     pub async fn access_token(&self, sid: &str) -> Option<String> {
-        let mut sess = self.store.load(sid).await?;
+        // Fail open, deliberately: this answers "what token may I use for this
+        // request?", and a store that cannot be read has no token to offer — the
+        // same answer as a session that does not exist. Erroring here would turn
+        // a store blip into a failure of every downstream call a consumer makes.
+        let mut sess = self.store.load(sid).await.ok().flatten()?;
         let expired = sess.expires_at.map(|e| e <= now_secs()).unwrap_or(false);
         if let Some(tok) = sess.access_token.clone() {
             if !expired {
@@ -316,14 +356,21 @@ impl WebLogin {
                 sess.access_token = Some(t.access_token.clone());
                 sess.refresh_token = t.refresh_token.clone();
                 sess.expires_at = t.expires_in.map(|e| now_secs() + e);
-                self.store.store(sid, &sess).await;
+                // Non-fatal: the token in hand is valid for this request whether
+                // or not it was persisted. A failed write costs the *next*
+                // request one more refresh, which is what a refresh token is
+                // for. The store has already logged the cause.
+                let _ = self.store.store(sid, &sess).await;
                 return Some(t.access_token);
             }
         }
         sess.access_token = None;
         sess.refresh_token = None;
         sess.expires_at = None;
-        self.store.store(sid, &sess).await;
+        // Non-fatal for the same reason in the other direction: this write only
+        // clears tokens that are already known to be stale, and the caller is
+        // told `None` whether or not it landed.
+        let _ = self.store.store(sid, &sess).await;
         None
     }
 
@@ -331,17 +378,48 @@ impl WebLogin {
     /// (`id_token_hint`). Returns `None` when there is no session or it predates
     /// id_token capture.
     pub async fn id_token(&self, sid: &str) -> Option<String> {
-        self.store.load(sid).await?.id_token
+        // Fail open: the id_token is a *hint* on the logout redirect. A store
+        // that cannot be read costs the IdP the hint, and nothing else.
+        self.store.load(sid).await.ok().flatten()?.id_token
     }
 
     /// End the session: read the `id_token` (for `id_token_hint`), remove the
     /// session from the store, and return the id_token. Use this for logout —
     /// destroy the local session, then redirect to the IdP's RP-initiated logout
     /// endpoint with the returned hint.
-    pub async fn end_session(&self, sid: &str) -> Option<String> {
-        let id_token = self.store.load(sid).await.and_then(|s| s.id_token);
-        self.store.remove(sid).await;
-        id_token
+    ///
+    /// **The `remove` propagates.** Logging out is the one operation whose whole
+    /// purpose is the write: a caller that answers "you are logged out" while the
+    /// row is still live has told the user something false about a credential
+    /// that still works. What to do about it is the caller's to decide — it is
+    /// the one holding the response — so the error travels rather than being
+    /// swallowed here.
+    pub async fn end_session(&self, sid: &str) -> anyhow::Result<Option<String>> {
+        // Fail open on the *read* only: the hint is a nicety, and failing to
+        // fetch it must not stop the destroy below from being attempted.
+        let id_token = self
+            .store
+            .load(sid)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.id_token);
+        self.store.remove(sid).await?;
+        Ok(id_token)
+    }
+
+    /// A `Set-Cookie` value that clears the session cookie, for a consumer that
+    /// destroys a session itself rather than through [`end_session`].
+    ///
+    /// It exists because building it correctly needs two things that are private
+    /// to this module: the configured cookie name, and the `Secure` decision,
+    /// which is derived from the trusted edge's `X-Forwarded-Proto` exactly as
+    /// [`WebLogin::redirect_uri`] is. A consumer outside the crate cannot reach
+    /// either, so every one of them was on course to hard-code `hs_session` and
+    /// guess at `Secure` — and a clearing cookie whose attributes do not match
+    /// the one that was set does not replace it, it sits beside it.
+    pub fn clear_cookie_header(&self, headers: &HeaderMap) -> HeaderValue {
+        build_clear_cookie(&self.cfg, request_is_https(headers))
     }
 }
 
@@ -475,6 +553,27 @@ fn build_set_cookie(cfg: &WebLoginConfig, sid: &str, secure: bool) -> HeaderValu
     HeaderValue::from_str(&s).expect("cookie header value")
 }
 
+/// The counterpart to [`build_set_cookie`]: same name, same `Path`, same
+/// `SameSite`, same `Secure`, with an empty value and `Max-Age=0` so it is
+/// dropped immediately.
+///
+/// Of those, `Path` is the one that has to match: a browser's cookie store keys
+/// on name/domain/path (RFC 6265 §5.3), so a differing `Path` adds a second
+/// cookie rather than replacing the first. `Secure` and `HttpOnly` are **not**
+/// part of that key — an earlier version of this comment said they were —
+/// they are mirrored so the clearing cookie cannot end up more permissive than
+/// the one it replaces.
+fn build_clear_cookie(cfg: &WebLoginConfig, secure: bool) -> HeaderValue {
+    let mut s = format!(
+        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+        cfg.cookie_name
+    );
+    if secure {
+        s.push_str("; Secure");
+    }
+    HeaderValue::from_str(&s).expect("cookie header value")
+}
+
 fn see_other(location: &str, set_cookie: Option<HeaderValue>) -> Response {
     let mut resp = Response::builder()
         .status(StatusCode::SEE_OTHER)
@@ -491,6 +590,38 @@ fn see_other(location: &str, set_cookie: Option<HeaderValue>) -> Response {
 
 fn bad_request(msg: &'static str) -> Response {
     (StatusCode::BAD_REQUEST, msg).into_response()
+}
+
+/// What a login step answers when it could not reach the session store.
+///
+/// **"Try logging in again", never "refresh this page".** One constant serves
+/// four sites and has to be safe at the worst of them: the two in `callback`
+/// that answer *after* the token exchange, where the authorization `code` still
+/// in the URL bar has been spent and a refresh fails at the token endpoint. It
+/// is merely unnecessary at the other two — the gate's 503 carries no `code` at
+/// all, and `callback`'s pre-exchange 503 carries an unspent one — so nothing is
+/// lost by giving the same advice everywhere.
+const STORE_UNAVAILABLE_BODY: &str =
+    "login is temporarily unavailable, please try logging in again";
+
+/// Terminal refusal for a login step whose write did not land.
+///
+/// **503, not 500**: a dependency being transiently unavailable is not a bug in
+/// handling the request, and 503 is what a load balancer and an alert read as
+/// "retry". Not 400 either — the surrounding handler already answers 400 for
+/// token-exchange and userinfo failures, which are our dependencies too, but
+/// consistency with a wrong status is not a reason to add a third instance of
+/// it.
+///
+/// **And not a redirect, in either direction — that is the load-bearing part.**
+/// Sending the browser back to the IdP means persisting a fresh `state` in the
+/// store that is down, so the next callback answers "no state found"; sending it
+/// on to its destination with no cookie means the gate bounces it straight back.
+/// Either way it is the login loop this ticket exists to remove, so failing
+/// loudly has to mean a terminal status. No `Set-Cookie` and no `Location`:
+/// nothing was written, so there is nothing for a cookie to name.
+fn store_unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, STORE_UNAVAILABLE_BODY).into_response()
 }
 
 /// Max length for an attacker-supplied value recorded on a log line.
@@ -529,29 +660,86 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
+/// The provider's redirect back to us: exchange the `code`, resolve the user,
+/// rotate the session id onto the finished session.
+///
+/// Emits one `auth.login` span — one per login, not one per store call —
+/// carrying the verdict **and its reason** (`auth.login.outcome`), plus `user.id`
+/// once there is one. This handler had no span at all, and it is the one place a
+/// login can fail eight different ways that all read as "400" from outside. The
+/// `code` and the `state` are never recorded on it: the first is a one-time
+/// credential, the second is attacker-chosen.
+///
+/// `session.op` (HIK-236's vocabulary) rides along on the `store_unavailable`
+/// outcome, because this handler reaches the store three times and the outcome
+/// alone cannot tell a read outage from a write one — different halves of the
+/// store and, on the two arms, different code paths.
+///
+/// **`skip_all` is load-bearing, not tidiness.** Without it `#[instrument]`
+/// records every argument by `Debug`: `headers` carries `cookie:
+/// hs_session=<the bearer credential>` and `q` carries the one-time `code`.
+/// `WebLogin` is not `Debug`, so `skip(wl)` compiles — and compiles *because*
+/// the other two are being recorded. `tests/login_span.rs` is what fails when
+/// someone writes it.
+#[tracing::instrument(
+    name = "auth.login",
+    skip_all,
+    fields(
+        auth.login.outcome = tracing::field::Empty,
+        session.op = tracing::field::Empty,
+        user.id = tracing::field::Empty,
+    )
+)]
 async fn callback(
     State(wl): State<WebLogin>,
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> Response {
+    let span = tracing::Span::current();
     if let Some(err) = q.error.as_deref() {
         // Already a `&str`, so the formatter escapes it — but it is still an
         // unbounded attacker-supplied query parameter, so it is capped too.
+        span.record("auth.login.outcome", "provider_error");
         tracing::warn!(error = log_safe(err).as_str(), "web_login: provider returned error");
         return bad_request("login error");
     }
     let (Some(code), Some(state_key)) = (q.code, q.state) else {
+        span.record("auth.login.outcome", "missing_code_or_state");
         return bad_request("missing code/state");
     };
     let Some(sid) = read_cookie(&headers, &wl.cfg.cookie_name) else {
+        span.record("auth.login.outcome", "no_session_cookie");
         return bad_request("no session cookie");
     };
-    let orig = wl
-        .store
-        .load(&sid)
-        .await
-        .and_then(|s| s.redirects.get(&state_key).cloned());
-    let Some(orig) = orig else {
+
+    // **Two loads, and the second one is not redundant — see the rotation
+    // below.** This one answers "is this `state` one we issued, and where was
+    // the browser going?".
+    let loaded = match wl.store.load(&sid).await {
+        Ok(s) => s,
+        Err(e) => {
+            // **The one `load` in this crate that does not fail open.**
+            // Degrading to `None` lands on the "no state found" branch below,
+            // which is the verdict for a caller who invented a `state` — so an
+            // outage of ours answered 400 and sent whoever investigated it
+            // hunting the IdP. Same misdiagnosis as the rotation defect, in the
+            // same handler.
+            span.record("auth.login.outcome", "store_unavailable");
+            span.record("session.op", "load");
+            tracing::warn!(
+                session.op = %"load",
+                auth.login.outcome = %"store_unavailable",
+                error.message = log_safe(&format!("{e:#}")).as_str(),
+                "web_login: session store unavailable, login refused"
+            );
+            return store_unavailable();
+        }
+    };
+    // Copied, not consumed: the row is re-read after the token exchange, and
+    // *that* copy is the one this flow's entry is removed from. The session read
+    // here is kept only as the fallback for a row that is gone by then.
+    let found = loaded.and_then(|s| s.redirects.get(&state_key).cloned().map(|orig| (s, orig)));
+    let Some((prior, orig)) = found else {
         // Recorded as `&str`, NOT `%state_key`. The `%` sigil formats via
         // Display, which the fmt layer passes through unescaped — so a
         // `state` containing CRLF lets an unauthenticated caller inject
@@ -559,14 +747,19 @@ async fn callback(
         // real ones. As a `&str` the formatter escapes it. Bounded too:
         // this value is attacker-chosen and otherwise unlimited, which
         // sidesteps the caps applied to `url.query` and the user agent.
+        span.record("auth.login.outcome", "no_state_found");
         tracing::warn!(state = log_safe(&state_key).as_str(), "web_login: no stored state");
         return bad_request("no state found");
     };
 
     let token = match do_token_exchange(&wl.http, &wl.cfg, &code, &wl.redirect_uri(&headers)).await {
         Ok(t) if !t.access_token.is_empty() => t,
-        Ok(_) => return bad_request("no access token in response"),
+        Ok(_) => {
+            span.record("auth.login.outcome", "no_access_token");
+            return bad_request("no access token in response");
+        }
         Err(e) => {
+            span.record("auth.login.outcome", "token_exchange_failed");
             tracing::warn!(error = log_safe(&e.to_string()).as_str(), "web_login: token exchange failed");
             return bad_request("token exchange failed");
         }
@@ -576,13 +769,16 @@ async fn callback(
     {
         Ok(v) => v,
         Err(e) => {
+            span.record("auth.login.outcome", "profile_fetch_failed");
             tracing::warn!(error = log_safe(&e.to_string()).as_str(), "web_login: userinfo fetch failed");
             return bad_request("profile fetch failed");
         }
     };
     let Some(resolved) = wl.resolver.resolve(&userinfo).await else {
+        span.record("auth.login.outcome", "user_unresolved");
         return bad_request("could not resolve user");
     };
+    span.record("user.id", resolved.user_id.as_str());
 
     // Rotate the session id across the privilege change. This handler is where
     // an anonymous row acquires a user's tokens, so keeping the id hands the
@@ -597,19 +793,149 @@ async fn callback(
     // two leaves the browser's current cookie still working rather than logging
     // the user out. Leftover `redirects` move across: a second tab mid-flow will
     // arrive here carrying the rotated cookie and must still find its own state.
+    //
+    // **That sentence was true of a crash and false of a store failure, which is
+    // the mode it names.** `store` reported nothing, so this ran the whole
+    // rotation regardless: the new row was never written, the old one was
+    // removed anyway, and the browser was sent away with a cookie naming a
+    // session that does not exist — logged out at the instant it logged in, and
+    // bounced back to the IdP by the gate, which reads as the IdP looping. The
+    // fallible signature is what makes the paragraph above true for the first
+    // time.
     let new_sid = uuid::Uuid::new_v4().to_string();
-    {
-        let mut sess = wl.store.load(&sid).await.unwrap_or_default();
-        sess.redirects.remove(&state_key);
-        sess.user_id = Some(resolved.user_id.clone());
-        sess.profile = serde_json::to_value(&resolved.profile).ok();
-        sess.access_token = Some(token.access_token);
-        sess.refresh_token = token.refresh_token;
-        sess.id_token = token.id_token;
-        sess.expires_at = token.expires_in.map(|e| now_secs() + e);
-        wl.store.store(&new_sid, &sess).await;
+    // **Re-read, rather than writing back the snapshot taken at the top of this
+    // handler.** The gap between the two reads is two IdP round trips wide, and
+    // a second tab that begins its own login inside it inserts a `state` into
+    // this very row. Writing the older copy and then removing the row would
+    // delete that entry, and tab 2's callback would come back "no state found" —
+    // a login broken by ordinary concurrency, no store failure required.
+    let mut sess = match wl.store.load(&sid).await {
+        Ok(Some(fresh)) => fresh,
+        // The row is gone between the two reads: its TTL lapsed, or another tab
+        // logged out, or another tab's callback rotated and removed it. There is
+        // nothing *fresh* to read — so the copy taken at the top of this
+        // handler, the only surviving evidence of what the row held, is what
+        // gets written, `redirects` and all. A second tab whose `state` was
+        // already on that copy still finds it under the rotated id; what is lost
+        // is only whatever reached the row after that first read.
+        //
+        // **It also RESURRECTS, and losing data is the half a reader guesses.**
+        // `sess.redirects.remove` below drops *this* callback's own `state` and
+        // nothing else, so every other entry on the snapshot is written into the
+        // authenticated row — and a snapshot cannot say whether one of them has
+        // since been **consumed** by another tab that finished first. Measured
+        // on this arm's own fixture with the two tabs' roles swapped — seeded
+        // `{st-1: /tab-one, st-2: /tab-two}`, re-read blanked, `state=st-2`
+        // instead of `st-1`: the rotated row comes back
+        // `redirects = {"st-1": "/tab-one"}`, and if tab 1 got there first that
+        // `st-1` names a state which by then exists nowhere else — its row was
+        // removed and the entry dropped from tab 1's own rotation
+        // (`a_state_stored_while_the_token_exchange_was_in_flight_survives_the_rotation`
+        // asserts both). It then lives for the row's TTL. New with the fix: at
+        // `c46e50c` this was `load(&sid).await.unwrap_or_default()` over an
+        // `Option<Session>`, so a vanished row produced `Session::default()` and
+        // the whole snapshot went.
+        //
+        // Accepted rather than fixed. Nothing in `prior` distinguishes pending
+        // from consumed, so the choice is between resurrecting some spent
+        // entries and dropping every live one — and a resurrected entry only
+        // maps a `state` to a destination: redeeming it still needs a fresh
+        // single-use `code` from the IdP, which is the IdP's to refuse.
+        //
+        // Spelled as a branch and not `unwrap_or_default()`, because that
+        // spelling swallowed the `Err` below too, which is how a store blip came
+        // to silently drop a second tab's `redirects`. Pinned by
+        // `a_row_that_vanished_between_the_two_reads_carries_the_first_read_across`.
+        Ok(None) => prior,
+        Err(e) => {
+            // Fatal, for the same reason the write below is: the next two
+            // statements write a new row and delete this one, and a re-read that
+            // failed cannot say what is being deleted. Consistent with the first
+            // `load` — and nothing has been written yet, so the old row and its
+            // `state -> orig` entry survive and a retry works.
+            span.record("auth.login.outcome", "store_unavailable");
+            span.record("session.op", "load");
+            tracing::warn!(
+                session.op = %"load",
+                auth.login.outcome = %"store_unavailable",
+                user.id = resolved.user_id.as_str(),
+                error.message = log_safe(&format!("{e:#}")).as_str(),
+                "web_login: session store unavailable, login refused"
+            );
+            return store_unavailable();
+        }
+    };
+    sess.redirects.remove(&state_key);
+    sess.user_id = Some(resolved.user_id.clone());
+    sess.profile = serde_json::to_value(&resolved.profile).ok();
+    sess.access_token = Some(token.access_token);
+    sess.refresh_token = token.refresh_token;
+    sess.id_token = token.id_token;
+    sess.expires_at = token.expires_in.map(|e| now_secs() + e);
+    if let Err(e) = wl.store.store(&new_sid, &sess).await {
+        // Fatal. The old row and its `state -> orig` entry are untouched, so a
+        // retry works the moment the store recovers.
+        //
+        // `user.id` is on this line on purpose. It is in hand at no cost, and
+        // this crate's only other span (`auth.gate`) does not cover `callback`.
+        //
+        // **Say what that buys, exactly: a store that started failing, not one
+        // that is down.** The identity exists here only because the first `load`
+        // succeeded and the token exchange and Kratos then answered. In a total
+        // outage that first read is what fails, the handler returns there, and
+        // the process never learns who the caller was — so those refusals are
+        // anonymous and carry no `user.id` at all. "Which users
+        // could not log in during the blip" is answerable for the branches past
+        // the identity and for nothing else.
+        //
+        // Recorded as a bare `&str`: it is downstream-derived (Kratos' `sub`),
+        // and `%` emits bytes raw.
+        span.record("auth.login.outcome", "store_unavailable");
+        span.record("session.op", "store");
+        tracing::warn!(
+            session.op = %"store",
+            auth.login.outcome = %"store_unavailable",
+            user.id = resolved.user_id.as_str(),
+            error.message = log_safe(&format!("{e:#}")).as_str(),
+            "web_login: session store unavailable, login refused"
+        );
+        return store_unavailable();
     }
-    wl.store.remove(&sid).await;
+    // Non-fatal: the rotation landed, so this caller *is* logged in, and
+    // refusing the login over a tidy-up delete would throw away an
+    // authentication that succeeded.
+    //
+    // What is left behind when it fails is a superseded row that lives until the
+    // store reclaims it — `DEFAULT_SESSION_TTL_SECS`, 24 h, unless the
+    // deployment built its store with another. It is **not** necessarily
+    // anonymous: `redirects` move across the rotation (above), so a second tab's
+    // callback arrives holding the *authenticated* row this handler just wrote,
+    // and rotates that. If its delete is the one that fails, the leftover
+    // carries `user_id`, the access token and the refresh token, and the cookie
+    // naming it is one the browser was given. Nothing here bounds that; the TTL
+    // does.
+    //
+    // **A failed delete is not the only producer, and this paragraph read as
+    // though it were.** Two callbacks racing on one cookie leave the same row
+    // behind with every store call succeeding: tab 1 rotates and removes the
+    // shared row while tab 2 is at the token endpoint, tab 2's re-read then
+    // finds nothing (the `Ok(None)` arm above), so it writes its own rotated row
+    // and its `remove` deletes a row that is already gone — nobody removes tab
+    // 1's, and the browser's cookie now names tab 2's. Driven, not reasoned:
+    // `two_callbacks_racing_on_one_cookie_orphan_a_row_with_no_store_failure`.
+    // Pre-existing, and not this ticket's to fix.
+    //
+    // Hence a line of its own: `error!` inside the store names the operation but
+    // not whose rotation it was, and `user.id` is in hand two statements up.
+    if let Err(e) = wl.store.remove(&sid).await {
+        tracing::warn!(
+            session.op = %"remove",
+            user.id = resolved.user_id.as_str(),
+            error.message = log_safe(&format!("{e:#}")).as_str(),
+            "web_login: rotated session stored, but the superseded row could not be removed"
+        );
+    }
+    span.record("auth.login.outcome", "success");
     tracing::debug!(user = %resolved.user_id, "web_login: login complete, redirecting to {orig}");
     see_other(
         &orig,
@@ -641,6 +967,12 @@ async fn callback(
 /// `user.id` is the current OTel semantic-convention slot for an end user's
 /// identifier. The older `enduser.*` attributes are **deprecated** — do not
 /// "correct" this back to `enduser.id`.
+///
+/// `auth.gate.session.load_failed` is a **span field and deliberately not a log
+/// line**: this path is anonymously reachable at whatever rate a caller chooses,
+/// and it exists because the read below fails open, so on the api tier an outage
+/// refuses with `outcome=refused_401 session.present=true` — byte-identical to
+/// an expired session, and a different incident.
 pub async fn gate(State(g): State<GateState>, req: Request, next: Next) -> Response {
     let span = tracing::info_span!(
         "auth.gate",
@@ -648,6 +980,8 @@ pub async fn gate(State(g): State<GateState>, req: Request, next: Next) -> Respo
         auth.gate.outcome = tracing::field::Empty,
         auth.gate.session.present = tracing::field::Empty,
         auth.gate.session.minted = tracing::field::Empty,
+        auth.gate.session.load_failed = tracing::field::Empty,
+        session.op = tracing::field::Empty,
         user.id = tracing::field::Empty,
     );
     // The request's parts, not the request itself: `Body` is not `Sync`, so
@@ -685,8 +1019,31 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
     // The whole session is kept rather than just the user it resolves to: the
     // redirect branch needs to know whether the store *recognised* this cookie,
     // and reuses the row it already has instead of reading it a second time.
+    //
+    // **Fail open, and here that is the right posture rather than a leftover.**
+    // This read decides "is this caller logged in?", and an unreadable session
+    // is indistinguishable from an absent one from the caller's side — the
+    // branches below already handle absent, so degrading to `None` costs a
+    // logged-in caller a fresh login rather than an error page.
+    //
+    // **It does not follow that a store outage keeps the site serving**, and an
+    // earlier version of this comment said so. Failing open here only reaches
+    // the *next* branch; on the browser tier that branch mints a session and
+    // writes it, and that write is fatal, so a store that is down answers 503 on
+    // every gated page. Only the api tier's 401 (below) returns before any
+    // write. Both halves are pinned by
+    // `a_store_outage_is_a_401_on_the_api_tier_and_a_503_on_the_browser_tier`.
     let loaded = match &cookie_sid {
-        Some(sid) => wl.store.load(sid).await,
+        Some(sid) => match wl.store.load(sid).await {
+            Ok(s) => s,
+            Err(_) => {
+                // Recorded on the span and **not** as a log line: this path is
+                // anonymously reachable at caller-chosen rate, and the store has
+                // already emitted its own `error!` for the cause.
+                span.record("auth.gate.session.load_failed", true);
+                None
+            }
+        },
         None => None,
     };
 
@@ -737,7 +1094,28 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
         .unwrap_or_else(|| "/".to_string());
     let state_key = uuid::Uuid::new_v4().to_string();
     sess.redirects.insert(state_key.clone(), orig);
-    wl.store.store(&sid, &sess).await;
+    if let Err(e) = wl.store.store(&sid, &sess).await {
+        // **Fatal, unlike the `load` above, and the difference is what the write
+        // is for.** `callback` reads this `state` back out of the store, so a
+        // redirect carrying one that was never persisted is *guaranteed* to come
+        // back "no state found" — a round trip spent reaching a failure already
+        // known here, with the IdP taking the blame for it. No `Location` and no
+        // `Set-Cookie`: there is no row for either to name.
+        //
+        // A `let _ =` here instead would be the "a Result nobody branches on"
+        // outcome the fallible signature exists to remove.
+        span.record("auth.gate.outcome", "store_unavailable");
+        span.record("auth.gate.session.minted", minted);
+        span.record("session.op", "store");
+        tracing::warn!(
+            session.op = %"store",
+            auth.gate.outcome = %"store_unavailable",
+            auth.gate.session.minted = minted,
+            error.message = log_safe(&format!("{e:#}")).as_str(),
+            "web_login: session store unavailable, login refused"
+        );
+        return GateDecision::Respond(store_unavailable());
+    }
     span.record("auth.gate.outcome", "redirect_to_login");
     span.record("auth.gate.session.minted", minted);
     GateDecision::Respond(see_other(&wl.authorize_url(&state_key, headers), set_cookie))
@@ -746,7 +1124,7 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::ServiceExt as _;
 
     fn cfg() -> WebLoginConfig {
@@ -798,9 +1176,12 @@ mod tests {
             id_token: Some("tok-123".into()),
             ..Default::default()
         };
-        wl.store.store("sid-1", &sess).await;
+        wl.store.store("sid-1", &sess).await.unwrap();
         assert_eq!(wl.id_token("sid-1").await.as_deref(), Some("tok-123"));
-        assert_eq!(wl.end_session("sid-1").await.as_deref(), Some("tok-123"));
+        assert_eq!(
+            wl.end_session("sid-1").await.unwrap().as_deref(),
+            Some("tok-123")
+        );
         // session is gone now
         assert!(wl.id_token("sid-1").await.is_none());
     }
@@ -862,6 +1243,58 @@ mod tests {
         assert!(!insecure.to_str().unwrap().contains("Secure"));
     }
 
+    /// A clearing cookie only replaces the one that was set when the browser
+    /// sees the same name, `Path`, `SameSite` and `Secure` — otherwise it lands
+    /// *beside* it and the session cookie survives the logout. So this is
+    /// asserted against [`build_set_cookie`]'s own output, not against a list.
+    #[test]
+    fn the_clearing_cookie_matches_the_one_it_replaces() {
+        for secure in [true, false] {
+            let set = build_set_cookie(&cfg(), "sid-1", secure);
+            let clear = build_clear_cookie(&cfg(), secure);
+            let (set, clear) = (set.to_str().unwrap(), clear.to_str().unwrap());
+
+            for attr in ["hs_session=", "HttpOnly", "SameSite=Lax", "Path=/"] {
+                assert!(set.contains(attr), "{set:?} is missing {attr}");
+                assert!(clear.contains(attr), "{clear:?} is missing {attr}");
+            }
+            assert_eq!(
+                set.contains("; Secure"),
+                clear.contains("; Secure"),
+                "Secure must match, or the browser keeps the original cookie"
+            );
+            assert!(
+                clear.contains("hs_session=;"),
+                "the value must be emptied: {clear:?}"
+            );
+            assert!(
+                clear.contains("Max-Age=0"),
+                "and expired immediately: {clear:?}"
+            );
+        }
+    }
+
+    /// `clear_cookie_header` takes `Secure` from the same place `redirect_uri`
+    /// does — the trusted edge's `X-Forwarded-Proto`. That is the half a
+    /// consumer outside this crate cannot reach, and would therefore guess at.
+    #[test]
+    fn the_clearing_cookie_takes_secure_from_the_edge() {
+        let wl = wl();
+        assert!(wl
+            .clear_cookie_header(&https_headers())
+            .to_str()
+            .unwrap()
+            .contains("Secure"));
+
+        let mut plain = HeaderMap::new();
+        plain.insert("host", "localhost:3000".parse().unwrap());
+        assert!(!wl
+            .clear_cookie_header(&plain)
+            .to_str()
+            .unwrap()
+            .contains("Secure"));
+    }
+
     #[test]
     fn request_is_https_tracks_forwarded_proto() {
         assert!(request_is_https(&https_headers()));
@@ -917,15 +1350,15 @@ mod tests {
 
     #[async_trait]
     impl WebSessionStore for CountingStore {
-        async fn load(&self, sid: &str) -> Option<Session> {
+        async fn load(&self, sid: &str) -> anyhow::Result<Option<Session>> {
             self.loads.fetch_add(1, Ordering::SeqCst);
             self.inner.load(sid).await
         }
-        async fn store(&self, sid: &str, session: &Session) {
+        async fn store(&self, sid: &str, session: &Session) -> anyhow::Result<()> {
             self.stores.fetch_add(1, Ordering::SeqCst);
             self.inner.store(sid, session).await
         }
-        async fn remove(&self, sid: &str) {
+        async fn remove(&self, sid: &str) -> anyhow::Result<()> {
             self.inner.remove(sid).await
         }
     }
@@ -1076,6 +1509,7 @@ mod tests {
             .inner
             .load(&sid)
             .await
+            .unwrap()
             .expect("the redirect branch created the row");
         assert_eq!(
             sess.redirects.get(&state_key).map(String::as_str),
@@ -1105,7 +1539,7 @@ mod tests {
         midflow
             .redirects
             .insert("state-tab-1".into(), "/dash?tab=one".into());
-        store.inner.store("sid-midflow", &midflow).await;
+        store.inner.store("sid-midflow", &midflow).await.unwrap();
 
         let resp = gated_app(store.clone(), false)
             .oneshot(
@@ -1149,6 +1583,7 @@ mod tests {
             .inner
             .load("sid-midflow")
             .await
+            .unwrap()
             .expect("the existing row is updated, not replaced");
         assert_eq!(
             sess.redirects.get("state-tab-1").map(String::as_str),
@@ -1193,7 +1628,12 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert!(
-            store.inner.load("attacker-chosen-sid").await.is_none(),
+            store
+                .inner
+                .load("attacker-chosen-sid")
+                .await
+                .unwrap()
+                .is_none(),
             "a caller-supplied session id must never become a stored key"
         );
         let cookie = resp
@@ -1213,7 +1653,7 @@ mod tests {
         assert_ne!(sid, "attacker-chosen-sid");
         uuid::Uuid::parse_str(&sid).expect("the replacement is a server-generated uuid");
         assert!(
-            store.inner.load(&sid).await.is_some(),
+            store.inner.load(&sid).await.unwrap().is_some(),
             "the state is stored under the minted id instead"
         );
     }
@@ -1224,6 +1664,25 @@ mod tests {
     /// the session-id rotation below is not observable without driving it end to
     /// end. Answers `Connection: close` so each request gets its own accept.
     fn oauth_provider_stub() -> String {
+        oauth_provider_stub_with(None)
+    }
+
+    /// Handshake for holding the token exchange open, so a test can act inside
+    /// the window it leaves. The stub announces on `arrived` that it has read a
+    /// `/token` request and then blocks on `release` before answering.
+    ///
+    /// A handshake and not a sleep: the window this opens is the whole point of
+    /// `a_state_stored_while_the_token_exchange_was_in_flight_survives_the_rotation`,
+    /// and a timed one turns that test into a race whose green means "the timer
+    /// was long enough today". `arrived` is a tokio channel because the test
+    /// awaits it on a current-thread runtime; `release` is a std one because the
+    /// stub's own OS thread blocks on it.
+    struct TokenGate {
+        arrived: tokio::sync::mpsc::UnboundedSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    fn oauth_provider_stub_with(gate: Option<TokenGate>) -> String {
         use std::io::{BufRead, BufReader, Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1255,7 +1714,16 @@ mod tests {
                 }
 
                 let json = if path.starts_with("/token") {
-                    r#"{"access_token":"at-1","token_type":"bearer","expires_in":3600,"id_token":"idt-1"}"#
+                    if let Some(g) = gate.as_ref() {
+                        let _ = g.arrived.send(());
+                        let _ = g.release.recv();
+                    }
+                    // The `refresh_token` is here so the leftover-row tests can
+                    // assert it rather than describe it: it is the part of an
+                    // orphaned session that outlives the access token's hour,
+                    // and a doc comment naming it while nothing drove it is the
+                    // claim-without-evidence this ticket keeps failing on.
+                    r#"{"access_token":"at-1","refresh_token":"rt-1","token_type":"bearer","expires_in":3600,"id_token":"idt-1"}"#
                 } else {
                     r#"{"sub":"kratos-identity-9"}"#
                 };
@@ -1291,7 +1759,7 @@ mod tests {
         let mut seeded = Session::default();
         seeded.redirects.insert("st-1".into(), "/dash?tab=runs".into());
         seeded.redirects.insert("st-2".into(), "/other".into());
-        store.inner.store("pre-login-sid", &seeded).await;
+        store.inner.store("pre-login-sid", &seeded).await.unwrap();
 
         // `fallback: false` keeps the resolver off the network entirely: with no
         // fallback it never fetches, so the unroutable admin URL is never used.
@@ -1339,13 +1807,14 @@ mod tests {
         assert!(cookie.contains("Secure"), "the edge was HTTPS");
 
         assert!(
-            store.inner.load("pre-login-sid").await.is_none(),
+            store.inner.load("pre-login-sid").await.unwrap().is_none(),
             "the pre-login id must not survive the privilege change"
         );
         let sess = store
             .inner
             .load(&new_sid)
             .await
+            .unwrap()
             .expect("the session moved to the rotated id");
         assert_eq!(sess.user_id.as_deref(), Some("kratos-identity-9"));
         assert_eq!(sess.access_token.as_deref(), Some("at-1"));
@@ -1360,6 +1829,791 @@ mod tests {
         );
     }
 
+    // ─── A store that is down (HIK-241) ────────────────────────────────────
+
+    /// A [`WebSessionStore`] whose three methods fail **independently**, and
+    /// which delegates to the real in-memory store whenever it is not failing.
+    ///
+    /// The independence is the design of these tests, not a convenience. Fail
+    /// `remove` as well as `store` in
+    /// `a_rotation_that_could_not_be_stored_keeps_the_old_session` and its
+    /// oracle — "the superseded row is still there" — goes **green against the
+    /// unfixed code**: the row survives because the DELETE never landed, not
+    /// because the handler declined to issue one. Only a real `remove` under a
+    /// failing `store` tells those two apart.
+    ///
+    /// **`load` also misbehaves by call number, and that is what reaches
+    /// `callback`'s second read.** `fail_load` is a latch with no counter, so it
+    /// fails the *first* `load` and the handler answers 503 before the token
+    /// exchange — the re-read after it is unreachable under that fixture, which
+    /// is why two of its three arms were asserted by nothing. The two `*_nth`
+    /// fields name a 1-based call index instead; `0`, the default, matches no
+    /// call, so the two tests that set `fail_load` —
+    /// `a_store_outage_is_a_401_on_the_api_tier_and_a_503_on_the_browser_tier`
+    /// and `a_store_outage_at_the_callback_is_not_reported_as_a_bogus_state` —
+    /// keep exactly the behaviour they were written against. Named rather than
+    /// counted, per this file's own habit: a numeral here read neither the
+    /// latch's setters nor the tests built on `FailingStore`, and matched
+    /// nothing. The count is per store rather than per request: a test driving
+    /// two callbacks through one store is counting both.
+    struct FailingStore {
+        inner: InMemorySessionStore,
+        fail_load: AtomicBool,
+        fail_store: AtomicBool,
+        fail_remove: AtomicBool,
+        /// Every `load`, whatever it went on to answer.
+        load_calls: AtomicUsize,
+        /// 1-based index of the `load` that returns `Err`; `0` never matches.
+        fail_load_nth: AtomicUsize,
+        /// 1-based index of the `load` that returns `Ok(None)` — the row is gone
+        /// rather than unreadable. `0` never matches.
+        blank_load_nth: AtomicUsize,
+        /// Every call, whether or not it was allowed to write.
+        store_attempts: AtomicUsize,
+        /// Only the calls that actually reached the inner map.
+        store_writes: AtomicUsize,
+    }
+
+    impl FailingStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemorySessionStore::default(),
+                fail_load: AtomicBool::new(false),
+                fail_store: AtomicBool::new(false),
+                fail_remove: AtomicBool::new(false),
+                load_calls: AtomicUsize::new(0),
+                fail_load_nth: AtomicUsize::new(0),
+                blank_load_nth: AtomicUsize::new(0),
+                store_attempts: AtomicUsize::new(0),
+                store_writes: AtomicUsize::new(0),
+            }
+        }
+        fn fail(&self, which: &AtomicBool) {
+            which.store(true, Ordering::SeqCst);
+        }
+        fn fail_load_on_call(&self, nth: usize) {
+            self.fail_load_nth.store(nth, Ordering::SeqCst);
+        }
+        fn blank_load_on_call(&self, nth: usize) {
+            self.blank_load_nth.store(nth, Ordering::SeqCst);
+        }
+        fn store_attempts(&self) -> usize {
+            self.store_attempts.load(Ordering::SeqCst)
+        }
+        fn store_writes(&self) -> usize {
+            self.store_writes.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl WebSessionStore for FailingStore {
+        async fn load(&self, sid: &str) -> anyhow::Result<Option<Session>> {
+            let nth = self.load_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_load.load(Ordering::SeqCst)
+                || nth == self.fail_load_nth.load(Ordering::SeqCst)
+            {
+                anyhow::bail!("session store load failed (test)");
+            }
+            if nth == self.blank_load_nth.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            self.inner.load(sid).await
+        }
+        async fn store(&self, sid: &str, session: &Session) -> anyhow::Result<()> {
+            self.store_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail_store.load(Ordering::SeqCst) {
+                anyhow::bail!("session store write failed (test)");
+            }
+            self.store_writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.store(sid, session).await
+        }
+        async fn remove(&self, sid: &str) -> anyhow::Result<()> {
+            if self.fail_remove.load(Ordering::SeqCst) {
+                anyhow::bail!("session store delete failed (test)");
+            }
+            self.inner.remove(sid).await
+        }
+    }
+
+    /// `callback` wired to the stub provider and a caller-supplied store, with
+    /// the Kratos resolver kept off the network (`fallback: false` never
+    /// fetches, so the unroutable admin URL is never dialled).
+    fn callback_app(store: Arc<FailingStore>) -> Router {
+        callback_app_at(store, oauth_provider_stub())
+    }
+
+    fn callback_app_at(store: Arc<FailingStore>, base: String) -> Router {
+        let mut c = cfg();
+        c.token_url = format!("{base}/token");
+        c.profile_url = format!("{base}/userinfo");
+        let resolver = Arc::new(KratosUserResolver::new(
+            "http://kratos.invalid:4434",
+            "https://hikari-systems.com/",
+            false,
+        ));
+        WebLogin::with_store(c, resolver, store).callback_router()
+    }
+
+    /// The provider's redirect back to us, carrying the pre-login cookie.
+    fn callback_request() -> Request {
+        callback_request_with("pre-login-sid", "st-1")
+    }
+
+    fn callback_request_with(sid: &str, state: &str) -> Request {
+        Request::builder()
+            .method("GET")
+            .uri(format!("/oauth2/callback?code=auth-code&state={state}"))
+            .header(header::COOKIE, format!("hs_session={sid}"))
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-host", "app.example.com")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// The `hs_session` value a `Set-Cookie` names.
+    fn cookie_sid(resp: &Response) -> String {
+        resp.headers()
+            .get(header::SET_COOKIE)
+            .expect("a rotated id is useless unless the browser is told about it")
+            .to_str()
+            .unwrap()
+            .strip_prefix("hs_session=")
+            .expect("cookie names the session")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    /// A rotation whose new row could not be written must not drop the old one.
+    ///
+    /// `store` is best-effort and reports nothing, so `callback` ran the whole
+    /// rotation regardless: the new row was never written, the old row was
+    /// removed anyway, and the browser was handed a cookie naming a session that
+    /// does not exist — logged out at the moment it just logged in, then bounced
+    /// back to the IdP by the gate.
+    ///
+    /// **The four assertions do not carry equal weight**, and the next reader
+    /// should not assume they do:
+    ///
+    /// | # | assertion | against the unfixed code |
+    /// |---|-----------|--------------------------|
+    /// | 1 | the old row still exists | **RED — this is the oracle** |
+    /// | 2 | no new row: one write attempted, zero succeeded | GREEN — non-discriminating by construction; it is here to stop a "fix" that writes twice |
+    /// | 3 | no `Set-Cookie` | RED |
+    /// | 4 | 503 + the fixed body | RED, but weakest — a "fix" that 503s *and still removes the row* passes 4 and fails 1 |
+    #[tokio::test]
+    async fn a_rotation_that_could_not_be_stored_keeps_the_old_session() {
+        let store = Arc::new(FailingStore::new());
+        let mut seeded = Session::default();
+        seeded
+            .redirects
+            .insert("st-1".into(), "/dash?tab=runs".into());
+        store.inner.store("pre-login-sid", &seeded).await.unwrap();
+        store.fail(&store.fail_store);
+
+        let resp = callback_app(store.clone())
+            .oneshot(callback_request())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let set_cookie = resp.headers().get(header::SET_COOKIE).cloned();
+
+        // 1 — the oracle.
+        assert!(
+            store.inner.load("pre-login-sid").await.unwrap().is_some(),
+            "the row the browser's cookie still names must survive a rotation \
+             that could not be written"
+        );
+        // 2 — green either way; it fails a fix that retries or double-writes.
+        assert_eq!(store.store_attempts(), 1, "exactly one write attempted");
+        assert_eq!(store.store_writes(), 0, "and none of them landed");
+        // 3
+        assert!(
+            set_cookie.is_none(),
+            "no cookie may be issued for a row that was not written"
+        );
+        // 4
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_text(resp).await,
+            "login is temporarily unavailable, please try logging in again",
+            "the OAuth code was spent by the token exchange, so refreshing this \
+             URL fails at the token endpoint — the body must say to log in again"
+        );
+    }
+
+    /// The other half of the truth table: a rotation that *was* written must
+    /// still succeed when only the tidy-up delete fails. Refusing the login
+    /// there would throw away an authentication that had already completed.
+    ///
+    /// It says nothing about what the leftover row *is*; that is the test below,
+    /// and the two disagreed for a review round.
+    #[tokio::test]
+    async fn a_rotation_whose_tidy_up_delete_failed_is_still_a_login() {
+        let store = Arc::new(FailingStore::new());
+        let mut seeded = Session::default();
+        seeded
+            .redirects
+            .insert("st-1".into(), "/dash?tab=runs".into());
+        store.inner.store("pre-login-sid", &seeded).await.unwrap();
+        store.fail(&store.fail_remove);
+
+        let resp = callback_app(store.clone())
+            .oneshot(callback_request())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/dash?tab=runs"
+        );
+        let new_sid = cookie_sid(&resp);
+        assert_eq!(
+            store
+                .inner
+                .load(&new_sid)
+                .await
+                .unwrap()
+                .expect("the rotated row was written")
+                .user_id
+                .as_deref(),
+            Some("kratos-identity-9")
+        );
+        assert!(
+            store.inner.load("pre-login-sid").await.unwrap().is_some(),
+            "the delete failed, so the old row is still there"
+        );
+    }
+
+    /// **The row a failed tidy-up leaves behind can be an authenticated
+    /// session.** The comment on that `remove` used to say the opposite — that
+    /// the leftover is anonymous, so it authenticates nobody — and that claim
+    /// was the whole justification for the delete being silent as well as
+    /// non-fatal.
+    ///
+    /// It is false on the multi-tab path this module documents as ordinary, and
+    /// this test drives that path rather than describing it: two tabs each start
+    /// a login against one row, and the *second* callback is the one whose
+    /// delete fails. By then the row it is rotating is the row the first
+    /// callback wrote — `user_id`, access token, refresh token and the second
+    /// tab's still-pending `state`, all on it.
+    ///
+    /// The refresh token is the part that outlives the obvious reasoning: the
+    /// leftover can mint fresh access tokens long after the one on it expires,
+    /// for as long as the store keeps the row — `DEFAULT_SESSION_TTL_SECS`,
+    /// 24 h, which is what `PgSessionStore::from_pool` builds with. It is
+    /// asserted below rather than merely said: the stub issues one, so a
+    /// rotation that dropped it would be red here.
+    ///
+    /// Seeding a hand-built authenticated row would assert the same thing more
+    /// cheaply and prove less — the question is whether *this code* produces
+    /// one, and it does.
+    #[tokio::test]
+    async fn the_row_a_failed_tidy_up_leaves_behind_can_be_an_authenticated_session() {
+        let store = Arc::new(FailingStore::new());
+        let mut seeded = Session::default();
+        seeded.redirects.insert("st-1".into(), "/tab-one".into());
+        seeded.redirects.insert("st-2".into(), "/tab-two".into());
+        store.inner.store("pre-login-sid", &seeded).await.unwrap();
+        let app = callback_app(store.clone());
+
+        // Tab 1 finishes its login. Its rotation succeeds outright, and carries
+        // tab 2's pending `state` onto the new, now authenticated, row.
+        let first = app
+            .clone()
+            .oneshot(callback_request_with("pre-login-sid", "st-1"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::SEE_OTHER);
+        let sid_after_tab_one = cookie_sid(&first);
+
+        // Tab 2 comes back carrying the rotated cookie — the browser has one
+        // cookie jar, so this is what a real second tab sends. This time the
+        // tidy-up delete is the one that fails.
+        store.fail(&store.fail_remove);
+        let second = app
+            .oneshot(callback_request_with(&sid_after_tab_one, "st-2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::SEE_OTHER,
+            "the second tab logged in too — only its tidy-up failed"
+        );
+        assert_ne!(cookie_sid(&second), sid_after_tab_one, "and it rotated");
+
+        let leftover = store
+            .inner
+            .load(&sid_after_tab_one)
+            .await
+            .unwrap()
+            .expect("the delete failed, so the superseded row is still there");
+        assert_eq!(
+            leftover.user_id.as_deref(),
+            Some("kratos-identity-9"),
+            "the superseded row is NOT anonymous: it is a live authenticated \
+             session under a cookie value the browser was given"
+        );
+        assert_eq!(leftover.access_token.as_deref(), Some("at-1"));
+        assert_eq!(
+            leftover.refresh_token.as_deref(),
+            Some("rt-1"),
+            "and the refresh token is on it, which is what makes the leftover \
+             outlive the access token's expiry"
+        );
+    }
+
+    /// **A failed delete is not the only way to leave one behind.** Two
+    /// callbacks racing on one cookie produce the same authenticated leftover
+    /// with every store call succeeding, which is what the comment on that
+    /// `remove` would otherwise read as ruling out.
+    ///
+    /// Tab 2 reads the shared row, then goes to the token endpoint. Tab 1
+    /// finishes inside that window: it rotates and *removes* the shared row.
+    /// Tab 2's re-read therefore finds nothing, so it writes its own rotated row
+    /// from the copy it read at the top, and its `remove` deletes a row that is
+    /// already gone. Nobody removes tab 1's row, and the browser's cookie now
+    /// names tab 2's — so tab 1's session is orphaned with its tokens intact
+    /// until the TTL reclaims it.
+    ///
+    /// Two provider stubs over one store, because the gated stub serves its
+    /// connections on a single thread: tab 1 cannot reach a token endpoint that
+    /// tab 2 is blocking. A handshake rather than a timer, for the reason
+    /// [`TokenGate`] gives.
+    ///
+    /// Pre-existing behaviour, and deliberately not fixed here — it is driven so
+    /// the sentence describing it is falsifiable.
+    #[tokio::test]
+    async fn two_callbacks_racing_on_one_cookie_orphan_a_row_with_no_store_failure() {
+        let (arrived_tx, mut arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gated = oauth_provider_stub_with(Some(TokenGate {
+            arrived: arrived_tx,
+            release: release_rx,
+        }));
+
+        let store = Arc::new(FailingStore::new());
+        let mut seeded = Session::default();
+        seeded.redirects.insert("st-1".into(), "/tab-one".into());
+        seeded.redirects.insert("st-2".into(), "/tab-two".into());
+        store.inner.store("pre-login-sid", &seeded).await.unwrap();
+
+        let tab_two = callback_app_at(store.clone(), gated);
+        let tab_one = callback_app_at(store.clone(), oauth_provider_stub());
+
+        let two = tokio::spawn(async move {
+            tab_two
+                .oneshot(callback_request_with("pre-login-sid", "st-2"))
+                .await
+                .unwrap()
+        });
+        arrived_rx
+            .recv()
+            .await
+            .expect("tab 2 has read the row and is at the token endpoint");
+
+        let one = tab_one
+            .oneshot(callback_request_with("pre-login-sid", "st-1"))
+            .await
+            .unwrap();
+        assert_eq!(one.status(), StatusCode::SEE_OTHER);
+        let sid_one = cookie_sid(&one);
+        assert!(
+            store.inner.load("pre-login-sid").await.unwrap().is_none(),
+            "tab 1's rotation removed the shared row — that is the precondition \
+             for tab 2's re-read finding nothing"
+        );
+
+        release_tx.send(()).expect("let tab 2's exchange answer");
+        let two = two.await.unwrap();
+        assert_eq!(two.status(), StatusCode::SEE_OTHER);
+        let sid_two = cookie_sid(&two);
+        assert_ne!(
+            sid_two, sid_one,
+            "the browser's cookie now names tab 2's row"
+        );
+
+        // No fixture failure is configured, and this is what says so: every
+        // write that was attempted landed. Without it the leftover could be read
+        // as a store blip after all.
+        assert_eq!(
+            store.store_attempts(),
+            store.store_writes(),
+            "no store call failed — the leftover is ordinary concurrency"
+        );
+
+        let orphan = store
+            .inner
+            .load(&sid_one)
+            .await
+            .unwrap()
+            .expect("nothing removed tab 1's rotated row");
+        assert_eq!(orphan.user_id.as_deref(), Some("kratos-identity-9"));
+        assert_eq!(orphan.access_token.as_deref(), Some("at-1"));
+        assert_eq!(orphan.refresh_token.as_deref(), Some("rt-1"));
+    }
+
+    /// A `state` written while the token exchange was in flight must survive the
+    /// rotation.
+    ///
+    /// The window is two IdP round trips wide and a second tab lands in it
+    /// routinely: its gate inserts a `state` into the row this callback is about
+    /// to rotate. Collapse `callback`'s two loads into one and the row written
+    /// under the new id is a snapshot taken *before* that insert, while
+    /// `remove(&sid)` deletes the row that held it — so tab 2 comes back to
+    /// `400 no state found`. No store failure required; ordinary concurrency is
+    /// enough, which is why this is a regression test and not a hardening one.
+    ///
+    /// The window is opened by a handshake with the provider stub rather than by
+    /// a timer, so the interleaving is the same on every run and on a loaded
+    /// machine.
+    #[tokio::test]
+    async fn a_state_stored_while_the_token_exchange_was_in_flight_survives_the_rotation() {
+        let (arrived_tx, mut arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let base = oauth_provider_stub_with(Some(TokenGate {
+            arrived: arrived_tx,
+            release: release_rx,
+        }));
+
+        let store = Arc::new(FailingStore::new());
+        let mut seeded = Session::default();
+        seeded.redirects.insert("st-1".into(), "/tab-one".into());
+        store.inner.store("pre-login-sid", &seeded).await.unwrap();
+
+        let app = callback_app_at(store.clone(), base);
+        let call = tokio::spawn(async move { app.oneshot(callback_request()).await.unwrap() });
+
+        // Tab 2's gate, mid-exchange: read the row, add its state, write it back.
+        arrived_rx.recv().await.expect("the token exchange started");
+        let mut mid = store
+            .inner
+            .load("pre-login-sid")
+            .await
+            .unwrap()
+            .expect("tab 1's row");
+        mid.redirects.insert("st-2".into(), "/tab-two".into());
+        store.inner.store("pre-login-sid", &mid).await.unwrap();
+        release_tx.send(()).expect("let the exchange answer");
+
+        let resp = call.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let new_sid = cookie_sid(&resp);
+
+        // Without this the assertion below could be satisfied by a rotation that
+        // never removed anything, which is a different bug passing this test.
+        assert!(
+            store.inner.load("pre-login-sid").await.unwrap().is_none(),
+            "the rotation still drops the old row"
+        );
+        let sess = store
+            .inner
+            .load(&new_sid)
+            .await
+            .unwrap()
+            .expect("the rotated row");
+        assert_eq!(
+            sess.redirects.get("st-2").map(String::as_str),
+            Some("/tab-two"),
+            "a login started while this one was at the token endpoint must not \
+             be deleted by this one's rotation"
+        );
+        assert!(!sess.redirects.contains_key("st-1"), "st-1 was consumed");
+    }
+
+    /// The re-read's `Err` arm: a rotation whose second `load` could not be made
+    /// leaves the old row alone, so the retry the 503 asks for works.
+    ///
+    /// **`fail_load` cannot reach this branch**, which is why it went untested
+    /// through two review rounds: that latch has no call counter, so it fails
+    /// the read at the top of the handler and returns before the token exchange.
+    /// `fail_load_on_call(2)` is the whole difference.
+    ///
+    /// The oracle is the surviving row, not the status. Collapse the three arms
+    /// to `wl.store.load(&sid).await.unwrap_or_default().unwrap_or(prior)` — the
+    /// spelling this branch exists to refuse — and the handler swallows the
+    /// error, rotates on the stale copy and deletes the row the browser is still
+    /// holding a cookie for.
+    #[tokio::test]
+    async fn a_re_read_that_could_not_be_made_leaves_the_old_row_for_the_retry() {
+        let store = Arc::new(FailingStore::new());
+        let mut seeded = Session::default();
+        seeded
+            .redirects
+            .insert("st-1".into(), "/dash?tab=runs".into());
+        store.inner.store("pre-login-sid", &seeded).await.unwrap();
+        store.fail_load_on_call(2);
+
+        let resp = callback_app(store.clone())
+            .oneshot(callback_request())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let set_cookie = resp.headers().get(header::SET_COOKIE).cloned();
+
+        // 1 — the oracle. A re-read that failed cannot say what is being
+        // deleted, and nothing has been written yet, so both must be intact.
+        let old = store
+            .inner
+            .load("pre-login-sid")
+            .await
+            .unwrap()
+            .expect("the row the browser's cookie still names must survive");
+        assert_eq!(
+            old.redirects.get("st-1").map(String::as_str),
+            Some("/dash?tab=runs"),
+            "a retry needs the `state -> orig` entry, not just the row"
+        );
+        // 2 — and the rotation really did stop before writing, rather than
+        // writing a row and then refusing.
+        assert_eq!(store.store_attempts(), 0);
+        assert_eq!(store.store_writes(), 0);
+        // 3
+        assert!(
+            set_cookie.is_none(),
+            "no cookie may be issued for a rotation that did not happen"
+        );
+        // 4
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The re-read's `Ok(None)` arm: the row is *gone* rather than unreadable —
+    /// its TTL lapsed, or another tab's callback removed it — and the copy read
+    /// at the top of the handler is what gets written, `redirects` included.
+    ///
+    /// So a second tab whose `state` was already on that copy still finds it
+    /// under the rotated id. `Ok(None) => Session::default()` is the mutation
+    /// this discriminates against, and it is the natural "there is nothing to
+    /// carry across" reading of the branch.
+    ///
+    /// It does **not** discriminate against `unwrap_or_default().unwrap_or(prior)`,
+    /// and no test can: on this arm that spelling computes the same value. What
+    /// it gets wrong is the `Err` arm, which the test above owns.
+    #[tokio::test]
+    async fn a_row_that_vanished_between_the_two_reads_carries_the_first_read_across() {
+        let store = Arc::new(FailingStore::new());
+        let mut seeded = Session::default();
+        seeded.redirects.insert("st-1".into(), "/tab-one".into());
+        seeded.redirects.insert("st-2".into(), "/tab-two".into());
+        store.inner.store("pre-login-sid", &seeded).await.unwrap();
+        store.blank_load_on_call(2);
+
+        let resp = callback_app(store.clone())
+            .oneshot(callback_request())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let new_sid = cookie_sid(&resp);
+
+        let sess = store
+            .inner
+            .load(&new_sid)
+            .await
+            .unwrap()
+            .expect("the rotated row was written");
+        assert_eq!(
+            sess.redirects.get("st-2").map(String::as_str),
+            Some("/tab-two"),
+            "the only evidence of what the row held is the first read, so a \
+             second tab's pending state has to come across from there"
+        );
+        assert!(
+            !sess.redirects.contains_key("st-1"),
+            "the consumed state is still dropped"
+        );
+        assert_eq!(
+            sess.user_id.as_deref(),
+            Some("kratos-identity-9"),
+            "and it is a login, not a half-written row"
+        );
+    }
+
+    /// What a store outage actually costs, per tier — the sentence this crate's
+    /// doc comments keep getting wrong, which is why both store headers now
+    /// point a reader here instead of restating it. (No count: the previous one
+    /// was stale within the round that wrote it, and this is the doc comment
+    /// those headers send you to.)
+    ///
+    /// The gate's `load` fails open, which is easy to read as "an outage
+    /// degrades to logging in again, never an error page". It does not: failing
+    /// open only reaches the *next* branch. On the api tier that branch is the
+    /// 401 and returns before any write, so the fail-open really is the whole
+    /// story. On the browser tier it mints a session and writes it, and that
+    /// write is fatal — so every gated page is a 503 for as long as the store is
+    /// down. Worth knowing before someone plans a maintenance window on the
+    /// strength of the prose.
+    #[tokio::test]
+    async fn a_store_outage_is_a_401_on_the_api_tier_and_a_503_on_the_browser_tier() {
+        let tier = |fail_fast: bool| async move {
+            let store = Arc::new(FailingStore::new());
+            store.fail(&store.fail_load);
+            store.fail(&store.fail_store);
+            let resolver = Arc::new(KratosUserResolver::new(
+                "http://kratos:4434",
+                "https://hikari-systems.com/",
+                true,
+            ));
+            let wl = WebLogin::with_store(cfg(), resolver, store.clone());
+            let app = Router::new().route("/dash", get(|| async { "ok" })).layer(
+                axum::middleware::from_fn_with_state(wl.gate_state(fail_fast), gate),
+            );
+            app.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/dash")
+                    // A cookie, so the failing `load` is actually reached — the
+                    // gate does not ask the store about a request with none.
+                    .header(header::COOKIE, "hs_session=some-live-session")
+                    .header("x-forwarded-proto", "https")
+                    .header("x-forwarded-host", "app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        assert_eq!(
+            tier(true).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "the api tier returns before the write, so the fail-open read is the \
+             whole story there"
+        );
+        assert_eq!(
+            tier(false).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the browser tier writes a state before redirecting, and that write \
+             is fatal — an outage is a 503 per gated page, not a login bounce"
+        );
+    }
+
+    /// The gate's own write is fatal too. A `state` that was never persisted
+    /// guarantees the round trip comes back "no state found", so sending the
+    /// browser to the IdP anyway buys a slower failure and blames the IdP for
+    /// it.
+    ///
+    /// Asserts on the **absence of a `Location`** as well as the status: a 303
+    /// carrying the authorize URL is exactly what the unfixed code answers.
+    #[tokio::test]
+    async fn the_gate_refuses_to_start_a_login_it_could_not_store() {
+        let store = Arc::new(FailingStore::new());
+        store.fail(&store.fail_store);
+
+        let resolver = Arc::new(KratosUserResolver::new(
+            "http://kratos:4434",
+            "https://hikari-systems.com/",
+            true,
+        ));
+        let wl = WebLogin::with_store(cfg(), resolver, store.clone());
+        let app = Router::new().route("/dash", get(|| async { "ok" })).layer(
+            axum::middleware::from_fn_with_state(wl.gate_state(false), gate),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/dash")
+                    .header("x-forwarded-proto", "https")
+                    .header("x-forwarded-host", "app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().get(header::LOCATION).is_none(),
+            "a redirect to the IdP with an unstored state is a login loop"
+        );
+        assert!(
+            resp.headers().get(header::SET_COOKIE).is_none(),
+            "no cookie for a row that was not written"
+        );
+        assert_eq!(store.store_writes(), 0);
+    }
+
+    /// Logging out is the one operation whose whole purpose is the write, so a
+    /// destroy that did not happen must reach the caller — it is the one holding
+    /// the response, and answering "you are logged out" while the row is still
+    /// live is a false statement about a credential that still works.
+    ///
+    /// The `id_token` read stays fail-open, which is why this seeds one and
+    /// leaves `fail_load` off: the hint is a nicety, and losing it must not stop
+    /// the destroy from being attempted.
+    #[tokio::test]
+    async fn a_logout_whose_delete_failed_is_reported_to_the_caller() {
+        let store = Arc::new(FailingStore::new());
+        let resolver = Arc::new(KratosUserResolver::new(
+            "http://kratos:4434",
+            "https://hikari-systems.com/",
+            true,
+        ));
+        let wl = WebLogin::with_store(cfg(), resolver, store.clone());
+        let sess = Session {
+            id_token: Some("tok-123".into()),
+            ..Default::default()
+        };
+        store.inner.store("sid-1", &sess).await.unwrap();
+
+        assert_eq!(
+            wl.end_session("sid-1").await.unwrap().as_deref(),
+            Some("tok-123"),
+            "the healthy path is unchanged"
+        );
+
+        store.inner.store("sid-2", &sess).await.unwrap();
+        store.fail(&store.fail_remove);
+        assert!(
+            wl.end_session("sid-2").await.is_err(),
+            "a session that is still live must not be reported as destroyed"
+        );
+        assert!(
+            store.inner.load("sid-2").await.unwrap().is_some(),
+            "and it really is still live — otherwise this asserts nothing"
+        );
+    }
+
+    /// A store outage at `callback`'s read must not read as a bogus `state`.
+    ///
+    /// `load` failed open into `None`, which lands on the same branch as a
+    /// caller who invented a `state` — so an outage answered `400 no state
+    /// found` and sent whoever investigated it hunting the IdP for our own
+    /// dependency being down. Same misdiagnosis as the headline defect, in the
+    /// same handler.
+    #[tokio::test]
+    async fn a_store_outage_at_the_callback_is_not_reported_as_a_bogus_state() {
+        let store = Arc::new(FailingStore::new());
+        let mut seeded = Session::default();
+        seeded
+            .redirects
+            .insert("st-1".into(), "/dash?tab=runs".into());
+        store.inner.store("pre-login-sid", &seeded).await.unwrap();
+        store.fail(&store.fail_load);
+
+        let resp = callback_app(store.clone())
+            .oneshot(callback_request())
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        assert_eq!(
+            body_text(resp).await,
+            "login is temporarily unavailable, please try logging in again"
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     /// An already-logged-in request passes through untouched: the store is read
     /// once to resolve the user and never written, and no cookie is re-issued.
     #[tokio::test]
@@ -1370,7 +2624,7 @@ mod tests {
             ..Default::default()
         };
         // Seeded through `inner` so the counters start at zero.
-        store.inner.store("sid-live", &sess).await;
+        store.inner.store("sid-live", &sess).await.unwrap();
 
         let resp = gated_app(store.clone(), true)
             .oneshot(
@@ -1392,22 +2646,22 @@ mod tests {
     #[tokio::test]
     async fn in_memory_store_roundtrip_and_expiry() {
         let store = InMemorySessionStore::new(Duration::from_secs(60));
-        assert!(store.load("sid").await.is_none());
+        assert!(store.load("sid").await.unwrap().is_none());
         let mut s = Session {
             user_id: Some("u1".into()),
             ..Default::default()
         };
         s.redirects.insert("st".into(), "/orig".into());
-        store.store("sid", &s).await;
-        let got = store.load("sid").await.expect("present");
+        store.store("sid", &s).await.unwrap();
+        let got = store.load("sid").await.unwrap().expect("present");
         assert_eq!(got.user_id.as_deref(), Some("u1"));
         assert_eq!(got.redirects.get("st").map(String::as_str), Some("/orig"));
-        store.remove("sid").await;
-        assert!(store.load("sid").await.is_none());
+        store.remove("sid").await.unwrap();
+        assert!(store.load("sid").await.unwrap().is_none());
 
         // already-expired entry is evicted on load
         let expired = InMemorySessionStore::new(Duration::from_secs(0));
-        expired.store("sid", &Session::default()).await;
-        assert!(expired.load("sid").await.is_none());
+        expired.store("sid", &Session::default()).await.unwrap();
+        assert!(expired.load("sid").await.unwrap().is_none());
     }
 }

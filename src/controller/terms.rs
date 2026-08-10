@@ -64,7 +64,24 @@ pub async fn refresh_session_profile(core: &CoreServices, session_id: Option<&st
     let (Some(store), Some(sid)) = (core.session_store.as_ref(), session_id) else {
         return;
     };
-    let Some(session) = store.load(sid).await else {
+    // Fail open, deliberately: this is a *cache* refresh in front of Kratos, and
+    // Kratos holds the durable copy either way — `ensure_terms_hydrated` has
+    // just read it, and `accept_terms` has just written it. Nothing here is lost
+    // by a store that cannot be reached.
+    //
+    // **What is lost differs by caller, and the earlier note here described only
+    // one of them.** `ensure_terms_hydrated` patches the in-memory profile
+    // itself, so its request sees the value regardless; the cost is a Kratos
+    // lookup on *every* request until a write-back lands, not one more next
+    // time — the skip at the top of that function is driven by the persisted
+    // profile, so a session whose row was never refreshed re-hydrates each time.
+    // `accept_terms`
+    // (`controller/graphql/terms.rs`) has no such patch: with the cached session
+    // unrefreshed, a user who accepts during a blip is re-prompted on every
+    // request until the session profile is rebuilt at the next login. Annoying,
+    // not wrong — and the alternative, failing a mutation whose durable write
+    // already succeeded, is worse.
+    let Some(session) = store.load(sid).await.ok().flatten() else {
         return;
     };
     let Ok(mut session_val) = serde_json::to_value(&session) else {
@@ -84,6 +101,8 @@ pub async fn refresh_session_profile(core: &CoreServices, session_id: Option<&st
         map.insert("profile".into(), profile);
     }
     if let Ok(updated) = serde_json::from_value::<crate::web_login::Session>(session_val) {
-        store.store(sid, &updated).await;
+        // Non-fatal for the same reason: nothing in this request depends on the
+        // write landing, and the store has already logged the cause.
+        let _ = store.store(sid, &updated).await;
     }
 }

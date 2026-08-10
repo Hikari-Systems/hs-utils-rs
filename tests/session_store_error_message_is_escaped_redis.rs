@@ -213,11 +213,27 @@ async fn a_hostile_redis_cannot_forge_a_log_line_through_a_connection_failure() 
     )
     .expect("a plain redis url parses; from_url performs no I/O");
 
-    store.load(SID).await;
-    store.store(SID, &Session::default()).await;
+    // **Asserted, not discarded**, for the reason the sid sibling gives at
+    // length: the only places in the tree that assert a *shipped* store returns
+    // `Err` are the binaries that drive one, and this is one of them. The
+    // `conn()` sites are the ones it reaches; which sites each binary reaches is
+    // accounted for in its own header, and no count of them belongs here.
+    assert!(
+        store.load(SID).await.is_err(),
+        "a connection that could not be opened must reach the caller — degrading \
+         it to `Ok(None)` reads as 'no such session' and logs everyone out"
+    );
+    assert!(
+        store.store(SID, &Session::default()).await.is_err(),
+        "a write that never reached redis must reach the caller — `callback` \
+         removes the old row on the strength of this one"
+    );
     // The same two operations again, answered with the over-long reply.
-    store.load(SID).await;
-    store.store(SID, &Session::default()).await;
+    assert!(store.load(SID).await.is_err(), "as above, over-long reply");
+    assert!(
+        store.store(SID, &Session::default()).await.is_err(),
+        "as above, over-long reply"
+    );
 
     let rendered = capture.rendered();
 

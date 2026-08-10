@@ -35,9 +35,25 @@
 //! invisible the instant it lapses), and [`PgSessionStore::sweep_expired`]
 //! reclaims the dead rows — call it periodically (e.g. an hourly task).
 //!
-//! Posture matches the rest of hs-utils' shared stores: **fail open** — a
-//! Postgres outage degrades to "the user is asked to log in again", never a
-//! 500.
+//! Posture matches the redis sibling: a failure is logged here **and
+//! returned**, and the caller decides what it costs — a caller whose next
+//! step depends on the write landing (the session-id rotation in `callback`) can
+//! now tell that it did not.
+//!
+//! Named as that one store rather than as "hs-utils' shared stores", which is
+//! what this lead-in said while the clause after the colon flipped to
+//! fail-closed underneath it. The wider phrase now takes in
+//! `mcp_resource_server::db_session_store`, which does the opposite — it logs
+//! and swallows — and is a `SessionStore` rather than a `WebSessionStore`, so
+//! nothing here constrains it.
+//!
+//! **What that costs during an outage is worth knowing before you plan a
+//! maintenance window.** The gate's *read* fails open, but the browser tier
+//! writes immediately afterwards and that write is fatal, so a Postgres outage
+//! is a 503 on every browser-gated page — not "everyone is asked to log in
+//! again". Api-gated routes still 401, because they return before the write. See
+//! `web_login::gate`, and the oracle both stores share,
+//! `web_login::tests::a_store_outage_is_a_401_on_the_api_tier_and_a_503_on_the_browser_tier`.
 //!
 //! **First-time DB setup** (role, table, grants — one script per consuming
 //! service) is templated in `docs/web-login-postgres-db-setup.md`; copy the
@@ -206,16 +222,25 @@ fn validate_table_name(name: &str) -> Result<String> {
 // is downstream-derived, and `%` emits bytes raw, so a newline in it would forge
 // a whole log line. `session.*` take `%` because they are compile-time literals
 // and a validated identifier.
+//
+// **Every failure is now both logged here and returned to the caller**, and the
+// two are not redundant. The `error!` is the cause, at the only place that has
+// it in full; the `Err` is the *fact* of the failure, which is what the caller
+// needs in order to stop — it used to be swallowed here, so `callback` deleted a
+// live session on the strength of a write that never landed. The returned error
+// carries a fixed context string and the backend's own error as its source;
+// neither names the sid, per the invariant above.
 #[async_trait]
 impl WebSessionStore for PgSessionStore {
-    async fn load(&self, sid: &str) -> Option<Session> {
+    async fn load(&self, sid: &str) -> Result<Option<Session>> {
         let res = sqlx::query_scalar::<_, serde_json::Value>(&self.sql_load)
             .bind(sid)
             .fetch_optional(&self.pool)
             .await;
 
         let data = match res {
-            Ok(v) => v?,
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(None),
             Err(e) => {
                 tracing::error!(
                     session.store = %"postgres",
@@ -224,12 +249,12 @@ impl WebSessionStore for PgSessionStore {
                     error.message = log_safe(&e.to_string()).as_str(),
                     "web_login pg load failed"
                 );
-                return None; // fail open
+                return Err(anyhow::Error::new(e).context("web_login pg load"));
             }
         };
 
         match serde_json::from_value::<Session>(data) {
-            Ok(s) => Some(s),
+            Ok(s) => Ok(Some(s)),
             Err(e) => {
                 tracing::error!(
                     session.store = %"postgres",
@@ -238,12 +263,12 @@ impl WebSessionStore for PgSessionStore {
                     error.message = log_safe(&e.to_string()).as_str(),
                     "web_login pg load: malformed payload"
                 );
-                None
+                Err(anyhow::Error::new(e).context("web_login pg load: malformed payload"))
             }
         }
     }
 
-    async fn store(&self, sid: &str, session: &Session) {
+    async fn store(&self, sid: &str, session: &Session) -> Result<()> {
         let data = match serde_json::to_value(session) {
             Ok(v) => v,
             Err(e) => {
@@ -254,7 +279,7 @@ impl WebSessionStore for PgSessionStore {
                     error.message = log_safe(&e.to_string()).as_str(),
                     "web_login pg store: serialize failed"
                 );
-                return;
+                return Err(anyhow::Error::new(e).context("web_login pg store: serialize failed"));
             }
         };
 
@@ -273,10 +298,12 @@ impl WebSessionStore for PgSessionStore {
                 error.message = log_safe(&e.to_string()).as_str(),
                 "web_login pg store failed"
             );
+            return Err(anyhow::Error::new(e).context("web_login pg store"));
         }
+        Ok(())
     }
 
-    async fn remove(&self, sid: &str) {
+    async fn remove(&self, sid: &str) -> Result<()> {
         let res = sqlx::query(&self.sql_remove)
             .bind(sid)
             .execute(&self.pool)
@@ -289,7 +316,9 @@ impl WebSessionStore for PgSessionStore {
                 error.message = log_safe(&e.to_string()).as_str(),
                 "web_login pg remove failed"
             );
+            return Err(anyhow::Error::new(e).context("web_login pg remove"));
         }
+        Ok(())
     }
 }
 

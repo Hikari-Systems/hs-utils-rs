@@ -143,9 +143,28 @@ async fn the_postgres_store_never_writes_the_session_id_to_the_log() {
         .expect("a lazy pool does not dial, so this cannot fail on connectivity");
     let store = PgSessionStore::from_pool(pool);
 
-    store.load(SID).await;
-    store.store(SID, &Session::default()).await;
-    store.remove(SID).await;
+    // **Asserted, not discarded.** What this file goes on to read is the log line
+    // each failure wrote, but the *return* is HIK-241's own subject and it is the
+    // arm the fleet runs. Measured: replace these three error returns in
+    // `web_login_postgres.rs` with `Ok(None)` / `Ok(())` and this binary stayed
+    // green without them, so the header's "a failure is logged here **and
+    // returned**" rested on nothing. Three lines rather than new harness — the
+    // failing fixture is the lazy pool already in hand.
+    assert!(
+        store.load(SID).await.is_err(),
+        "a query that could not be run must reach the caller: an unreadable row \
+         and an absent one are different facts, and only the caller can price them"
+    );
+    assert!(
+        store.store(SID, &Session::default()).await.is_err(),
+        "a write that did not land must reach the caller — `callback` removes the \
+         old row on the strength of this one"
+    );
+    assert!(
+        store.remove(SID).await.is_err(),
+        "a delete that did not land must reach the caller — logout answers \"you \
+         are logged out\" on the strength of this one"
+    );
 
     let rendered = capture.rendered();
 

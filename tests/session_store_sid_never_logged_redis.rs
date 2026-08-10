@@ -192,10 +192,44 @@ async fn the_redis_store_never_writes_the_session_id_to_the_log() {
     )
     .expect("a plain redis url parses; from_url performs no I/O");
 
-    store.load(SID).await;
-    store.load(SID).await;
-    store.store(SID, &Session::default()).await;
-    store.remove(SID).await;
+    // **Asserted, not discarded.** What this file goes on to read is the log line
+    // each failure wrote — but the *return* is HIK-241's own subject, and the
+    // only places in the tree that assert a **shipped** store returns `Err` are
+    // the binaries that drive one: this file, `..._error_message_is_escaped_redis`
+    // and `..._sid_never_logged_postgres`. A list rather than a count, and
+    // `..._sid_source_lint` is deliberately not in it — it scans source text and
+    // drives nothing. The tier oracle
+    // (`web_login::tests::a_store_outage_is_a_401_on_the_api_tier_and_a_503_on_the_browser_tier`)
+    // drives the in-crate `FailingStore`, and both redis binaries read rendered
+    // output only. Measured: replace every error return in
+    // `web_login_redis.rs`'s impl with `Ok(None)` / `Ok(())` and, without these,
+    // the whole suite stays green while both store headers' "a failure is logged
+    // here **and returned**" is silently false.
+    //
+    // They sit ahead of the log assertions and cannot mask them: a stub that
+    // never answered still fails these operations, on `conn()`, so the
+    // fix-invariant markers below keep their say over whether the run reached
+    // the sid-bearing branches at all.
+    assert!(
+        store.load(SID).await.is_err(),
+        "a stored payload that will not deserialise must reach the caller as an \
+         error — read as an absent session it silently logs the user out"
+    );
+    assert!(
+        store.load(SID).await.is_err(),
+        "a backend error on `load` must reach the caller: an unreadable row and an \
+         absent one are different facts, and only the caller can price them"
+    );
+    assert!(
+        store.store(SID, &Session::default()).await.is_err(),
+        "a write that did not land must reach the caller — `callback` removes the \
+         old row on the strength of this one"
+    );
+    assert!(
+        store.remove(SID).await.is_err(),
+        "a delete that did not land must reach the caller — logout answers \"you \
+         are logged out\" on the strength of this one"
+    );
 
     let rendered = capture.rendered();
 

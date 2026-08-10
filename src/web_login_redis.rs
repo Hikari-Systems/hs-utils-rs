@@ -27,8 +27,25 @@
 //! when redis was down would turn a degraded dependency into a service that
 //! will not boot.
 //!
-//! Posture matches the rest of hs-utils' shared stores: **fail open** — a redis
-//! outage degrades to "the user is asked to log in again", never a 500.
+//! Posture matches the Postgres sibling: a failure is logged here **and
+//! returned**, and the caller decides what it costs — a caller whose next
+//! step depends on the write landing (the session-id rotation in `callback`) can
+//! now tell that it did not.
+//!
+//! Named as that one store rather than as "hs-utils' shared stores", which is
+//! what this lead-in said while the clause after the colon flipped to
+//! fail-closed underneath it. The wider phrase now takes in
+//! `mcp_resource_server::db_session_store`, which does the opposite — it logs
+//! and swallows — and is a `SessionStore` rather than a `WebSessionStore`, so
+//! nothing here constrains it.
+//!
+//! **What that costs during an outage is worth knowing before you plan a
+//! maintenance window.** The gate's *read* fails open, but the browser tier
+//! writes immediately afterwards and that write is fatal, so a redis outage is a
+//! 503 on every browser-gated page — not "everyone is asked to log in again".
+//! Api-gated routes still 401, because they return before the write. See
+//! `web_login::gate`, and the oracle both stores share,
+//! `web_login::tests::a_store_outage_is_a_401_on_the_api_tier_and_a_503_on_the_browser_tier`.
 //!
 //! Note both modes obtain a connection per operation. For Sentinel that is
 //! required (the master can move); for a single node it is merely consistent,
@@ -411,8 +428,15 @@ impl RedisSessionStore {
     /// db index (`/0`), credentials (`redis://user:pass@host`) and TLS
     /// (`rediss://`) — so there is no second config shape to keep in step.
     ///
-    /// Performs no I/O: an unreachable host is discovered on first use and
-    /// handled by the fail-open path, not here.
+    /// Performs no I/O: an unreachable host is discovered on first use, as an
+    /// `Err` from whichever operation reached for it — not here. Whether that is
+    /// absorbed or fatal is the caller's, per call site, and the rule is on
+    /// [`WebSessionStore`](crate::web_login::WebSessionStore): a read whose
+    /// answer to an unreadable row is the same as its answer to an absent one
+    /// fails open, a write that is what makes the next request work does not.
+    /// Pointed at the rule rather than at the module header, which names one
+    /// read of the several that absorb — read literally it said `access_token`,
+    /// `id_token` and `end_session` propagate, and they do not.
     pub fn from_url(url: &str, ttl: Duration) -> Result<Self> {
         let url = url.trim();
         anyhow::ensure!(!url.is_empty(), "redis url is empty");
@@ -522,7 +546,7 @@ impl RedisSessionStore {
 // bytes raw, so a newline in it would forge a whole log line. `session.*` take
 // `%` because they are compile-time literals.
 //
-// The two `connection failed` sites carry no sid, so they were left interpolated
+// The `connection failed` sites carry no sid, so they were left interpolated
 // for one release — and the reason that was wrong is worth keeping, because it is
 // not the reason it looks like. The chain comes from `conn()`, whose context is a
 // fixed string plus a `RedisError`; it never carries the URL, so `from_url`'s
@@ -536,10 +560,16 @@ impl RedisSessionStore {
 // downstream rather than from caller input. They now carry the same **three**
 // fields as the five other `tracing::error!` sites in this impl —
 // `session.store`, `session.op`, `error.message` — and `error.message` is a bare
-// `&str` on all seven: that is what makes the fmt layer escape the newline
+// `&str` on all of them: that is what makes the fmt layer escape the newline
 // instead of emitting it. `tests/session_store_error_message_is_escaped_redis.rs`
-// drives both of them, including the over-256-byte reply that exercises
-// `log_safe`'s cap.
+// drives the `load` and `store` ones, including the over-256-byte reply that
+// exercises `log_safe`'s cap.
+//
+// **There are three of them, not two, since HIK-241.** `remove`'s connection
+// failure was `let Ok(mut conn) = self.conn().await else { return; };` — no
+// field, no message, no line at all, so a logout during a redis outage was
+// invisible from both ends: nothing in the log, and nothing returned to the
+// caller either. It is the third, and it is not driven by that test.
 //
 // **Three, not four, and this store is not symmetric with the Postgres one.**
 // `web_login_postgres` has five sites carrying four fields, the extra being
@@ -547,9 +577,17 @@ impl RedisSessionStore {
 // two stores get flattened to one shape every time someone summarises them —
 // botsafely-controller's `CLAUDE.md` records correcting exactly that once
 // already — so the counts are spelt out per store rather than shared.
+//
+// **Every failure is now both logged here and returned to the caller**, and the
+// two are not redundant. The `error!` is the cause, at the only place that has
+// it in full; the `Err` is the *fact* of the failure, which is what the caller
+// needs in order to stop — it used to be swallowed here, so `callback` deleted a
+// live session on the strength of a write that never landed. The returned error
+// carries a fixed context string and the backend's own error as its source;
+// neither names the sid, per the invariant above.
 #[async_trait]
 impl WebSessionStore for RedisSessionStore {
-    async fn load(&self, sid: &str) -> Option<Session> {
+    async fn load(&self, sid: &str) -> Result<Option<Session>> {
         let key = self.key(sid);
         let mut conn = match self.conn().await {
             Ok(c) => c,
@@ -560,7 +598,7 @@ impl WebSessionStore for RedisSessionStore {
                     error.message = log_safe(&format!("{e:#}")).as_str(),
                     "web_login redis load: connection failed"
                 );
-                return None; // fail open
+                return Err(e.context("web_login redis load: connection failed"));
             }
         };
         let raw: Option<String> = match conn.get(&key).await {
@@ -572,12 +610,14 @@ impl WebSessionStore for RedisSessionStore {
                     error.message = log_safe(&e.to_string()).as_str(),
                     "web_login redis load failed"
                 );
-                return None;
+                return Err(anyhow::Error::new(e).context("web_login redis load"));
             }
         };
-        let raw = raw?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
         match serde_json::from_str::<Session>(&raw) {
-            Ok(s) => Some(s),
+            Ok(s) => Ok(Some(s)),
             Err(e) => {
                 tracing::error!(
                     session.store = %"redis",
@@ -585,12 +625,12 @@ impl WebSessionStore for RedisSessionStore {
                     error.message = log_safe(&e.to_string()).as_str(),
                     "web_login redis load: malformed payload"
                 );
-                None
+                Err(anyhow::Error::new(e).context("web_login redis load: malformed payload"))
             }
         }
     }
 
-    async fn store(&self, sid: &str, session: &Session) {
+    async fn store(&self, sid: &str, session: &Session) -> Result<()> {
         let key = self.key(sid);
         let json = match serde_json::to_string(session) {
             Ok(j) => j,
@@ -601,7 +641,9 @@ impl WebSessionStore for RedisSessionStore {
                     error.message = log_safe(&e.to_string()).as_str(),
                     "web_login redis store: serialize failed"
                 );
-                return;
+                return Err(
+                    anyhow::Error::new(e).context("web_login redis store: serialize failed")
+                );
             }
         };
         let mut conn = match self.conn().await {
@@ -613,7 +655,7 @@ impl WebSessionStore for RedisSessionStore {
                     error.message = log_safe(&format!("{e:#}")).as_str(),
                     "web_login redis store: connection failed"
                 );
-                return;
+                return Err(e.context("web_login redis store: connection failed"));
             }
         };
         let res: redis::RedisResult<()> = conn.set_ex(&key, json, self.ttl_secs).await;
@@ -624,13 +666,31 @@ impl WebSessionStore for RedisSessionStore {
                 error.message = log_safe(&e.to_string()).as_str(),
                 "web_login redis store failed"
             );
+            return Err(anyhow::Error::new(e).context("web_login redis store"));
         }
+        Ok(())
     }
 
-    async fn remove(&self, sid: &str) {
+    async fn remove(&self, sid: &str) -> Result<()> {
         let key = self.key(sid);
-        let Ok(mut conn) = self.conn().await else {
-            return;
+        // **This branch logged nothing at all**, so a logout during a redis
+        // outage was entirely invisible: no line, and — before the trait was
+        // fallible — no way for the caller to know either. It now carries the
+        // same three fields as every other `error!` site in this impl. Which
+        // sites those are is accounted for once, in the block comment above the
+        // impl; a second tally here was a second place to keep it, and the two
+        // disagreed.
+        let mut conn = match self.conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    session.store = %"redis",
+                    session.op = %"remove",
+                    error.message = log_safe(&format!("{e:#}")).as_str(),
+                    "web_login redis remove: connection failed"
+                );
+                return Err(e.context("web_login redis remove: connection failed"));
+            }
         };
         let res: redis::RedisResult<()> = conn.del(&key).await;
         if let Err(e) = res {
@@ -640,7 +700,9 @@ impl WebSessionStore for RedisSessionStore {
                 error.message = log_safe(&e.to_string()).as_str(),
                 "web_login redis remove failed"
             );
+            return Err(anyhow::Error::new(e).context("web_login redis remove"));
         }
+        Ok(())
     }
 }
 
