@@ -58,6 +58,38 @@ There is no CHANGELOG in this repo, so "the plan" cannot live in one. It goes in
 
 ## Migrating consumers
 
+### v0.32.1 — the post-login redirect is sanitised (HIK-272)
+
+No API change — nothing is added, removed or re-typed, so this is a patch and a consumer bump is a one-line tag change. What changes is **behaviour**, at two points a consumer never calls directly: `gate` sanitises the request target before storing it as the `state → destination` map, and `callback` sanitises again before emitting the `Location`. Both were previously verbatim, which made the completed-login redirect an open redirect against a victim who is *necessarily* authenticated by the time it fires.
+
+**The guard is unconditional.** There is no config key and no feature flag for it, deliberately: either would be a switch that turns an open-redirect guard off. It cannot be opted out of, so read the set below rather than planning around it.
+
+**It does NOT supersede a consumer's own redirect guard, and deleting one as redundant would reopen a fixed bug.** This guard covers two inputs and only those: the request target `gate` stores, and the row `callback` reads back. `botsafely-controller`'s `routes::auth::origin_relative_dest` covers a different input — the caller-supplied `dest_uri` query parameter on `/api/auth` and `/api/logout`, which never passes through either of this crate's two sites. The rule is the same rule; the inputs are disjoint, so both are needed. That local copy is HIK-242 and it stays.
+
+**A refused destination becomes `/`, never a 4xx.** At the callback a 4xx would throw away an authentication that already succeeded — the code is spent and the session rotated — and at the gate it would let this library refuse a page of yours it merely failed to parse.
+
+**The accepted set moved in BOTH directions, so "it only got stricter" is false** and a consumer reasoning from that will mispredict it:
+
+| request target / stored destination | before | now |
+|---|---|---|
+| `/dash?tab=runs`, `/api/auth`, `/`, `/x?a=b#f` | forwarded | **unchanged, byte for byte** |
+| `/../../etc/passwd` | forwarded verbatim | **rewritten** to `/etc/passwd` |
+| `*` | forwarded verbatim | **rewritten** to `/*` |
+| `//evil.example.com/x`, `/\evil.example.com/x` | forwarded — off-origin | **`/`** |
+| `///evil.example.com/x`, `//\evil.example.com/x` | forwarded | **`/`** |
+| `/..//x`, `/.//x`, `/a/..//x` and the rest of the dot-segment family | forwarded | **`/`** |
+| a target containing CR or LF | a 303 with **no `Location` header at all** — `see_other` silently drops a header value it cannot build | **`/`** |
+
+The rewrites are harmless — a browser resolves dot segments the same way and the origin is unchanged — but they are not what the old code did.
+
+**One live consumer shape is affected.** `botsafely-controller`'s UI sends `${window.location.pathname}${search}`, so a user who landed on `https://app.example.com//dashboard` sends a `pathname` beginning with a doubled slash. That is genuinely protocol-relative and nothing at this layer can tell it from an attack, so it now lands on `/` after login instead of being forwarded. Correct, but a real request shape rather than a hypothetical one — expect it in a support ticket rather than in a pen test.
+
+**Telemetry a consumer may want to alert on.** One `warn!` per refusal, message `web_login: post-login redirect destination refused`, carrying `auth.redirect.outcome`, `auth.redirect.reason` (`missing` | `control_character` | `unparseable` | `not_origin_relative` | `escapes_root`), `auth.redirect.site` (`gate` | `callback`), `auth.redirect.dest` and, at the callback only, `user.id`. Nothing at all on the accept path. `auth.redirect.refused` and `auth.redirect.reason` are also recorded on the existing `auth.gate` / `auth.login` spans; at `log.level: debug` those render in the span's brace prefix, so `auth.redirect.reason` appears on the line twice. `user.id` renders twice on the callback line for the same reason — `callback` records it on the `auth.login` span before it reaches the redirect — which is pre-existing behaviour for that handler's other `warn!`s, not new here.
+
+**`auth.redirect.dest` diverges from this crate's own redaction policy, and an operator alerting on it should know before switching it on.** It carries the destination **raw and pre-sanitisation, query string included**, capped at 256 bytes — while `otel::redact_query` in this same crate deliberately records which query parameters were *present* and never their values, because spans land in a third-party store with long retention. So a refused destination that happens to be an absolute return URL carrying a token gets that token's first 256 bytes onto a log line. The divergence is narrow and deliberate: only refusals are logged, and a refusal that named nothing would be undiagnosable. It is a trade, not an oversight.
+
+`escapes_root` is a misnomer and is kept only because `botsafely-controller` already publishes that vocabulary: it never fires for an input that escapes the root, and what it fires for in practice is the protocol-relative form the reconstruction can manufacture out of a dot-segment input. (It also catches a cannot-be-a-base URL whose origin aliases the sentinel, which nothing reaches from either call site.)
+
 ### v0.32.0 — `WebSessionStore` is fallible (HIK-241)
 
 All three trait methods changed. Any type implementing `WebSessionStore` outside this crate must change with them:
