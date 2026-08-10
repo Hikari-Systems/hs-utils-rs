@@ -36,10 +36,16 @@
 //! reclaims the dead rows — call it periodically (e.g. an hourly task).
 //!
 //! Posture matches the rest of hs-utils' shared stores: a failure is logged here
-//! **and returned**, and the caller decides what it costs. The gate still fails
-//! open — a Postgres outage there degrades to "the user is asked to log in
-//! again", never a 500 — but a caller whose next step depends on the write
-//! landing (the session-id rotation in `callback`) can now tell that it did not.
+//! **and returned**, and the caller decides what it costs — a caller whose next
+//! step depends on the write landing (the session-id rotation in `callback`) can
+//! now tell that it did not.
+//!
+//! **What that costs during an outage is worth knowing before you plan a
+//! maintenance window.** The gate's *read* fails open, but the browser tier
+//! writes immediately afterwards and that write is fatal, so a Postgres outage
+//! is a 503 on every browser-gated page — not "everyone is asked to log in
+//! again". Api-gated routes still 401, because they return before the write. See
+//! `web_login::gate`.
 //!
 //! **First-time DB setup** (role, table, grants — one script per consuming
 //! service) is templated in `docs/web-login-postgres-db-setup.md`; copy the

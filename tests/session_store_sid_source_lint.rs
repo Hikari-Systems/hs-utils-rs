@@ -594,12 +594,18 @@ struct Stripped {
 /// It costs nothing on plausible source. [`raw_string_starts_at`] requires the
 /// full `r` `#`* `"` prefix, so a raw *identifier* (`r#type`) is not touched —
 /// it cannot hide a delimiter, being `r#` plus an identifier and nothing else.
-/// And the `r"` that a grep for the sequence actually turns up in these files
-/// is the one inside `"mymaster".into()` (`web_login_redis.rs:374`), which sits
-/// within a string literal and so never reaches this branch at all. Measured on
-/// today's tree: 13 redis invocations and 6 postgres ones still scanned, 19 in
-/// total, and the whole `(file, line, label, body)` dump is byte-identical to
-/// `16bd876`'s.
+/// And every `r"` a grep for the sequence turns up in these files is the tail of
+/// a word inside a string literal (`"mymaster".into()`, `query.get("user")`),
+/// which never reaches this branch at all.
+///
+/// **No inventory count is quoted here, deliberately.** The sentence this
+/// replaces gave one, and HIK-241 falsified it the moment it put a `.context(`
+/// on every error branch in both stores: a numeral in an unowned comment goes
+/// stale on the next ticket that adds a logging site, which is most tickets in
+/// these two files. What this paragraph needs is only that the raw-string branch
+/// is not reached on this tree, which the observation above establishes without
+/// counting anything — and the scanner's liveness is the *test's* job, asserted
+/// per file rather than described here.
 fn strip_comments(text: &str) -> Stripped {
     let mut out = String::with_capacity(text.len());
     let mut unsupported = Vec::new();
@@ -1164,10 +1170,11 @@ fn no_tracing_or_anyhow_line_in_either_session_store_names_an_unsanctioned_bindi
         // prone to.
         //
         // **Per file, never summed.** A total across `STORES` cannot see one
-        // file go dark: postgres alone contributes six invocations, so a redis
+        // file go dark: postgres contributes invocations of its own, so a redis
         // scan that silently found nothing would still leave a healthy-looking
         // total. That matters concretely, because postgres' `malformed payload`
-        // site is one this lint is the *only* oracle for.
+        // site is one this lint is the *only* oracle for. (No count here either
+        // — see `strip_comments`' doc comment for why one does not survive.)
         //
         // Deliberately not a count, either. The assertion it replaced was
         // `>= 5`, which gave a confidently wrong diagnosis when it tripped: it

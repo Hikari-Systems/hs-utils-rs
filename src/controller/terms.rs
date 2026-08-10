@@ -64,10 +64,20 @@ pub async fn refresh_session_profile(core: &CoreServices, session_id: Option<&st
     let (Some(store), Some(sid)) = (core.session_store.as_ref(), session_id) else {
         return;
     };
-    // Fail open, deliberately: this is a *cache* refresh in front of Kratos, so
-    // a store that cannot be read costs the next request one more Kratos lookup
-    // and nothing else. The value the caller sees was already patched into the
-    // in-memory profile by `ensure_terms_hydrated`.
+    // Fail open, deliberately: this is a *cache* refresh in front of Kratos, and
+    // Kratos holds the durable copy either way — `ensure_terms_hydrated` has
+    // just read it, and `accept_terms` has just written it. Nothing here is lost
+    // by a store that cannot be reached.
+    //
+    // **What is lost differs by caller, and the earlier note here described only
+    // one of them.** `ensure_terms_hydrated` patches the in-memory profile
+    // itself, so its request sees the value regardless; the cost is one more
+    // Kratos lookup next time. `accept_terms`
+    // (`controller/graphql/terms.rs`) has no such patch: with the cached session
+    // unrefreshed, a user who accepts during a blip is re-prompted on every
+    // request until the session profile is rebuilt at the next login. Annoying,
+    // not wrong — and the alternative, failing a mutation whose durable write
+    // already succeeded, is worse.
     let Some(session) = store.load(sid).await.ok().flatten() else {
         return;
     };
