@@ -217,12 +217,21 @@ const ALLOWED_FIELD_IDENTS: &[&str] = &["error", "message", "op", "session", "st
 /// They are startup-config and helper names, not request data, which is why they
 /// were acceptable to add — that is the standard, not "the build was red".
 ///
-/// **HIK-241 owes this list one line.** That ticket adds `anyhow` context
-/// strings to these same sites, and any binding it names that is not here will
-/// fail this test. That failure is the design working, not a defect in it: the
-/// fix is to add the *reviewed* name, with a bullet above saying why it cannot
-/// carry the sid — not to widen the list until the build is green, which is the
-/// same defeat by a friendlier route.
+/// **HIK-241 was owed a line here and needed none.** That ticket made
+/// `WebSessionStore` fallible and put an `anyhow` context string on every error
+/// branch in both stores — **thirteen** new `.context(` sites, five in
+/// `web_login_postgres.rs` and eight in `web_login_redis.rs` — and it added no
+/// name, because every one of those strings is a compile-time literal with no
+/// inline capture in it, so the scan finds no identifier in any of them. Written
+/// down rather than left implicit: the sentence this replaces sent the next
+/// reader looking for a line that was never added.
+///
+/// **The obligation itself is unchanged, which is what makes that outcome worth
+/// stating.** A site spelled `.context(format!("… {sid} …"))` names `sid` and
+/// fails this test; so does any other new binding. When that happens the fix is
+/// to add the *reviewed* name, with a bullet above saying why it cannot carry
+/// the sid — not to widen the list until the build is green, which is the same
+/// defeat by a friendlier route.
 const ALLOWED_VALUE_IDENTS: &[&str] = &[
     "as_str",
     "e",

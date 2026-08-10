@@ -143,9 +143,12 @@ async fn the_postgres_store_never_writes_the_session_id_to_the_log() {
         .expect("a lazy pool does not dial, so this cannot fail on connectivity");
     let store = PgSessionStore::from_pool(pool);
 
-    store.load(SID).await;
-    store.store(SID, &Session::default()).await;
-    store.remove(SID).await;
+    // Discarded on purpose: every one of these is *expected* to fail (there is
+    // no server on port 1), and what this test reads is the log line each
+    // failure wrote, not the error it returned.
+    let _ = store.load(SID).await;
+    let _ = store.store(SID, &Session::default()).await;
+    let _ = store.remove(SID).await;
 
     let rendered = capture.rendered();
 

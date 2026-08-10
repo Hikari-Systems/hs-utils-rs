@@ -192,10 +192,13 @@ async fn the_redis_store_never_writes_the_session_id_to_the_log() {
     )
     .expect("a plain redis url parses; from_url performs no I/O");
 
-    store.load(SID).await;
-    store.load(SID).await;
-    store.store(SID, &Session::default()).await;
-    store.remove(SID).await;
+    // Discarded on purpose: each of these is *expected* to fail (the stub is
+    // scripted to answer `-ERR`), and what this test reads is the log line each
+    // failure wrote, not the error it returned.
+    let _ = store.load(SID).await;
+    let _ = store.load(SID).await;
+    let _ = store.store(SID, &Session::default()).await;
+    let _ = store.remove(SID).await;
 
     let rendered = capture.rendered();
 

@@ -109,7 +109,10 @@ async fn the_gate_span_does_not_wrap_the_downstream_handler() {
         "user_id": "kratos-identity-1"
     }))
     .expect("session from json");
-    store.store(SID, &sess).await;
+    store
+        .store(SID, &sess)
+        .await
+        .expect("the in-memory store cannot fail");
 
     let resolver = Arc::new(KratosUserResolver::new(
         "http://kratos:4434",

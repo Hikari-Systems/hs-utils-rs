@@ -64,7 +64,11 @@ pub async fn refresh_session_profile(core: &CoreServices, session_id: Option<&st
     let (Some(store), Some(sid)) = (core.session_store.as_ref(), session_id) else {
         return;
     };
-    let Some(session) = store.load(sid).await else {
+    // Fail open, deliberately: this is a *cache* refresh in front of Kratos, so
+    // a store that cannot be read costs the next request one more Kratos lookup
+    // and nothing else. The value the caller sees was already patched into the
+    // in-memory profile by `ensure_terms_hydrated`.
+    let Some(session) = store.load(sid).await.ok().flatten() else {
         return;
     };
     let Ok(mut session_val) = serde_json::to_value(&session) else {
@@ -84,6 +88,8 @@ pub async fn refresh_session_profile(core: &CoreServices, session_id: Option<&st
         map.insert("profile".into(), profile);
     }
     if let Ok(updated) = serde_json::from_value::<crate::web_login::Session>(session_val) {
-        store.store(sid, &updated).await;
+        // Non-fatal for the same reason: nothing in this request depends on the
+        // write landing, and the store has already logged the cause.
+        let _ = store.store(sid, &updated).await;
     }
 }

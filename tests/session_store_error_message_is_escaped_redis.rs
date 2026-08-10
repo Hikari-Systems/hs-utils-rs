@@ -213,11 +213,13 @@ async fn a_hostile_redis_cannot_forge_a_log_line_through_a_connection_failure() 
     )
     .expect("a plain redis url parses; from_url performs no I/O");
 
-    store.load(SID).await;
-    store.store(SID, &Session::default()).await;
+    // Discarded on purpose: each of these is *expected* to fail, and what this
+    // test reads is the rendered log line, not the error that came back.
+    let _ = store.load(SID).await;
+    let _ = store.store(SID, &Session::default()).await;
     // The same two operations again, answered with the over-long reply.
-    store.load(SID).await;
-    store.store(SID, &Session::default()).await;
+    let _ = store.load(SID).await;
+    let _ = store.store(SID, &Session::default()).await;
 
     let rendered = capture.rendered();
 
