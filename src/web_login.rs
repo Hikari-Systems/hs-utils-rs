@@ -5,14 +5,31 @@
 //! `lib/oauth2-kratos.ts` (`authorizeKratosMiddleware`). The flow:
 //!   1. An un-authenticated request to a protected route is redirected to the
 //!      provider's `authorize` endpoint (`response_type=code`), with a random
-//!      `state` → original URL stored in the session.
+//!      `state` → **sanitised** original URL stored in the session.
 //!   2. The provider redirects back to `{callback_uri}` with `code`+`state`.
 //!      [`callback`] exchanges the code for tokens
 //!      ([`do_token_exchange`]), fetches userinfo
 //!      ([`get_oauth_profile_by_token`]), resolves `{ sub, profile }` from
 //!      Kratos via the reused [`KratosUserResolver`], stores `session.user`,
-//!      and redirects to the original URL.
+//!      and redirects to that destination.
 //!   3. Subsequent requests carry the session cookie and pass straight through.
+//!
+//! # The post-login destination is not the caller's string (HIK-272)
+//!
+//! Steps 1 and 2 both reduce the destination to one that can only be
+//! origin-relative, and **a destination that cannot be is replaced by `/`** —
+//! never a 4xx, because at step 2 the authentication has already completed.
+//! The guard is unconditional: there is no config key and no feature gate for
+//! it, since either would be a switch that turns an open-redirect guard off.
+//!
+//! Consumers should know three things about the accepted set, because it moved
+//! in **both** directions rather than merely narrowing. A destination is kept
+//! byte-for-byte if it is already an ordinary path (`/dash?tab=runs`); it is
+//! **rewritten** if it parses to an origin-relative URL by another spelling
+//! (`/../../etc/passwd` → `/etc/passwd`, `*` → `/*`); and it is **replaced by
+//! `/`** if it is protocol-relative, unparseable, or carries a control
+//! character. A request target beginning with a doubled slash is a real shape
+//! in at least one consumer, and it now lands on `/` after login.
 //!
 //! Kratos is the source of truth (no user-data-service rows): the Kratos
 //! identity id (= `sub`) is the canonical user id.
@@ -140,7 +157,10 @@ pub struct Session {
     id_token: Option<String>,
     #[serde(default)]
     expires_at: Option<i64>,
-    /// `state` → original URL, set at redirect time, consumed at callback.
+    /// `state` → the sanitised original URL (or `/`), set at redirect time and
+    /// consumed at callback. Never the caller's raw request target — see
+    /// `origin_relative_dest`. The callback sanitises again on the way out,
+    /// because a row written by an older binary outlives a rolling deploy.
     #[serde(default)]
     redirects: HashMap<String, String>,
 }
@@ -574,6 +594,240 @@ fn build_clear_cookie(cfg: &WebLoginConfig, secure: bool) -> HeaderValue {
     HeaderValue::from_str(&s).expect("cookie header value")
 }
 
+/// The fixed base every candidate destination is resolved against.
+///
+/// **A literal, and that is the load-bearing part.** The alternatives all make
+/// the verdict depend on something other than the input: `Host` /
+/// `X-Forwarded-Host` is attacker-influenceable, and a configured public URL
+/// would make one and the same destination legal in one deployment and refused
+/// in another. `.invalid` is reserved by RFC 2606, so it can never name a real
+/// origin.
+const DEST_SENTINEL_BASE: &str = "https://dest.invalid/";
+
+/// Reduce a caller-supplied destination to one that can only ever be *ours*, or
+/// say why it cannot be.
+///
+/// Both places this crate emits a post-login `Location` go through it: the gate,
+/// before the destination is written into the session, and the callback, before
+/// it is handed to the browser. **Two call sites, one rule** — a second spelling
+/// of "is this destination ours" is how one of them gets fixed and the other
+/// does not. The callback needs its own pass regardless of the gate's, because
+/// it reads from a store shared across replicas whose rows outlive a rolling
+/// deploy: a `decide`-only fix is not in force for any row an older binary
+/// already wrote.
+///
+/// The rule **parses** rather than prefix-matching, because a prefix rule cannot
+/// be completed. The WHATWG parser strips ASCII tab/LF/CR *before* deciding
+/// where the authority starts and folds `\` to `/` for a special scheme, so
+/// `//host`, `/\host`, `\\host`, `/\/host`, `//\host`, `///host` and
+/// `/<TAB>/host` all resolve to the same off-origin place. Resolve against the
+/// sentinel, compare `origin()`, and every one of them is answered by the same
+/// two lines.
+///
+/// **The post-condition is not belt-and-braces; it catches a family the origin
+/// check passes.** Measured on `url` 2.5.8: `/..//evil.example.com` resolves to
+/// the sentinel's own origin — so the origin check is satisfied — and
+/// re-serialises to `//evil.example.com`. Emitting the parsed components would
+/// therefore *manufacture* the protocol-relative form out of an input that never
+/// had one. The single-dot family (`/.//x`, `/a/..//x`, …) behaves identically.
+/// It is a post-condition on **the string this function built**, which is a
+/// different thing from letting a prefix decide the verdict — and it is why no
+/// backslash check is needed here: within a special scheme the parser has
+/// already folded `\` to `/` and stripped the tab.
+///
+/// **Not an `assert!` and not a `debug_assert!`.** The first is a panic
+/// reachable from request-shaped input in a library the whole estate links,
+/// i.e. a denial-of-service primitive; the second is compiled out of every
+/// release binary while reading like a guarantee. It is an ordinary branch, and
+/// its callers turn it into the site root plus one `warn!`.
+///
+/// Private on purpose. Exporting it would commit the reason vocabulary below to
+/// this crate's public API; a consumer wanting to retire its own copy is a
+/// scoped follow-up, not a rider on this fix.
+///
+/// `reqwest::Url` rather than a direct `url` dependency: `web-login` already
+/// requires reqwest, which already brings `url`, and two copies of `url` in one
+/// binary would be a genuine hazard for a guard whose security property *is* the
+/// parse semantics.
+fn origin_relative_dest(dest: Option<&str>) -> Result<String, &'static str> {
+    let dest = match dest {
+        // An empty destination names nowhere, and it has to be refused
+        // explicitly: the parser resolves `""` to the base, which would forward
+        // to `/` silently instead of saying so.
+        Some(d) if !d.is_empty() => d,
+        _ => return Err("missing"),
+    };
+
+    // Refused, never normalised. `/x\r\nSet-Cookie: a=b` parses to
+    // `/xSet-Cookie:%20a=b`, so accepting it would mean validating one string
+    // and emitting a visibly different one — the bug class this function exists
+    // to remove.
+    if dest.chars().any(|c| c.is_ascii_control()) {
+        return Err("control_character");
+    }
+
+    let base =
+        reqwest::Url::parse(DEST_SENTINEL_BASE).expect("DEST_SENTINEL_BASE is a literal URL");
+    let Ok(resolved) = reqwest::Url::options().base_url(Some(&base)).parse(dest) else {
+        return Err("unparseable");
+    };
+    if resolved.origin() != base.origin() {
+        return Err("not_origin_relative");
+    }
+
+    // Reconstruct from the parsed components, so what is emitted is what was
+    // judged. Userinfo and host are dropped by construction.
+    let mut out = String::from(resolved.path());
+    if let Some(query) = resolved.query() {
+        out.push('?');
+        out.push_str(query);
+    }
+    if let Some(fragment) = resolved.fragment() {
+        out.push('#');
+        out.push_str(fragment);
+    }
+
+    // **`escapes_root` is a misnomer, kept deliberately.** It never fires for an
+    // input that escapes the document root — `/../../etc/passwd` is *accepted*,
+    // and normalised to `/etc/passwd`. What it mostly fires for is the
+    // protocol-relative form the reconstruction above can MANUFACTURE out of a
+    // dot-segment input that never contained one. The name is the one
+    // botsafely-controller's copy of this rule already publishes, and one
+    // reason vocabulary the estate can grep for beats a locally better word.
+    //
+    // The first disjunct is not dead code, though nothing reaches it from either
+    // call site. A cannot-be-a-base URL whose `origin()` aliases the sentinel
+    // gets past the origin comparison and yields a path with no leading slash:
+    // measured, `blob:https://dest.invalid/x` gives `origin() == base.origin()`
+    // and `path() == "https://dest.invalid/x"`. Refused here, correctly.
+    if !out.starts_with('/') || out.starts_with("//") {
+        return Err("escapes_root");
+    }
+    Ok(out)
+}
+
+/// [`origin_relative_dest`], with the refusal turned into the site root and one
+/// `warn!`.
+///
+/// **Refused means `/`, never a 4xx**, at both sites and for different reasons.
+/// At the callback a 4xx would discard a *completed* authentication — the code
+/// is spent, the session is rotated and the cookie is about to be set — leaving
+/// the caller logged in with an error page and no way back. At the gate it would
+/// let this library refuse a page of the consumer's own that it merely failed to
+/// understand. The site root is somewhere every consumer serves.
+///
+/// `auth.redirect.reason` distinguishes the five refusals because `refused`
+/// alone cannot tell a typo in someone's UI from a probe for this defect.
+///
+/// `auth.redirect.dest` carries the **raw** destination, before sanitisation —
+/// that is the whole point of the line — so it is the most attacker-controlled
+/// value in this module and the two things protecting it are worth stating
+/// exactly, because an earlier revision of this comment got them the wrong way
+/// round.
+///
+/// **The bare `&str` is what makes the fmt layer escape *and* quote the value.**
+/// Escaping is what stops a CRLF forging a whole log line; quoting is what stops
+/// a space or an `=` forging a `key=value` pair inside one. [`log_safe`]
+/// contributes **only the cap** — read its body, it is truncation and nothing
+/// else. So swapping to `%` reopens both holes and keeping the `log_safe(..)`
+/// call around it compensates for neither.
+///
+/// **Scope the CRLF case precisely — an earlier revision of this comment did
+/// not, and neither did the ticket.** `control_character` is refused at the
+/// callback for any row already in the store, and such a row's value does reach
+/// this line raw. But no binary of this library can write one: the only writer
+/// of `redirects` is `decide`, whose value comes from
+/// `http::Uri::path_and_query`, and `http::Uri` rejects CR and LF as
+/// `InvalidUriChar`. Putting a CRLF on this line therefore needs a store writer
+/// outside this library. The `&str` neither rests on that reachability nor is
+/// weakened by its absence — it is what makes every refused value, whatever the
+/// caller chose, render as exactly one line.
+///
+/// **On the OTLP path there is no fmt layer at all**, so with `otel.enabled` set
+/// neither the escaping nor the quoting applies to the exported attribute and
+/// **only the cap is in force**. A collector or a UI that renders an attribute
+/// value verbatim sees whatever bytes the caller sent, bounded to
+/// [`MAX_LOGGED_LEN`].
+///
+/// **Only refusals are logged, and the trade has a cost worth naming.** A
+/// legitimate in-app destination never reaches a log line at all — but a refused
+/// one *is* recorded, so an absolute return URL carrying a token in its query is
+/// refused *and* has its first [`MAX_LOGGED_LEN`] bytes written out. Silence on
+/// the accept path is a judgement that a successful same-origin forward is not
+/// worth a line, not a claim that the value is recorded somewhere else.
+///
+/// **The line is unsampled on an anonymously reachable path, and [`gate`]'s own
+/// doc comment argues against exactly that** — it keeps
+/// `auth.gate.session.load_failed` as a span field rather than a log line for
+/// this reason. The divergence is deliberate; the argument for it is not the one
+/// an earlier revision of this comment gave. That version said a refusal "needs
+/// a caller who sent a hostile destination", as though that made the rate
+/// smaller. It makes it **attacker-chosen**, which is worse: the accidental rate
+/// here is nil and the adversarial rate is unbounded. Nor is it only an ingest
+/// bill — `botsafely-controller` carries no `logging:` block in any of its
+/// compose files (verified), so on Docker's default `json-file` driver, with no
+/// `max-size`, a sustained flood is host disk-fill. Deliberately not a count:
+/// the phrasing this was inherited from enumerated two files, was written before
+/// that repo's third one existed, and became false without reading as false. A
+/// hand-maintained number over a set that grows goes silently stale while
+/// reading as authoritative — which is why this sentence names none.
+///
+/// What `load_failed` has and this does not is a **second source**: the store has
+/// already emitted its own `error!` for the cause, so dropping that log line
+/// costs nothing. A refusal has no other line anywhere, and a guard nobody can
+/// tell fired is indistinguishable from one that was never reached. That is the
+/// whole justification, and it is a trade rather than a win. If the rate bites,
+/// the remedy is the deployment's own filter — not a config key here, which
+/// would be a switch that quiets an open-redirect guard.
+///
+/// The two span fields are recorded **only on a refusal**, following
+/// `error.message`'s precedent in this crate: a field that is present and
+/// `false` on every clean login defeats `auth.redirect.refused exists`, which is
+/// the filter an operator actually reaches for.
+///
+/// **They are NOT export-only, and an earlier revision of this comment said they
+/// were.** `fmt::Layer::on_record` appends each recorded field to the span's
+/// `FormattedFields`, and `Format<Full>` writes every in-scope span's fields in
+/// braces ahead of each event inside it. So at the shipped
+/// `otel.enabled: "false"`, on the fleet's `log.level: debug`, both fields *do*
+/// render — in the `auth.gate{…}` prefix of the very `warn!` below, which is
+/// also why `auth.redirect.reason` appears on that line **twice**, once in the
+/// braces and once among the event's own fields.
+/// `tests/redirect_refusal_log_debug.rs` drives that filter shape and pins it.
+fn safe_dest(dest: Option<&str>, site: &'static str, user_id: Option<&str>) -> String {
+    match origin_relative_dest(dest) {
+        Ok(d) => d,
+        Err(reason) => {
+            let span = tracing::Span::current();
+            span.record("auth.redirect.refused", true);
+            span.record("auth.redirect.reason", reason);
+            // Two arms rather than one call with `unwrap_or_default()`, for the
+            // same reason the span fields above are `Empty` until a refusal: a
+            // `user.id=""` on every gate refusal defeats `user.id exists`, and
+            // the gate genuinely has no user to name — `decide` refuses before
+            // anyone is authenticated. At the callback there always is one.
+            match user_id {
+                Some(uid) => tracing::warn!(
+                    auth.redirect.outcome = %"refused",
+                    auth.redirect.reason = %reason,
+                    auth.redirect.dest = log_safe(dest.unwrap_or_default()).as_str(),
+                    auth.redirect.site = %site,
+                    user.id = uid,
+                    "web_login: post-login redirect destination refused"
+                ),
+                None => tracing::warn!(
+                    auth.redirect.outcome = %"refused",
+                    auth.redirect.reason = %reason,
+                    auth.redirect.dest = log_safe(dest.unwrap_or_default()).as_str(),
+                    auth.redirect.site = %site,
+                    "web_login: post-login redirect destination refused"
+                ),
+            }
+            "/".to_string()
+        }
+    }
+}
+
 fn see_other(location: &str, set_cookie: Option<HeaderValue>) -> Response {
     let mut resp = Response::builder()
         .status(StatusCode::SEE_OTHER)
@@ -686,6 +940,8 @@ struct CallbackQuery {
     skip_all,
     fields(
         auth.login.outcome = tracing::field::Empty,
+        auth.redirect.refused = tracing::field::Empty,
+        auth.redirect.reason = tracing::field::Empty,
         session.op = tracing::field::Empty,
         user.id = tracing::field::Empty,
     )
@@ -936,9 +1192,22 @@ async fn callback(
         );
     }
     span.record("auth.login.outcome", "success");
-    tracing::debug!(user = %resolved.user_id, "web_login: login complete, redirecting to {orig}");
+    // The second pass, and it is not redundant with the gate's. This value came
+    // out of a store the whole fleet shares, so it may have been written by a
+    // binary that predates the gate's pass — for as long as the store's TTL,
+    // which the deployment chooses.
+    // `user.id` is in hand here and the caller is authenticated by now, so the
+    // refusal line carries it — the sibling `warn!`s in this handler do. The
+    // gate's call site deliberately passes `None`: it refuses before there is
+    // any user to name.
+    let dest = safe_dest(
+        Some(orig.as_str()),
+        "callback",
+        Some(resolved.user_id.as_str()),
+    );
+    tracing::debug!(user = %resolved.user_id, "web_login: login complete, redirecting to {dest}");
     see_other(
-        &orig,
+        &dest,
         Some(build_set_cookie(&wl.cfg, &new_sid, request_is_https(&headers))),
     )
 }
@@ -981,6 +1250,11 @@ pub async fn gate(State(g): State<GateState>, req: Request, next: Next) -> Respo
         auth.gate.session.present = tracing::field::Empty,
         auth.gate.session.minted = tracing::field::Empty,
         auth.gate.session.load_failed = tracing::field::Empty,
+        // Recorded only when a destination was refused — see `safe_dest`. A
+        // field that is present and `false` on every clean request defeats the
+        // `auth.redirect.refused exists` filter.
+        auth.redirect.refused = tracing::field::Empty,
+        auth.redirect.reason = tracing::field::Empty,
         session.op = tracing::field::Empty,
         user.id = tracing::field::Empty,
     );
@@ -1066,7 +1340,8 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
         return GateDecision::Respond((StatusCode::UNAUTHORIZED, "not logged in").into_response());
     }
 
-    // Begin the authorization-code dance: stash state → original URL. This is
+    // Begin the authorization-code dance: stash state → the sanitised original
+    // URL (see the `safe_dest` call below, which is what makes it so). This is
     // the only branch that needs a session id, so it is the one that mints it —
     // and the only one that writes.
     //
@@ -1088,10 +1363,21 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
     };
     let set_cookie = minted.then(|| build_set_cookie(&wl.cfg, &sid, request_is_https(headers)));
 
-    let orig = uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
+    // Sanitised *before* it is persisted, not merely before it is emitted. The
+    // request target is caller-supplied and this row is what `callback` reads
+    // back to build a `Location`, so a hostile spelling stored here is a
+    // post-authentication open redirect held in shared storage for the store's
+    // TTL. `callback` sanitises again on the way out, because rows written by an
+    // older binary outlive a rolling deploy.
+    //
+    // One behaviour change here that is not a security one, so that nobody
+    // reads it as a symptom: an authority-form target has no `path_and_query`,
+    // which used to fall silently to `/` and now falls to `/` plus a `missing`
+    // warn. Identical behaviour, newly audible.
+    //
+    // `None` for the user: this branch is reached only when the caller is *not*
+    // authenticated, so there is no id to put on the refusal line.
+    let orig = safe_dest(uri.path_and_query().map(|pq| pq.as_str()), "gate", None);
     let state_key = uuid::Uuid::new_v4().to_string();
     sess.redirects.insert(state_key.clone(), orig);
     if let Err(e) = wl.store.store(&sid, &sess).await {
@@ -2641,6 +2927,273 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(store.stores(), 0, "authenticating a request must not write");
         assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    // ─── HIK-272: the post-login redirect ──────────────────────────────────
+    //
+    // One table per verdict, shared by the three tests below, so a row added
+    // for one of them is exercised by all of them. `tests/redirect_refusal_log
+    // .rs` is a separate binary and cannot see these; it drives a single row
+    // and says so.
+
+    /// Destinations that must never reach a browser as a `Location`.
+    ///
+    /// The rows are grouped by the reason the rule refuses them, and the reason
+    /// is a measured property of `url` 2.5.8 rather than a design choice — the
+    /// first three fail the origin check, the next three do not parse at all,
+    /// and every dot-segment row parses and passes the origin check but
+    /// **re-serialises** to a leading `//`, which only the post-condition
+    /// catches. The last row carries a CRLF.
+    ///
+    /// The dot-segment family is the reason the guard is a post-condition on
+    /// the string we construct rather than a longer list of prefixes to reject:
+    /// `/..//evil.example.com` never had a protocol-relative form, and
+    /// validate-then-emit *manufactures* one out of it.
+    const MUST_REFUSE: &[&str] = &[
+        "//evil.example.com/x",
+        "/\\evil.example.com/x",
+        "/\\/evil.example.com/x",
+        "///evil.example.com/x",
+        "////evil.example.com/x",
+        "//\\evil.example.com/x",
+        "/..//evil.example.com",
+        "/.//x",
+        "/%2e//x",
+        "/a/..//x",
+        "/a/./..//x",
+        "/%2e%2e//x",
+        "/../..//x",
+        "/..\\/x",
+        "/.\\/x",
+        "/..//",
+        "/.//",
+        "/..//?q=1",
+        "/..//#f",
+        "/x\r\nSet-Cookie: a=b",
+    ];
+
+    /// Destinations that must survive **byte-identical**.
+    const MUST_ACCEPT: &[&str] = &["/dash?tab=runs", "/api/auth", "/", "/x?a=b#f"];
+
+    /// Destinations that are accepted but come back **normalised**, with the
+    /// output pinned explicitly.
+    ///
+    /// The accepted set moves in both directions under this change, so leaving
+    /// these unpinned would let a future refactor flip them invisibly. Both
+    /// outputs are origin-relative, which is the only property the guard
+    /// promises.
+    const MUST_REWRITE: &[(&str, &str)] = &[("/../../etc/passwd", "/etc/passwd"), ("*", "/*")];
+
+    /// Resolve an emitted `Location` the way a browser does and require the
+    /// origin to be unchanged.
+    ///
+    /// **A parse error is a FAILURE here, not a pass, and that clause is the
+    /// whole difference between this oracle and a broken one.** Measured on
+    /// `url` 2.5.8: `///evil.example.com/x` fails to parse ("empty host"),
+    /// while Chrome resolves it against `https://app.example.com/` to
+    /// `https://evil.example.com/x`. Spelled "if it parses, assert the origin
+    /// is unchanged", this helper would skip its own assertion on that row and
+    /// report green against a `Location` a browser follows off-origin — HIK-242's
+    /// `startsWith` oracle bug wearing a different hat.
+    fn stays_on_origin(location: &str, from: &str) {
+        let base = reqwest::Url::parse("https://app.example.com/").expect("a literal base parses");
+        match base.join(location) {
+            Ok(resolved) => assert_eq!(
+                resolved.origin(),
+                base.origin(),
+                "the Location emitted for {from:?} resolves off-origin"
+            ),
+            Err(e) => panic!(
+                "the Location emitted for {from:?} ({location:?}) did not parse ({e}); \
+                 a parse failure is not a pass — see this helper's doc comment"
+            ),
+        }
+    }
+
+    /// A destination already sitting in the session store cannot send the
+    /// browser off-origin when the login completes.
+    ///
+    /// Seeding `redirects` **directly** is what makes this the rolling-deploy
+    /// test as well: `callback` reads from a store shared across replicas whose
+    /// rows live for the store's TTL, so a row written by an old binary is
+    /// answered by a new one. A fix in `decide` alone is not in force for those
+    /// rows, and this test is what says so.
+    ///
+    /// **Never asserts on the status.** A 303 is correct in the safe and the
+    /// unsafe case alike, so a status-only assertion is green against the bug.
+    ///
+    /// Two oracles, both required: the browser-equivalent one (the emitted
+    /// `Location`, resolved with a real URL parser, stays on the origin) and the
+    /// exact one (it is the site root). The first is what a browser actually
+    /// does; the second is what this crate promises.
+    ///
+    /// **What it cannot kill:** it is green against a `decide`-only fix's
+    /// `decide` half, and it says nothing whatever about what gets *persisted* —
+    /// that is `a_hostile_destination_is_never_persisted_in_the_session`.
+    #[tokio::test]
+    async fn no_stored_destination_can_send_the_browser_off_origin_after_login() {
+        let base = oauth_provider_stub();
+        for hostile in MUST_REFUSE {
+            let store = Arc::new(FailingStore::new());
+            let mut seeded = Session::default();
+            seeded
+                .redirects
+                .insert("st-1".into(), (*hostile).to_string());
+            store.inner.store("pre-login-sid", &seeded).await.unwrap();
+
+            let resp = callback_app_at(store.clone(), base.clone())
+                .oneshot(callback_request())
+                .await
+                .unwrap();
+
+            let loc = resp
+                .headers()
+                .get(header::LOCATION)
+                .unwrap_or_else(|| {
+                    panic!("a completed login must still redirect somewhere ({hostile:?})")
+                })
+                .to_str()
+                .unwrap_or_else(|_| {
+                    panic!("the Location emitted for {hostile:?} is not printable ASCII")
+                });
+
+            stays_on_origin(loc, hostile);
+            assert_eq!(
+                loc, "/",
+                "a refused destination falls back to the site root, never to {hostile:?}"
+            );
+        }
+    }
+
+    /// The gate must not persist a hostile destination in the first place — and
+    /// it must still write the row, or `callback` answers "no state found" and
+    /// login is broken for everyone.
+    ///
+    /// The hostile targets match no route on `gated_app`, and they reach
+    /// `decide` anyway because `axum::Router::layer` layers the *fallback*
+    /// router too. That is a property of this router's shape, not of the
+    /// library: `gated_app` has no top-level `fallback_service`.
+    ///
+    /// **What it cannot kill, and nobody may cite it for more than it says:**
+    /// it is not evidence that any consumer is exploitable. Three of the four
+    /// consumers apply a top-level `fallback_service(ServeDir)` after the merge,
+    /// which takes these targets before the gate sees them, and `matchit` 0.8
+    /// does not collapse a doubled slash onto an exact gated route. This test
+    /// pins the library's own behaviour on a router that does not have that
+    /// cover.
+    #[tokio::test]
+    async fn a_hostile_destination_is_never_persisted_in_the_session() {
+        for hostile in MUST_REFUSE {
+            // The CRLF row is excluded, and only that one: `http::Uri` rejects
+            // it as `InvalidUriChar`, so hyper never delivers it to `decide`.
+            // It is reachable from a stored row alone, which is what
+            // `no_stored_destination_can_send_the_browser_off_origin_after_login`
+            // drives.
+            if hostile.chars().any(|c| c.is_ascii_control()) {
+                continue;
+            }
+            let store = Arc::new(CountingStore::new());
+            let resp = gated_app(store.clone(), false)
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(*hostile)
+                        .header("x-forwarded-proto", "https")
+                        .header("x-forwarded-host", "app.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let loc = resp
+                .headers()
+                .get(header::LOCATION)
+                .unwrap_or_else(|| panic!("the browser tier redirects to the IdP ({hostile:?})"))
+                .to_str()
+                .unwrap()
+                .to_string();
+            let state_key = reqwest::Url::parse(&loc)
+                .unwrap()
+                .query_pairs()
+                .into_owned()
+                .collect::<HashMap<_, _>>()
+                .remove("state")
+                .unwrap_or_else(|| panic!("the authorize URL carries a state ({hostile:?})"));
+            let sid = resp
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap_or_else(|| panic!("the browser tier mints a sid ({hostile:?})"))
+                .to_str()
+                .unwrap()
+                .strip_prefix("hs_session=")
+                .expect("cookie names the session")
+                .split(';')
+                .next()
+                .unwrap()
+                .to_string();
+
+            assert_eq!(
+                store.stores(),
+                1,
+                "the state row must still be written, or the callback 400s ({hostile:?})"
+            );
+            let sess = store
+                .inner
+                .load(&sid)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("the redirect branch created the row ({hostile:?})"));
+            assert_eq!(
+                sess.redirects.get(&state_key).map(String::as_str),
+                Some("/"),
+                "a hostile request target must be stored as the site root, not as {hostile:?}"
+            );
+        }
+    }
+
+    /// The other direction: a destination that is nobody's problem comes back
+    /// exactly as it went in, and a normalised one comes back in a form pinned
+    /// here rather than left to drift.
+    ///
+    /// **What it cannot kill.** It drives the callback only, so it says nothing
+    /// about what the *gate* accepts — an asymmetry between the two sites would
+    /// leave it green. Its `MUST_ACCEPT` half is green against the unfixed code
+    /// too (verbatim survival is the pre-fix behaviour), so the whole of its
+    /// discriminating power sits in `MUST_REWRITE`: it is a pin on a set this
+    /// change *widened*, not a regression test for the defect. And the rewrites
+    /// it pins are `url` 2.5.8's, so a future bump that changes them fails here
+    /// — intended, but it means a red result is as likely to be news about the
+    /// dependency as a bug in this crate.
+    #[tokio::test]
+    async fn a_legitimate_destination_survives_login_verbatim_and_a_normalised_one_is_pinned() {
+        let base = oauth_provider_stub();
+        let cases = MUST_ACCEPT
+            .iter()
+            .map(|d| (*d, *d))
+            .chain(MUST_REWRITE.iter().copied());
+        for (stored, want) in cases {
+            let store = Arc::new(FailingStore::new());
+            let mut seeded = Session::default();
+            seeded.redirects.insert("st-1".into(), stored.to_string());
+            store.inner.store("pre-login-sid", &seeded).await.unwrap();
+
+            let resp = callback_app_at(store.clone(), base.clone())
+                .oneshot(callback_request())
+                .await
+                .unwrap();
+
+            let loc = resp
+                .headers()
+                .get(header::LOCATION)
+                .unwrap_or_else(|| panic!("a completed login redirects somewhere ({stored:?})"))
+                .to_str()
+                .unwrap();
+            assert_eq!(
+                loc, want,
+                "the destination stored as {stored:?} must be forwarded as {want:?}"
+            );
+        }
     }
 
     #[tokio::test]
