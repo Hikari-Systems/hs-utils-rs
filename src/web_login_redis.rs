@@ -27,8 +27,18 @@
 //! when redis was down would turn a degraded dependency into a service that
 //! will not boot.
 //!
-//! Posture matches the rest of hs-utils' shared stores: **fail open** — a redis
-//! outage degrades to "the user is asked to log in again", never a 500.
+//! Posture matches the rest of hs-utils' shared stores: a failure is logged here
+//! **and returned**, and the caller decides what it costs — a caller whose next
+//! step depends on the write landing (the session-id rotation in `callback`) can
+//! now tell that it did not.
+//!
+//! **What that costs during an outage is worth knowing before you plan a
+//! maintenance window.** The gate's *read* fails open, but the browser tier
+//! writes immediately afterwards and that write is fatal, so a redis outage is a
+//! 503 on every browser-gated page — not "everyone is asked to log in again".
+//! Api-gated routes still 401, because they return before the write. See
+//! `web_login::gate`, and the oracle both stores share,
+//! `web_login::tests::a_store_outage_is_a_401_on_the_api_tier_and_a_503_on_the_browser_tier`.
 //!
 //! Note both modes obtain a connection per operation. For Sentinel that is
 //! required (the master can move); for a single node it is merely consistent,
@@ -411,8 +421,9 @@ impl RedisSessionStore {
     /// db index (`/0`), credentials (`redis://user:pass@host`) and TLS
     /// (`rediss://`) — so there is no second config shape to keep in step.
     ///
-    /// Performs no I/O: an unreachable host is discovered on first use and
-    /// handled by the fail-open path, not here.
+    /// Performs no I/O: an unreachable host is discovered on first use, as an
+    /// `Err` from whichever operation reached for it — not here. Only the read
+    /// sites named in the module header absorb that; the writes do not.
     pub fn from_url(url: &str, ttl: Duration) -> Result<Self> {
         let url = url.trim();
         anyhow::ensure!(!url.is_empty(), "redis url is empty");

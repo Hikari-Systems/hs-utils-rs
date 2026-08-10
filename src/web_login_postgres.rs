@@ -45,7 +45,8 @@
 //! writes immediately afterwards and that write is fatal, so a Postgres outage
 //! is a 503 on every browser-gated page — not "everyone is asked to log in
 //! again". Api-gated routes still 401, because they return before the write. See
-//! `web_login::gate`.
+//! `web_login::gate`, and the oracle both stores share,
+//! `web_login::tests::a_store_outage_is_a_401_on_the_api_tier_and_a_503_on_the_browser_tier`.
 //!
 //! **First-time DB setup** (role, table, grants — one script per consuming
 //! service) is templated in `docs/web-login-postgres-db-setup.md`; copy the

@@ -71,8 +71,11 @@ pub async fn refresh_session_profile(core: &CoreServices, session_id: Option<&st
     //
     // **What is lost differs by caller, and the earlier note here described only
     // one of them.** `ensure_terms_hydrated` patches the in-memory profile
-    // itself, so its request sees the value regardless; the cost is one more
-    // Kratos lookup next time. `accept_terms`
+    // itself, so its request sees the value regardless; the cost is a Kratos
+    // lookup on *every* request until a write-back lands, not one more next
+    // time — the skip at the top of that function is driven by the persisted
+    // profile, so a session whose row was never refreshed re-hydrates each time.
+    // `accept_terms`
     // (`controller/graphql/terms.rs`) has no such patch: with the cached session
     // unrefreshed, a user who accepts during a blip is re-prompted on every
     // request until the session profile is rebuilt at the next login. Annoying,
