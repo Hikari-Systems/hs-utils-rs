@@ -817,10 +817,34 @@ async fn callback(
         // handler, the only surviving evidence of what the row held, is what
         // gets written, `redirects` and all. A second tab whose `state` was
         // already on that copy still finds it under the rotated id; what is lost
-        // is only whatever reached the row after that first read. Spelled as a
-        // branch and not `unwrap_or_default()`, because that spelling swallowed
-        // the `Err` below too, which is how a store blip came to silently drop a
-        // second tab's `redirects`. Pinned by
+        // is only whatever reached the row after that first read.
+        //
+        // **It also RESURRECTS, and losing data is the half a reader guesses.**
+        // `sess.redirects.remove` below drops *this* callback's own `state` and
+        // nothing else, so every other entry on the snapshot is written into the
+        // authenticated row — and a snapshot cannot say whether one of them has
+        // since been **consumed** by another tab that finished first. Measured
+        // on this arm's own fixture with the two tabs' roles swapped — seeded
+        // `{st-1: /tab-one, st-2: /tab-two}`, re-read blanked, `state=st-2`
+        // instead of `st-1`: the rotated row comes back
+        // `redirects = {"st-1": "/tab-one"}`, and if tab 1 got there first that
+        // `st-1` names a state which by then exists nowhere else — its row was
+        // removed and the entry dropped from tab 1's own rotation
+        // (`a_state_stored_while_the_token_exchange_was_in_flight_survives_the_rotation`
+        // asserts both). It then lives for the row's TTL. New with the fix: at
+        // `c46e50c` this was `load(&sid).await.unwrap_or_default()` over an
+        // `Option<Session>`, so a vanished row produced `Session::default()` and
+        // the whole snapshot went.
+        //
+        // Accepted rather than fixed. Nothing in `prior` distinguishes pending
+        // from consumed, so the choice is between resurrecting some spent
+        // entries and dropping every live one — and a resurrected entry only
+        // maps a `state` to a destination: redeeming it still needs a fresh
+        // single-use `code` from the IdP, which is the IdP's to refuse.
+        //
+        // Spelled as a branch and not `unwrap_or_default()`, because that
+        // spelling swallowed the `Err` below too, which is how a store blip came
+        // to silently drop a second tab's `redirects`. Pinned by
         // `a_row_that_vanished_between_the_two_reads_carries_the_first_read_across`.
         Ok(None) => prior,
         Err(e) => {
@@ -1824,9 +1848,14 @@ mod tests {
     /// exchange — the re-read after it is unreachable under that fixture, which
     /// is why two of its three arms were asserted by nothing. The two `*_nth`
     /// fields name a 1-based call index instead; `0`, the default, matches no
-    /// call, so the four tests built on `fail_load` keep exactly the behaviour
-    /// they were written against. The count is per store rather than per
-    /// request: a test driving two callbacks through one store is counting both.
+    /// call, so the two tests that set `fail_load` —
+    /// `a_store_outage_is_a_401_on_the_api_tier_and_a_503_on_the_browser_tier`
+    /// and `a_store_outage_at_the_callback_is_not_reported_as_a_bogus_state` —
+    /// keep exactly the behaviour they were written against. Named rather than
+    /// counted, per this file's own habit: a numeral here read neither the
+    /// latch's setters nor the tests built on `FailingStore`, and matched
+    /// nothing. The count is per store rather than per request: a test driving
+    /// two callbacks through one store is counting both.
     struct FailingStore {
         inner: InMemorySessionStore,
         fail_load: AtomicBool,
@@ -2408,8 +2437,11 @@ mod tests {
         );
     }
 
-    /// What a store outage actually costs, per tier — the sentence three doc
-    /// comments got wrong.
+    /// What a store outage actually costs, per tier — the sentence this crate's
+    /// doc comments keep getting wrong, which is why both store headers now
+    /// point a reader here instead of restating it. (No count: the previous one
+    /// was stale within the round that wrote it, and this is the doc comment
+    /// those headers send you to.)
     ///
     /// The gate's `load` fails open, which is easy to read as "an outage
     /// degrades to logging in again, never an error page". It does not: failing

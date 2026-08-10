@@ -50,10 +50,17 @@ use tracing_subscriber::registry::LookupSpan;
 const SID: &str = "0f9c2b7a-4e51-4a3d-9c6e-1b8d5f2a7c34";
 const STATE: &str = "b81f5c02-9a6d-47e3-8c14-5f39d2a70e6b";
 
-/// One recorded field: the span's **name**, the field's name, the value. The
-/// span name is what makes a single capture serve two spans — `auth.gate` and
-/// `auth.login` both carry a `session.op`, and reading the wrong one would be a
-/// false green.
+/// One recorded field: the span's **name**, the field's name, the value.
+///
+/// The name is carried so a single capture can serve two spans — `auth.gate`
+/// and `auth.login` both carry a `session.op`. **It is not load-bearing today,
+/// and saying so is the honest version of that claim**: drives 1–2 create only
+/// an `auth.gate` and drives 3–5 only an `auth.login`, and the capture is
+/// cleared between each, so no drive here could read the wrong span's value even
+/// if the key were dropped. What it defends is the next drive — one that reaches
+/// `callback` through the gate, or a `gate` assertion added after a `callback`
+/// one without an intervening `clear()`. Kept because it costs a `&'static str`
+/// and because the alternative is discovering the collision as a false green.
 type Recorded = (&'static str, String, String);
 
 /// Every field set on every span.

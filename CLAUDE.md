@@ -74,7 +74,7 @@ async fn remove(&self, sid: &str)                   -> anyhow::Result<()>;      
 
 Grep each consumer for `.remove(` and `.store(` on a session store and rule on every hit. `botsafely-controller/src/routes/auth.rs` is the known one: it hand-rolls logout rather than calling `end_session`, so it owns the verdict itself.
 
-Posture to copy when deciding what an error costs, taken from this crate's own call sites: fail **open** where an unreadable row and an absent row deserve the same answer (the gate's read, `access_token`, `id_token`); fail **loud** where a write is what makes the next request work (the session-id rotation, and the gate's `state` write). Do not read "the gate fails open" as "an outage keeps the site serving" — see `web_login::gate`.
+Posture to copy when deciding what an error costs, taken from this crate's own call sites: fail **open** where an unreadable row and an absent row deserve the same answer; fail **loud** where a write is what makes the next request work. The rule is generative and that is the point — the parenthetical list that used to sit here was the same three-site enumeration the `WebSessionStore` doc comment had just replaced for being short by `end_session`, reproduced two files away where nothing would catch it going stale again. For which sites take which, read the trait, not this. Do not read "the gate fails open" as "an outage keeps the site serving" — see `web_login::gate`.
 
 ---
 

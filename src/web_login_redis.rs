@@ -27,10 +27,17 @@
 //! when redis was down would turn a degraded dependency into a service that
 //! will not boot.
 //!
-//! Posture matches the rest of hs-utils' shared stores: a failure is logged here
-//! **and returned**, and the caller decides what it costs — a caller whose next
+//! Posture matches the Postgres sibling: a failure is logged here **and
+//! returned**, and the caller decides what it costs — a caller whose next
 //! step depends on the write landing (the session-id rotation in `callback`) can
 //! now tell that it did not.
+//!
+//! Named as that one store rather than as "hs-utils' shared stores", which is
+//! what this lead-in said while the clause after the colon flipped to
+//! fail-closed underneath it. The wider phrase now takes in
+//! `mcp_resource_server::db_session_store`, which does the opposite — it logs
+//! and swallows — and is a `SessionStore` rather than a `WebSessionStore`, so
+//! nothing here constrains it.
 //!
 //! **What that costs during an outage is worth knowing before you plan a
 //! maintenance window.** The gate's *read* fails open, but the browser tier
@@ -422,8 +429,14 @@ impl RedisSessionStore {
     /// (`rediss://`) — so there is no second config shape to keep in step.
     ///
     /// Performs no I/O: an unreachable host is discovered on first use, as an
-    /// `Err` from whichever operation reached for it — not here. Only the read
-    /// sites named in the module header absorb that; the writes do not.
+    /// `Err` from whichever operation reached for it — not here. Whether that is
+    /// absorbed or fatal is the caller's, per call site, and the rule is on
+    /// [`WebSessionStore`](crate::web_login::WebSessionStore): a read whose
+    /// answer to an unreadable row is the same as its answer to an absent one
+    /// fails open, a write that is what makes the next request work does not.
+    /// Pointed at the rule rather than at the module header, which names one
+    /// read of the several that absorb — read literally it said `access_token`,
+    /// `id_token` and `end_session` propagate, and they do not.
     pub fn from_url(url: &str, ttl: Duration) -> Result<Self> {
         let url = url.trim();
         anyhow::ensure!(!url.is_empty(), "redis url is empty");
@@ -663,7 +676,10 @@ impl WebSessionStore for RedisSessionStore {
         // **This branch logged nothing at all**, so a logout during a redis
         // outage was entirely invisible: no line, and — before the trait was
         // fallible — no way for the caller to know either. It now carries the
-        // same three fields as its six siblings.
+        // same three fields as every other `error!` site in this impl. Which
+        // sites those are is accounted for once, in the block comment above the
+        // impl; a second tally here was a second place to keep it, and the two
+        // disagreed.
         let mut conn = match self.conn().await {
             Ok(c) => c,
             Err(e) => {

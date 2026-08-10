@@ -35,10 +35,17 @@
 //! invisible the instant it lapses), and [`PgSessionStore::sweep_expired`]
 //! reclaims the dead rows — call it periodically (e.g. an hourly task).
 //!
-//! Posture matches the rest of hs-utils' shared stores: a failure is logged here
-//! **and returned**, and the caller decides what it costs — a caller whose next
+//! Posture matches the redis sibling: a failure is logged here **and
+//! returned**, and the caller decides what it costs — a caller whose next
 //! step depends on the write landing (the session-id rotation in `callback`) can
 //! now tell that it did not.
+//!
+//! Named as that one store rather than as "hs-utils' shared stores", which is
+//! what this lead-in said while the clause after the colon flipped to
+//! fail-closed underneath it. The wider phrase now takes in
+//! `mcp_resource_server::db_session_store`, which does the opposite — it logs
+//! and swallows — and is a `SessionStore` rather than a `WebSessionStore`, so
+//! nothing here constrains it.
 //!
 //! **What that costs during an outage is worth knowing before you plan a
 //! maintenance window.** The gate's *read* fails open, but the browser tier
