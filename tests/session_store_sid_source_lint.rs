@@ -5,20 +5,51 @@
 //!
 //! # Which files, and why that is a property rather than a list (HIK-274)
 //!
-//! The scanned set is every `src/web_login*.rs`. It was the two stores alone
-//! until HIK-274, and `src/web_login.rs` — which holds `gate`, `decide` and
-//! `callback`, i.e. the code that *mints, rotates and destroys* the sid the
+//! The scanned set is every web-login module under `src/`. It was the two stores
+//! alone until HIK-274, and `src/web_login.rs` — which holds `gate`, `decide`
+//! and `callback`, i.e. the code that *mints, rotates and destroys* the sid the
 //! stores merely persist — was unscanned. Nothing leaked there; the defect was
-//! that a leak would have been green everywhere, and HIK-241 and HIK-272 had by
-//! then put seven `warn!` sites inside functions where `sid`, `new_sid` or
-//! `cookie_sid` are live bindings.
+//! that a leak would have been green everywhere.
 //!
-//! [`every_web_login_module_in_src_is_scanned`] asserts the set against
-//! `read_dir` at test time rather than against a list written here, because the
-//! failure this lint exists to prevent is *silent under-reporting* and a
-//! hand-maintained file list is exactly that failure with a friendly face: add
-//! `src/web_login_mysql.rs` and every assertion below stays green while covering
-//! less than it claims.
+//! **Seven `warn!` sites arrived in that file while it was unscanned, and they
+//! divide into two reasons rather than one.** Five are HIK-241's, in `callback`
+//! and `decide`, and those genuinely do sit in functions where `sid`, `new_sid`
+//! or `cookie_sid` are live bindings. **Two are HIK-272's, and the qualifier is
+//! false for them**: both are in `safe_dest`, whose three parameters are the
+//! destination, the site name and an optional user id, with no session id in
+//! scope at all — as this file's own `reason` bullet says further down. What
+//! those two carry is the raw caller-supplied redirect destination, which is a
+//! real reason to scan the module and a *different* one. The earlier phrasing
+//! put all seven under the sid qualifier and so contradicted that bullet.
+//!
+//! [`every_web_login_module_in_src_is_scanned`] asserts the set against a
+//! recursive walk of `src/` at test time rather than against a list written
+//! here, because the failure this lint exists to prevent is *silent
+//! under-reporting* and a hand-maintained file list is exactly that failure with
+//! a friendly face: add `src/web_login_mysql.rs` — or, the shape that actually
+//! got past the first version of this, `src/web_login/gate.rs` — and every
+//! assertion below stays green while covering less than it claims.
+//!
+//! **Two residuals in that walk, neither closed.** The match is
+//! `starts_with`/`ends_with` on the path below `src/`, and it is
+//! **case-sensitive**: a `Web_Login_Mysql.rs` created on a case-insensitive file
+//! system (APFS, NTFS) is a legal module that this walk does not see. And the
+//! walk roots at `env!("CARGO_MANIFEST_DIR")`, which is baked in at compile
+//! time, so the test binary is **not relocatable** — `cargo nextest archive` and
+//! run elsewhere would panic, or worse, read a different checkout's `src/` and
+//! report on that. Both are invisible today because there is no CI running this
+//! suite; they are recorded here so that whoever adds one does not have to
+//! rediscover them.
+//!
+//! **`src/controller/` is a known frontier, and it is named because silence
+//! about it reads as coverage.** `src/controller/graphql/context.rs` holds a
+//! `pub session_id: Option<String>` — the raw unsigned credential — in a module
+//! this glob does not reach and, until this paragraph, did not mention. Nothing
+//! leaks there today. But `src/mcp_resource_server/db_session_store.rs` is named
+//! below as a deliberate exclusion *with a reason*, and a reader who sees one
+//! module called out by name will take the glob as complete coverage of
+//! "everything that handles the sid". It is not: it is complete coverage of the
+//! web-login modules, which is a smaller claim.
 //!
 //! **This is subordinate to the two behavioural tests, not a substitute for
 //! them.** It earns its place for three reasons: it covers the three `error!`
@@ -227,9 +258,14 @@
 //! Deliberately scoped to the web-login modules. It is **not** extended to
 //! `src/mcp_resource_server/db_session_store.rs`, which has the same shape but a
 //! different trust claim and its own ticket: a test that is red for another
-//! ticket's reason gets muted, and then it is red for nobody's. That module sits
-//! in a subdirectory and does not match `web_login*.rs`, so HIK-274's glob
-//! cannot pick it up by accident — two independent reasons, stated at the test.
+//! ticket's reason gets muted, and then it is red for nobody's. The walk **does**
+//! descend into `src/mcp_resource_server/` and declines that file because its
+//! path below `src/` does not begin `web_login` — one reason, and the only one.
+//! An earlier revision offered non-recursion as a second, independent reason;
+//! the walk recurses now, and that was never a reason so much as an accident of
+//! how the set happened to be computed. Pinned by
+//! [`the_module_walk_descends_into_submodules_and_still_excludes_by_name`],
+//! which puts a deliberately `web_login`-named decoy in that directory.
 //!
 //! **`InMemorySessionStore` is now in scope**, having moved with the file it
 //! lives in (`src/web_login.rs`). It contributes nothing: it implements the same
@@ -249,29 +285,51 @@ struct SourceFile {
     /// [`no_web_login_module_carries_a_dead_value_list_entry`] for why an entry
     /// no site names any longer is deleted rather than left.
     allowed_value_idents: &'static [&'static str],
+    /// Whether this module is **declared** to contain scanned invocations.
+    ///
+    /// The liveness check below is a guard against the scanner going dark on a
+    /// file, which is the failure a source lint is most prone to. But once the
+    /// file set became a property (HIK-274), a `src/web_login*.rs` with no
+    /// logging in it became something a reader is *obliged* to add here — and an
+    /// unconditional floor then reports "the scanner is not seeing this file"
+    /// about a file in which there was nothing to see. That is a confidently
+    /// wrong diagnosis, and it is the same defect this file already records
+    /// against the `>= 5` floor the liveness check replaced. Measured: adding a
+    /// two-line `src/web_login_types.rs` correctly reddens the file-set
+    /// assertion, and complying by adding the row then reddens the main lint
+    /// with a message blaming the scanner.
+    ///
+    /// So it is declared rather than inferred, and **checked in both
+    /// directions**: a module declared silent that turns out to have sites fails
+    /// too. Without that second arm this field would be a way to switch the lint
+    /// off for a file by asserting something false about it.
+    expects_logging_sites: bool,
 }
 
 /// Every module scanned, with its own value-position allow-list.
 ///
-/// **The membership of this table is itself asserted**, against `read_dir` at
-/// test time — see [`every_web_login_module_in_src_is_scanned`]. Adding a
-/// `src/web_login*.rs` and not adding it here is a failure, which is the whole
-/// of HIK-274.
+/// **The membership of this table is itself asserted**, against a recursive walk
+/// of `src/` at test time — see [`every_web_login_module_in_src_is_scanned`].
+/// Adding a web-login module and not adding it here is a failure, which is the
+/// whole of HIK-274.
 const SCANNED_MODULES: &[SourceFile] = &[
     SourceFile {
         path: "src/web_login.rs",
         text: include_str!("../src/web_login.rs"),
         allowed_value_idents: WEB_LOGIN_VALUE_IDENTS,
+        expects_logging_sites: true,
     },
     SourceFile {
         path: "src/web_login_postgres.rs",
         text: include_str!("../src/web_login_postgres.rs"),
         allowed_value_idents: POSTGRES_VALUE_IDENTS,
+        expects_logging_sites: true,
     },
     SourceFile {
         path: "src/web_login_redis.rs",
         text: include_str!("../src/web_login_redis.rs"),
         allowed_value_idents: REDIS_VALUE_IDENTS,
+        expects_logging_sites: true,
     },
 ];
 
@@ -343,8 +401,25 @@ const ALLOWED_FIELD_IDENTS: &[&str] = &[
 ///
 /// * `e` — the error being reported. Downstream-derived text, which is why every
 ///   site puts it through `log_safe`; it is not derived from the sid.
-/// * `log_safe`, `format`, `to_string`, `as_str` — helper and method names, in
-///   callee position.
+/// * `log_safe`, `to_string`, `as_str` — helper and method names, in callee
+///   position.
+///
+/// `format` is deliberately **not** here, and its absence is the whole of the
+/// correction described at the bottom of this comment: it is named at a scanned
+/// site in `src/web_login.rs` and in `src/web_login_redis.rs`, and at none in
+/// `src/web_login_postgres.rs`. Adding it to postgres' list to make the overlap
+/// tidier would immediately fail
+/// [`no_web_login_module_carries_a_dead_value_list_entry`], which is the right
+/// outcome — the two assertions between them leave exactly one legal shape.
+///
+/// **The lists also keep the OAuth tokens off a log line — but incidentally,
+/// by default-deny, and not by any rule stated anywhere.** `token`, `sess` and
+/// `profile` are on no module's value list, so `%token.access_token`,
+/// `%token.id_token` and `%sess.id_token` are all offences today. That is worth
+/// writing down for one reason: it means a future ticket must not sanction
+/// `token` or `sess` on the grounds that "this lint is about the session id".
+/// The `id_token` in a `TokenResponse` is a bearer credential in its own right,
+/// and it reaches a log line by exactly the route the sid would.
 ///
 /// **The obligation on a new name is unchanged, and per-file scoping does not
 /// soften it.** A site spelled `.context(format!("… {sid} …"))` names `sid` and
@@ -361,9 +436,17 @@ const ALLOWED_FIELD_IDENTS: &[&str] = &[
 /// inline capture in it. Its five new `warn!` sites in `src/web_login.rs` are a
 /// different matter and were unscanned until HIK-274; they are why that file's
 /// list is the long one.
-#[allow(dead_code)]
-const VALUE_IDENTS_SHARED_BY_EVERY_MODULE: &[&str] =
-    &["as_str", "e", "format", "log_safe", "to_string"];
+/// **This const is CHECKED, not decorative** — see
+/// [`the_shared_value_idents_really_are_shared_by_every_module`]. It shipped
+/// once as an `#[allow(dead_code)]` restatement and was **false on the day it
+/// landed**: it listed `format`, which `POSTGRES_VALUE_IDENTS` does not contain
+/// and never did, postgres' `format!` calls all sitting inside `sqlx::query(…)`
+/// or plain `let` bindings, none of them on [`INVOCATIONS`]. Two reviewers found
+/// that independently, forty lines after this file's own rule about
+/// hand-maintained restatements of a derived set. The lesson is the one the
+/// header already argues for the allow-lists themselves: prose does not fail,
+/// assertions do.
+const VALUE_IDENTS_SHARED_BY_EVERY_MODULE: &[&str] = &["as_str", "e", "log_safe", "to_string"];
 
 /// `src/web_login.rs` — `gate`, `decide`, `callback`, `safe_dest`.
 ///
@@ -391,8 +474,13 @@ const VALUE_IDENTS_SHARED_BY_EVERY_MODULE: &[&str] =
 ///   sites so one refusal line can say which guard fired.
 /// * `uid`, `user_id`, `resolved` — the Kratos identity. A stable handle to a
 ///   person, not a bearer credential: it authenticates nobody. `resolved` is
-///   reached only as `resolved.user_id`, and because a dotted path is ruled on
-///   component by component, `resolved.id_token` would still fail on `id_token`.
+///   reached only as `resolved.user_id`, and sanctioning it does **not** sanction
+///   the rest of the struct, because a dotted path is ruled on component by
+///   component — `resolved.profile` fails on `profile`. (An earlier revision
+///   illustrated that with `resolved.id_token`. `ResolvedUser` has exactly two
+///   fields, `user_id` and `profile`, so that named a phantom; the mechanism it
+///   was demonstrating is real and is pinned by
+///   `a_dotted_field_name_is_checked_component_by_component`.)
 /// * `err` — `q.error`, the OAuth error the provider sent back. Provider-
 ///   supplied and capped by `log_safe`.
 /// * `state_key` — the OAuth `state`. A key **into** the session's `redirects`
@@ -1379,7 +1467,7 @@ fn field_value_split(chars: &[char]) -> Option<usize> {
 /// `error!(sid)` is `tracing`'s field shorthand, where the name and the value
 /// are the same binding.
 ///
-/// # `fields( … )` is recursed into, and that is a TIGHTENING (HIK-274)
+/// # `fields( … )` is recursed into, and it RECLASSIFIES (HIK-274)
 ///
 /// `#[tracing::instrument(name = "…", skip_all, fields(a.b = %x))]` presents the
 /// whole `fields( … )` group as **one argument with no top-level `=`**, so the
@@ -1392,9 +1480,25 @@ fn field_value_split(chars: &[char]) -> Option<usize> {
 /// and would have demanded exactly that trade.
 ///
 /// So a `fields( … )` argument is split on its own commas and each item run
-/// through [`field_value_split`] as if it were a top-level argument. It only
-/// ever *splits* — nothing right of a top-level `=` is reclassified, and no name
-/// that was reported stops being reported.
+/// through [`field_value_split`] as if it were a top-level argument.
+///
+/// **What that does is RECLASSIFY, and an earlier revision of this paragraph
+/// claimed otherwise.** It said the recursion "only ever *splits*" and that "no
+/// name that was reported stops being reported". Both are false, and the
+/// paragraph immediately below them enumerated the counter-examples — the file
+/// contradicted itself two paragraphs apart. Measured: delete the recursion and
+/// the main lint reports ten Value-position offences at `src/web_login.rs`'s
+/// `#[tracing::instrument]` which the recursion suppresses. They are not
+/// silenced; they are moved to [`Position::Field`] and checked against
+/// [`ALLOWED_FIELD_IDENTS`] instead.
+///
+/// **Nothing is weakened by that, and the argument is the one this file already
+/// makes for keeping the field list shared**: a name left of a top-level `=` is
+/// turned into a static string by `tracing`'s macro grammar and cannot carry a
+/// value, so moving a field-name component out of the strict list forfeits
+/// nothing a leak could use. What the recursion buys is the converse and it is
+/// the point of the change — those names no longer have to be sanctioned as
+/// *bindings*, which is what would have undone HIK-246's B3.
 ///
 /// **The names it moves are enumerated rather than counted**, because a count
 /// over this set goes stale on the next logging change while an enumeration
@@ -1610,11 +1714,32 @@ fn no_tracing_or_anyhow_line_in_a_web_login_module_names_an_unsanctioned_binding
         // postgres by the accident of that file having exactly five sites. A
         // number nobody owns doubles as an unowned tripwire for a spelling
         // change, and this test should not carry a control it cannot diagnose.
-        assert!(
-            !found.is_empty(),
-            "no tracing or anyhow invocation matched in {} — the scanner is not seeing this file",
-            file.path
-        );
+        //
+        // **Gated on the module's own declaration, and checked both ways.**
+        // An unconditional floor cannot tell "the scanner went dark" from "this
+        // module legitimately does not log", and since HIK-274 made the file set
+        // a property the second case is one a reader can be *obliged* to add.
+        // Blaming the scanner for it would be exactly the confidently-wrong
+        // diagnosis described three paragraphs up. See `expects_logging_sites`.
+        if file.expects_logging_sites {
+            assert!(
+                !found.is_empty(),
+                "no tracing or anyhow invocation matched in {} — either the scanner has stopped \
+                 seeing this file, or the file genuinely no longer logs anything. If it is the \
+                 second, set `expects_logging_sites: false` on its row and empty its value list; \
+                 do not delete the row, because the file-set property requires it.",
+                file.path
+            );
+        } else {
+            assert!(
+                found.is_empty(),
+                "{} is declared `expects_logging_sites: false` but {} scanned invocation(s) were \
+                 found in it. Review them and flip the flag — a module must not be able to opt \
+                 out of this lint by asserting something false about itself.",
+                file.path,
+                found.len()
+            );
+        }
         scanned += found.len();
 
         for o in offences_in(&source.text, file.allowed_value_idents) {
@@ -1646,6 +1771,46 @@ fn no_tracing_or_anyhow_line_in_a_web_login_module_names_an_unsanctioned_binding
         offences.len(),
         offences.join("\n")
     );
+}
+
+/// [`VALUE_IDENTS_SHARED_BY_EVERY_MODULE`] must actually be shared by every
+/// module.
+///
+/// The mirror of [`no_web_login_module_carries_a_dead_value_list_entry`], and it
+/// exists for the same reason: that const shipped once as an
+/// `#[allow(dead_code)]` restatement of a derived set and was false on the day
+/// it landed. A claim nothing checks is a claim that rots, and this file's
+/// entire argument for two allow-lists over a paragraph of guidance is that
+/// prose does not fail.
+///
+/// Note what the two assertions do *together*. This one forbids a name being on
+/// the shared list but missing from a module; the dead-entry one forbids a name
+/// being on a module's list without a site naming it. So the only way to put
+/// `format` back on the shared list is for postgres to genuinely acquire a site
+/// that names it — which is exactly the condition under which the claim would
+/// become true.
+/// **Scoped to modules that log**, which is not a loophole but the only coherent
+/// reading. A module declared `expects_logging_sites: false` has an empty value
+/// list by construction — [`no_web_login_module_carries_a_dead_value_list_entry`]
+/// would reject any name on it — so requiring the shared names *of it* would
+/// make the two assertions jointly unsatisfiable for a legitimately silent
+/// module. Measured while driving exactly that case with a logging-free
+/// `src/web_login_types.rs`: this assertion was the second thing to block it,
+/// after the liveness floor.
+#[test]
+fn the_shared_value_idents_really_are_shared_by_every_module() {
+    for file in SCANNED_MODULES.iter().filter(|f| f.expects_logging_sites) {
+        for name in VALUE_IDENTS_SHARED_BY_EVERY_MODULE {
+            assert!(
+                file.allowed_value_idents.contains(name),
+                "`{name}` is listed in VALUE_IDENTS_SHARED_BY_EVERY_MODULE but is not on {}'s \
+                 value list. Either it is not in fact shared — remove it from the shared list, \
+                 which is where this const went wrong before — or that module has acquired a \
+                 site naming it and its own list needs the name adding, with a bullet.",
+                file.path
+            );
+        }
+    }
 }
 
 /// Every name on a module's value list must be **named by a site in that
@@ -1925,6 +2090,161 @@ fn the_residuals_this_lint_cannot_close_are_pinned_as_gaps() {
     );
 }
 
+/// Every web-login module under `src`, as a `/`-separated path relative to
+/// `relative_to`, sorted.
+///
+/// # The rule is on the PATH below `src/`, not on the file name
+///
+/// A `.rs` file counts if its path relative to `src` starts with `web_login`.
+/// That is one rule, and it covers all three shapes the crate can take:
+/// `src/web_login.rs`, a sibling like `src/web_login_redis.rs`, and **anything
+/// inside a `src/web_login/` directory whatever it is called** —
+/// `src/web_login/gate.rs`, `src/web_login/mod.rs`.
+///
+/// **The last of those is the whole point, and a file-name rule does not get
+/// it.** The defect this replaces was a non-recursive [`std::fs::read_dir`],
+/// and the obvious repair — recurse, still matching the file name
+/// `web_login*.rs` — is not a repair at all: the leak that exposed the bug was
+/// `src/web_login/leaky.rs`, whose *name* matches nothing. Recursion alone
+/// finds `src/web_login/web_login_gate.rs` and walks straight past
+/// `src/web_login/gate.rs`, which is what anyone splitting a 3,000-line module
+/// would actually write. Both halves are pinned by
+/// [`the_module_walk_descends_into_submodules_and_still_excludes_by_name`].
+///
+/// `src/mcp_resource_server/db_session_store.rs` stays excluded because its
+/// path does not begin `web_login`, which is now the *only* reason — the walk
+/// really does descend into that directory and decline the file. See the module
+/// header for why that module is out of scope.
+///
+/// A symlinked directory is skipped rather than followed:
+/// [`std::fs::DirEntry::file_type`] does not traverse symlinks, so such an entry
+/// is neither `is_dir()` nor `is_file()` and falls through both arms. That is
+/// what keeps the walk from cycling, and it is a property of `file_type` rather
+/// than of anything written here — so do not "simplify" it to `path.is_dir()`,
+/// which *does* traverse.
+fn web_login_modules_under(src: &std::path::Path, relative_to: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => panic!("{} is not readable: {e}", dir.display()),
+        };
+        for entry in entries {
+            let entry = entry.expect("a readable directory entry");
+            let file_type = entry.file_type().expect("a readable file type");
+            let path = entry.path();
+            if file_type.is_dir() {
+                walk(&path, out);
+            } else if file_type.is_file() {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    walk(src, &mut files);
+
+    let mut out: Vec<String> = files
+        .into_iter()
+        .filter_map(|path| {
+            let below_src = path
+                .strip_prefix(src)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !below_src.starts_with("web_login") || !below_src.ends_with(".rs") {
+                return None;
+            }
+            Some(
+                path.strip_prefix(relative_to)
+                    .expect("under the root")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The walk itself, driven against a temporary tree.
+///
+/// This exists because [`every_web_login_module_in_src_is_scanned`] cannot
+/// discriminate on the property that matters here: the real `src/` has no
+/// `web_login/` submodule today, so a revert to the non-recursive
+/// [`std::fs::read_dir`] leaves that test **green**. The bug was silent exactly
+/// because the tree does not currently exercise it, and asserting against the
+/// tree cannot fix that.
+///
+/// It builds the tree under the OS temp directory rather than in `src/`, because
+/// a fixture file left in `src/` would be compiled into the crate — and a
+/// `web_login_fixture.rs` sitting there would then be a *real* member of the set
+/// this lint asserts over, which is a worse problem than the one it tests.
+#[test]
+fn the_module_walk_descends_into_submodules_and_still_excludes_by_name() {
+    let root = std::env::temp_dir().join(format!(
+        "hik274-walk-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+
+    for (dir, file) in [
+        ("src", "web_login.rs"),
+        ("src", "web_login_redis.rs"),
+        // **The case that exposed the bug.** A submodule of the very file this
+        // ticket is about, whose own name matches nothing. A file-name rule
+        // walks past it however deeply it recurses.
+        ("src/web_login", "leaky.rs"),
+        ("src/web_login", "mod.rs"),
+        ("src/web_login", "web_login_gate.rs"),
+        // Deeper still, to show the recursion is not one level deep, and with
+        // one name matching and one not.
+        ("src/web_login/inner", "helper.rs"),
+        ("src/web_login/inner", "web_login_deep.rs"),
+        // Must stay excluded — and now on its PATH alone, the walk having
+        // genuinely descended into this directory.
+        ("src/mcp_resource_server", "db_session_store.rs"),
+        ("src/mcp_resource_server", "web_login_lookalike.rs"),
+        // Must not match.
+        ("src", "config.rs"),
+        ("src", "session_store.rs"),
+        // A near-miss on each half of the rule.
+        ("src", "web_logins.rs.bak"),
+        ("src", "not_web_login.rs"),
+    ] {
+        std::fs::create_dir_all(root.join(dir)).expect("create fixture dir");
+        std::fs::write(root.join(dir).join(file), "// fixture\n").expect("write fixture");
+    }
+
+    let found = web_login_modules_under(&root.join("src"), &root);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(
+        found,
+        vec![
+            "src/web_login.rs".to_string(),
+            "src/web_login/inner/helper.rs".to_string(),
+            "src/web_login/inner/web_login_deep.rs".to_string(),
+            "src/web_login/leaky.rs".to_string(),
+            "src/web_login/mod.rs".to_string(),
+            "src/web_login/web_login_gate.rs".to_string(),
+            "src/web_login_redis.rs".to_string(),
+        ],
+        "the walk must take EVERY `.rs` under `src/web_login/` whatever it is called, not just \
+         the ones whose file name happens to start with `web_login`. `src/web_login/leaky.rs` is \
+         the shape that exposed this: a sid-handling submodule of the file this lint exists to \
+         cover, invisible to a file-name rule however deeply it recurses."
+    );
+    // Spelled out separately because it is the reason the exclusion still holds
+    // once the recursion fix removed the other one. The walk DID descend into
+    // `src/mcp_resource_server/`; both files there are declined on their path,
+    // including one deliberately named to match a file-name rule.
+    assert!(
+        !found.iter().any(|p| p.contains("mcp_resource_server")),
+        "the deliberate exclusion of the MCP session store has stopped holding"
+    );
+}
+
 /// **T1 — the file set is a property, not a hand-maintained list.**
 ///
 /// This is the assertion HIK-274 exists to add, and it is the only one in this
@@ -1938,35 +2258,45 @@ fn the_residuals_this_lint_cannot_close_are_pinned_as_gaps() {
 ///
 /// * against the pre-HIK-274 tree, where `src/web_login.rs` exists on disk and
 ///   is absent from the table — the ticket's own defect; and
-/// * the day someone adds `src/web_login_mysql.rs` and does not review it,
-///   which is the *class*, and which no hand-listed set of paths can catch.
+/// * the day someone adds `src/web_login_mysql.rs` — or `src/web_login/gate.rs`
+///   — and does not review it, which is the *class*, and which no hand-listed
+///   set of paths can catch.
 ///
-/// **`src/mcp_resource_server/db_session_store.rs` cannot be picked up by this
-/// glob, and that is deliberate** — see the module header for why it is out of
-/// scope. Two independent reasons, so a change to either leaves it out:
-/// [`std::fs::read_dir`] does not recurse, and the entry for the
-/// `mcp_resource_server` directory is not a file and does not match
-/// `web_login*.rs` in any case. If that module is ever brought in scope it gets
-/// its own review and its own row, not a widened glob.
+/// **The walk RECURSES and matches on the PATH, and both halves were defects
+/// for one review round.** The first version used a bare [`std::fs::read_dir`]
+/// matching a file name, so `src/web_login/leaky.rs` — one `mod leaky;` away,
+/// and a submodule of the very file this ticket exists to cover — was invisible
+/// and this test stayed green. Recursion alone does not fix that, because
+/// `leaky.rs` matches no file-name pattern; see [`web_login_modules_under`] for
+/// why the rule is the path below `src/` instead, and for the measurement
+/// showing a name rule fails in *both* directions.
+///
+/// That is not a hypothetical refactor: `src/web_login.rs` is well over three
+/// thousand lines, and HIK-274 has just made its test module hostile to raw
+/// strings, so splitting it into `src/web_login/{gate,callback,store}.rs` is the
+/// natural next move. It failed **closed** the other way — renaming
+/// `web_login.rs` to `web_login/mod.rs` reddened even the original — so only the
+/// additive submodule was silent, which is the worse direction.
+///
+/// **`src/mcp_resource_server/db_session_store.rs` stays out of scope because
+/// its path does not begin `web_login`**, and that is the whole of the reason
+/// now. An earlier revision gave two — the name, and `read_dir` not recursing —
+/// and offered them as independent belt and braces. The second is gone with the
+/// recursion fix, and it was never a *reason* so much as an accident of the
+/// implementation. See the module header for why that module is excluded; if it
+/// is ever brought in scope it gets its own review and its own row, not a
+/// widened glob.
 #[test]
 fn every_web_login_module_in_src_is_scanned() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
-        .expect("src/ is readable")
-        .map(|entry| entry.expect("a readable directory entry"))
-        .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("web_login") && name.ends_with(".rs"))
-        .map(|name| format!("src/{name}"))
-        .collect();
-    on_disk.sort();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let on_disk = web_login_modules_under(&root.join("src"), root);
 
     let mut scanned: Vec<String> = SCANNED_MODULES.iter().map(|f| f.path.to_string()).collect();
     scanned.sort();
 
     assert_eq!(
         scanned, on_disk,
-        "the set of `src/web_login*.rs` modules on disk and the set this lint scans have \
+        "the set of web-login modules on disk and the set this lint scans have \
          diverged. Every module implementing or gating a web-login session handles the `sid`, \
          which IS the unsigned `hs_session` bearer credential, so an unscanned one is a leak \
          that would be green everywhere. Add the file to the table and review its logging \

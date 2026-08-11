@@ -1295,7 +1295,16 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
     // it needs no rebinding at all, just a sigil. By the lint's own rule — if a
     // name cannot be argued for, the code changes — the binding moves out.
     // Behaviour is unchanged: same field, same type, same value, same span.
-    let session_present = cookie_sid.is_some();
+    //
+    // **The `: bool` is load-bearing, not decoration.** `session_present` is now
+    // a sanctioned name in that lint's value list, and it is the one name on it
+    // whose provenance IS the credential — so the rebinding the lint's standing
+    // data-flow residual warns about is a two-word edit right here
+    // (`cookie_sid.clone().unwrap_or_default()` passes the lint and publishes
+    // the whole sid). The annotation turns that specific edit into a compile
+    // error, which is the only guard available at this line: the lint cannot
+    // follow data flow and is not going to.
+    let session_present: bool = cookie_sid.is_some();
     span.record("auth.gate.session.present", session_present);
 
     // No cookie ⇒ nothing to load ⇒ the request cannot be authenticated. Asking
