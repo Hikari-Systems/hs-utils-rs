@@ -30,16 +30,40 @@
 //! got past the first version of this, `src/web_login/gate.rs` — and every
 //! assertion below stays green while covering less than it claims.
 //!
-//! **Two residuals in that walk, neither closed.** The match is
-//! `starts_with`/`ends_with` on the path below `src/`, and it is
-//! **case-sensitive**: a `Web_Login_Mysql.rs` created on a case-insensitive file
-//! system (APFS, NTFS) is a legal module that this walk does not see. And the
-//! walk roots at `env!("CARGO_MANIFEST_DIR")`, which is baked in at compile
-//! time, so the test binary is **not relocatable** — `cargo nextest archive` and
-//! run elsewhere would panic, or worse, read a different checkout's `src/` and
-//! report on that. Both are invisible today because there is no CI running this
-//! suite; they are recorded here so that whoever adds one does not have to
-//! rediscover them.
+//! **Residuals in that walk — a sample, and deliberately not offered as a closed
+//! set.** An earlier revision of this paragraph opened "Two residuals in that
+//! walk, neither closed" and listed two. A review found three more, which makes
+//! the heading itself the failure this file is written to prevent: an incomplete
+//! enumeration published as complete. The honest framing is that the walk
+//! answers "is this file under `src/web_login*`", and every way of being a
+//! compiled module without satisfying that is a gap. Known ones:
+//!
+//! * **`#[path]`.** `#[path = "other/moved_gate.rs"] mod web_login_gate;`
+//!   compiles a module the walk declines, because the rule reads the file's
+//!   location and not the module tree. Nothing in this crate uses `#[path]`
+//!   today.
+//! * **Symlinks, in both spellings.** A symlinked `.rs` inside
+//!   `src/web_login/`, and a symlinked directory `src/web_login_sym/`, are each
+//!   skipped — measured against the shipped function. See
+//!   [`web_login_modules_under`] for why, and for why following them is not a
+//!   free fix.
+//! * **Location, not name.** A web-login module placed outside `src/web_login*`
+//!   — a future `src/controller/web_login_bridge.rs` — is declined for the same
+//!   reason the deliberate `mcp_resource_server` exclusion is. That one is a
+//!   *consequence* of how the exclusion is expressed rather than an accident;
+//!   again see [`web_login_modules_under`].
+//! * **Case.** The match is `starts_with`/`ends_with` and is **case-sensitive**,
+//!   so a `Web_Login_Mysql.rs` created on a case-insensitive file system (APFS,
+//!   NTFS) is a legal module this walk does not see.
+//! * **Relocatability.** The walk roots at `env!("CARGO_MANIFEST_DIR")`, baked
+//!   in at compile time, so the test binary is **not relocatable** — `cargo
+//!   nextest archive` and run elsewhere would panic, or worse, read a different
+//!   checkout's `src/` and report on that.
+//!
+//! None is closed. All are invisible today: this crate has no `#[path]`, no
+//! symlinked source, no web-login module outside `src/web_login*`, and no CI
+//! running this suite. They are recorded so that whoever changes one of those
+//! four facts does not have to rediscover the consequence.
 //!
 //! **`src/controller/` is a known frontier, and it is named because silence
 //! about it reads as coverage.** `src/controller/graphql/context.rs` holds a
@@ -214,8 +238,9 @@
 //! `tracing` or `anyhow` site placed **inside** it is scanned, and its parameter
 //! is on no list, so it is caught.
 //!
-//! What did not change, and is the whole of the residual now: `log_safe` could
-//! stop **truncating** without this lint noticing a thing. Its body is a
+//! What did not change — at least this much, the enumeration not being offered
+//! as closed: `log_safe` could stop **truncating** without this lint noticing a
+//! thing. Its body is a
 //! `format!`, which is not on [`INVOCATIONS`], so nothing here reads it. And the
 //! calls to it in the two stores are still *trusted* rather than checked —
 //! `log_safe(x)` sanctions `x` by wrapping it, and no rule here verifies the
@@ -1487,9 +1512,11 @@ fn field_value_split(chars: &[char]) -> Option<usize> {
 /// name that was reported stops being reported". Both are false, and the
 /// paragraph immediately below them enumerated the counter-examples — the file
 /// contradicted itself two paragraphs apart. Measured: delete the recursion and
-/// the main lint reports ten Value-position offences at `src/web_login.rs`'s
-/// `#[tracing::instrument]` which the recursion suppresses. They are not
-/// silenced; they are moved to [`Position::Field`] and checked against
+/// the main lint reports Value-position offences at `src/web_login.rs`'s
+/// `#[tracing::instrument]` which the recursion suppresses — the names are
+/// enumerated two paragraphs down, and deliberately not counted here, since one
+/// more field on that attribute changes the number and not the argument. They
+/// are not silenced; they are moved to [`Position::Field`] and checked against
 /// [`ALLOWED_FIELD_IDENTS`] instead.
 ///
 /// **Nothing is weakened by that, and the argument is the one this file already
@@ -1507,7 +1534,7 @@ fn field_value_split(chars: &[char]) -> Option<usize> {
 /// `redirect`, `refused`, `session`, `user` — every one a component of a dotted
 /// field name — **and `fields`**, which is the group keyword and is discussed
 /// next. (A draft of this paragraph said "the ten that leave are all field-name
-/// components". Nine of them are; `fields` is not, and it is the one whose
+/// components". All but `fields` are; `fields` is not, and it is the one whose
 /// disposal needs an argument rather than an observation.)
 ///
 /// **One name really is dropped rather than moved: `fields` itself.** It is the
@@ -1983,12 +2010,18 @@ fn every_scanned_site_in_web_login_is_actually_checked() {
     // file grows and then asserts something nobody intended, whereas a message
     // that has been reworded or removed fails loudly and says which one.
     for message in [
-        // HIK-272, `safe_dest` — the most attacker-controlled value in the
-        // module travels on this line.
+        // HIK-272 (`cc222aa`), in `safe_dest` — the most attacker-controlled
+        // value in the module travels on this line.
         "web_login: post-login redirect destination refused",
-        // HIK-241, `callback` and `decide`.
+        // HIK-241, in `callback` and `decide` (`32c9ca5` and `b162270`).
         "web_login: session store unavailable, login refused",
         "web_login: rotated session stored, but the superseded row could not be removed",
+        // **Not HIK-241** — both of these date from `9472cbb`, the original
+        // v0.7.0 browser-login commit, and were simply unscanned for their whole
+        // life until HIK-274. They are here because they are `callback`'s other
+        // two refusal lines, not because of who wrote them. An earlier revision
+        // filed all four under one `// HIK-241` heading, which was true of the
+        // location and wrong about the authorship for these two.
         "web_login: provider returned error",
         "web_login: no stored state",
     ] {
@@ -2096,10 +2129,28 @@ fn the_residuals_this_lint_cannot_close_are_pinned_as_gaps() {
 /// # The rule is on the PATH below `src/`, not on the file name
 ///
 /// A `.rs` file counts if its path relative to `src` starts with `web_login`.
-/// That is one rule, and it covers all three shapes the crate can take:
+/// One rule, covering the three shapes that live **under `src/web_login*`**:
 /// `src/web_login.rs`, a sibling like `src/web_login_redis.rs`, and **anything
 /// inside a `src/web_login/` directory whatever it is called** —
 /// `src/web_login/gate.rs`, `src/web_login/mod.rs`.
+///
+/// **"Under `src/web_login*`" is the whole of the claim, and an earlier revision
+/// of this sentence said "all three shapes the crate can take", which is not the
+/// same thing and is false.** The rule is by *location*, so a web-login module
+/// living anywhere else is not scanned — a future `src/controller/
+/// web_login_bridge.rs` would be declined for exactly the reason
+/// `src/mcp_resource_server/web_login_lookalike.rs` is, and in a crate that
+/// already puts modules under `src/controller/` and `src/mcp_resource_server/`
+/// that is a plausible shape rather than a contrived one.
+///
+/// **This is a deliberate stopping point, not an oversight.** A name-OR-path
+/// rule with a named exclusion list would catch strictly more, and is what to
+/// reach for if such a module ever appears. It is not here because the measured
+/// case against a *name* rule (below) was a case against it **alone** — it does
+/// not by itself justify the extra machinery, and an exclusion list is the thing
+/// this file spends its length warning about. What the location rule does cover
+/// is HIK-274's actual defect and the realistic split of a 3,000-line
+/// `src/web_login.rs`, which are the two shapes anyone is likely to produce.
 ///
 /// **The last of those is the whole point, and a file-name rule does not get
 /// it.** The defect this replaces was a non-recursive [`std::fs::read_dir`],
@@ -2116,12 +2167,22 @@ fn the_residuals_this_lint_cannot_close_are_pinned_as_gaps() {
 /// really does descend into that directory and decline the file. See the module
 /// header for why that module is out of scope.
 ///
-/// A symlinked directory is skipped rather than followed:
-/// [`std::fs::DirEntry::file_type`] does not traverse symlinks, so such an entry
-/// is neither `is_dir()` nor `is_file()` and falls through both arms. That is
-/// what keeps the walk from cycling, and it is a property of `file_type` rather
-/// than of anything written here — so do not "simplify" it to `path.is_dir()`,
-/// which *does* traverse.
+/// # Symlinks are skipped, and that is a FAIL-OPEN
+///
+/// [`std::fs::DirEntry::file_type`] does not traverse symlinks, so a symlinked
+/// entry is neither `is_dir()` nor `is_file()` and falls through both arms. That
+/// is what keeps the walk from cycling, and it is a property of `file_type`
+/// rather than of anything written here — so do not "simplify" it to
+/// `path.is_dir()`, which *does* traverse.
+///
+/// **But say the consequence, which an earlier revision framed only as
+/// cycle-avoidance: a symlinked module is a real, compiled module that this walk
+/// does not see.** Measured against this function, both halves: a symlinked
+/// `src/web_login/linked.rs` and a symlinked directory `src/web_login_sym/`
+/// were each skipped, and the walk returned only the one ordinary file beside
+/// them. Neither is present in this repo, and following symlinks would need
+/// cycle detection to be safe — so this is recorded rather than fixed, which is
+/// the same trade the case-sensitivity residual gets in the module header.
 fn web_login_modules_under(src: &std::path::Path, relative_to: &std::path::Path) -> Vec<String> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let entries = match std::fs::read_dir(dir) {
