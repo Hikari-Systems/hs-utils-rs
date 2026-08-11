@@ -1,6 +1,24 @@
-//! Every `tracing` and `anyhow` invocation in the two session stores may only
+//! Every `tracing` and `anyhow` invocation in the web-login modules may only
 //! reference identifiers on an **allow-list**, and only in the **position** each
-//! one was reviewed in.
+//! one was reviewed in — and, since HIK-274, only in the **file** it was
+//! reviewed in.
+//!
+//! # Which files, and why that is a property rather than a list (HIK-274)
+//!
+//! The scanned set is every `src/web_login*.rs`. It was the two stores alone
+//! until HIK-274, and `src/web_login.rs` — which holds `gate`, `decide` and
+//! `callback`, i.e. the code that *mints, rotates and destroys* the sid the
+//! stores merely persist — was unscanned. Nothing leaked there; the defect was
+//! that a leak would have been green everywhere, and HIK-241 and HIK-272 had by
+//! then put seven `warn!` sites inside functions where `sid`, `new_sid` or
+//! `cookie_sid` are live bindings.
+//!
+//! [`every_web_login_module_in_src_is_scanned`] asserts the set against
+//! `read_dir` at test time rather than against a list written here, because the
+//! failure this lint exists to prevent is *silent under-reporting* and a
+//! hand-maintained file list is exactly that failure with a friendly face: add
+//! `src/web_login_mysql.rs` and every assertion below stays green while covering
+//! less than it claims.
 //!
 //! **This is subordinate to the two behavioural tests, not a substitute for
 //! them.** It earns its place for three reasons: it covers the three `error!`
@@ -68,10 +86,48 @@
 //!
 //! So there are two lists. [`ALLOWED_FIELD_IDENTS`] is what may appear to the
 //! left of an `=` — the components of a dotted `tracing` field name, which are
-//! not bindings and cannot carry a value. [`ALLOWED_VALUE_IDENTS`] is what may
-//! appear anywhere a value is computed: the right of an `=`, a positional
-//! argument, and an inline format capture inside a message string. `message` is
-//! in the first and **not** the second, so the shape above is now an offence.
+//! not bindings and cannot carry a value. The value list is what may appear
+//! anywhere a value is computed: the right of an `=`, a positional argument, and
+//! an inline format capture inside a message string. `message` is in the first
+//! and **not** the second, so the shape above is now an offence.
+//!
+//! # The value list is PER FILE, and the field list is shared (HIK-274)
+//!
+//! The same argument, one axis over. A name reviewed as safe *in one file* was
+//! never thereby reviewed in another: `dest` is sound in `src/web_login.rs`,
+//! where it is a redirect destination, and would be an unreviewed binding in
+//! `src/web_login_redis.rs`, where `sid` is a parameter name and `let dest =
+//! sid;` is a one-line refactor. So the value list is a field on
+//! [`SourceFile`], and adding `src/web_login.rs` sanctions its names **there**.
+//!
+//! **The size of the win is stated as a property and not as a number**, which is
+//! this file's own standing rule about counts over sets that grow. A shared list
+//! sanctions the union of every module's names in *every* module — so bringing
+//! one file in scope silently widens the other two, and `src/web_login.rs` is by
+//! far the longest list. The per-file split sanctions each name only in the file
+//! whose review established it, and the difference grows with every module
+//! added. (A numeral was drafted here. It was wrong by one, because a later edit
+//! in this same ticket retired `is_some`, which is exactly how such a numeral
+//! goes stale — and it would have needed re-deriving on every future list edit.)
+//!
+//! [`ALLOWED_FIELD_IDENTS`] stays shared, and that is a decision rather than an
+//! omission: a component left of a top-level `=` is turned into a static string
+//! by `tracing`'s macro grammar and cannot carry a value at all, so there is
+//! nothing for a per-file review to be *about*.
+//!
+//! # A sanctioned name that is no longer named is DELETED, not left (HIK-274)
+//!
+//! [`no_web_login_module_carries_a_dead_value_list_entry`] asserts that every
+//! name on a file's list is actually named by some scanned site in that file.
+//! It exists because this file's own standing warning — "do not widen a list to
+//! make a red build green" — was until then only prose, and prose does not fail.
+//! With the assertion, pre-emptive widening is not discouraged, it is
+//! **impossible**: a name added ahead of the site that would need it is a dead
+//! entry and fails immediately.
+//!
+//! The cost is real and is accepted: delete a log line and you must delete its
+//! list entry too. That is a loud failure with an accurate diagnosis, which is
+//! the trade this file makes everywhere else.
 //!
 //! # What it cannot do
 //!
@@ -80,7 +136,7 @@
 //! cost in list edits, because it costs none. Write `let e = format!("{sid}");`
 //! above one of these sites and the lint passes.
 //!
-//! **Every name in [`ALLOWED_VALUE_IDENTS`] is rebindable, not some readable
+//! **Every name on a value list is rebindable, not some readable
 //! subset of them**, and an earlier revision of this paragraph said "five of the
 //! eleven … are ordinary binding names", listing `e`, `url`, `hosts`, `name`,
 //! `table` — a plausibility judgement about which names *look* like bindings,
@@ -97,7 +153,7 @@
 //! `session`, `store`, `op`, `error`, `message` — are no longer usable that way,
 //! and `message` was the one an actual reviewer reached for first.
 //!
-//! Closing the rest needs data flow, i.e. a real Rust parser over these two
+//! Closing the rest needs data flow, i.e. a real Rust parser over the scanned
 //! modules, which is a different tool and its own ticket. It is also why the
 //! behavioural arms are not deleted: a source scanner can show the source looks
 //! right, never that the **rendered output** is clean.
@@ -106,18 +162,57 @@
 //! BY NAME, so a log statement reached through a macro or a helper that is not
 //! on [`INVOCATIONS`] is not scanned at all.** A site spelled `my_log!(sid)` or
 //! `report(sid)` matches no needle, so its body is never read and whatever the
-//! callee does with the value is invisible — and only these two files are
-//! `include_str!`d, so the callee's own `tracing::error!` is out of scope even
-//! when it is in this crate. Unlike the rebinding residual, this one is not
+//! callee does with the value is invisible — and only the `src/web_login*.rs`
+//! files are `include_str!`d, so the callee's own `tracing::error!` is out of
+//! scope even when it is in this crate. Unlike the rebinding residual, this is not
 //! closable by a lexical rule at all: the name of the offending helper is not
 //! knowable in advance, which is the whole difference between it and the
 //! constructs [`strip_comments`] refuses.
 //!
 //! Not hypothetical in shape. `log_safe` is exactly such a helper — declared in
-//! `src/web_login.rs`, imported by both stores, named at ten sites. It formats
-//! and truncates and logs nothing, which is why it is sanctioned in
-//! [`ALLOWED_VALUE_IDENTS`]; but that is a fact about `web_login.rs`, which this
-//! lint does not read, and it would not notice the day it stopped being true.
+//! `src/web_login.rs`, named by sites in all three scanned files. It formats and
+//! truncates and logs nothing, which is why it is sanctioned in every file's
+//! value list.
+//!
+//! **HIK-274 narrowed this residual and did not close it, and the difference is
+//! worth stating precisely** — the sentence replaced here said that `log_safe`
+//! being safe "is a fact about `web_login.rs`, which this lint does not read",
+//! and that clause became false the moment `web_login.rs` was added.
+//!
+//! What changed: `log_safe`'s *body* is now inside a scanned file, so a
+//! `tracing` or `anyhow` site placed **inside** it is scanned, and its parameter
+//! is on no list, so it is caught.
+//!
+//! What did not change, and is the whole of the residual now: `log_safe` could
+//! stop **truncating** without this lint noticing a thing. Its body is a
+//! `format!`, which is not on [`INVOCATIONS`], so nothing here reads it. And the
+//! calls to it in the two stores are still *trusted* rather than checked —
+//! `log_safe(x)` sanctions `x` by wrapping it, and no rule here verifies the
+//! callee is that helper rather than a same-named local.
+//!
+//! **Do not close this by putting `format!` on [`INVOCATIONS`].** Measured: it
+//! reds on `src/web_login.rs`'s `build_set_cookie`, whose cookie-assembly
+//! `format!` legitimately and necessarily names the sid — that is the function's
+//! entire job. A lint that fails on the one place the sid *must* be formatted is
+//! one people cannot keep green, and then it gets deleted.
+//!
+//! # The standing tax a scanned `src/web_login.rs` levies (HIK-274)
+//!
+//! [`strip_comments`] refuses a raw string literal rather than lexing one, so
+//! **any future `r"…"` / `r#"…"#` anywhere in `src/web_login.rs` re-reds this
+//! lint** — including in its `#[cfg(test)]` module, which is the majority of
+//! that file and where JSON fixtures are the natural thing to write. HIK-274
+//! rewrote two such fixtures as escaped ordinary string literals to land.
+//!
+//! This is designed behaviour, not a defect: the refusal is loud and its message
+//! says what to do, which is the whole reason it is a refusal rather than an
+//! approximation. But it will recur, so it is written down rather than
+//! rediscovered. The fix when it does is to escape the literal. Teaching the
+//! stripper to lex raw strings is a **separate ticket with its own red test**,
+//! and deliberately so: it adds surface to the one function whose characteristic
+//! failure is silent blindness, and the obvious normalisation — blank the body —
+//! would mint a new blind, because a raw string is a perfectly legal `tracing`
+//! message.
 //!
 //! **What bounds it today is a grep, not an assertion.** Neither store defines
 //! or pulls in a macro of its own — no `macro_rules!`, no `include!`, no
@@ -129,33 +224,54 @@
 //! the same standing weakness the raw-string residual was closed to remove,
 //! kept here because there is no lexical rule to replace it with.
 //!
-//! Deliberately scoped to the two web-login stores. It is **not** extended to
+//! Deliberately scoped to the web-login modules. It is **not** extended to
 //! `src/mcp_resource_server/db_session_store.rs`, which has the same shape but a
 //! different trust claim and its own ticket: a test that is red for another
-//! ticket's reason gets muted, and then it is red for nobody's.
+//! ticket's reason gets muted, and then it is red for nobody's. That module sits
+//! in a subdirectory and does not match `web_login*.rs`, so HIK-274's glob
+//! cannot pick it up by accident — two independent reasons, stated at the test.
 //!
-//! **`InMemorySessionStore` (`src/web_login.rs`) is also unscanned**, and unlike
-//! the MCP store that is not a deferral. It implements the same
-//! `WebSessionStore` trait and takes the same `sid`, but it has no I/O and so no
-//! error path: nothing in it formats anything, at any level, so there is no log
-//! line for a sid to reach. It is named here because silence about a third
-//! implementation of the trait reads as an oversight, which is the failure this
-//! whole section exists to avoid.
+//! **`InMemorySessionStore` is now in scope**, having moved with the file it
+//! lives in (`src/web_login.rs`). It contributes nothing: it implements the same
+//! `WebSessionStore` trait and takes the same `sid`, but has no I/O and so no
+//! error path, and nothing in it formats anything at any level. It is named here
+//! because it was previously called out as a deliberate *exclusion*, and a
+//! reader checking that claim would now find it false.
 
-/// Source of a module, with the path it came from for the failure message.
+/// Source of a module, with the path it came from for the failure message and
+/// the value-position names sanctioned **in that module**.
 struct SourceFile {
     path: &'static str,
     text: &'static str,
+    /// Every identifier this module may name where a value is computed. Per
+    /// file since HIK-274 — see the module header for why a name reviewed in one
+    /// file is not thereby reviewed in another, and
+    /// [`no_web_login_module_carries_a_dead_value_list_entry`] for why an entry
+    /// no site names any longer is deleted rather than left.
+    allowed_value_idents: &'static [&'static str],
 }
 
-const STORES: &[SourceFile] = &[
+/// Every module scanned, with its own value-position allow-list.
+///
+/// **The membership of this table is itself asserted**, against `read_dir` at
+/// test time — see [`every_web_login_module_in_src_is_scanned`]. Adding a
+/// `src/web_login*.rs` and not adding it here is a failure, which is the whole
+/// of HIK-274.
+const SCANNED_MODULES: &[SourceFile] = &[
+    SourceFile {
+        path: "src/web_login.rs",
+        text: include_str!("../src/web_login.rs"),
+        allowed_value_idents: WEB_LOGIN_VALUE_IDENTS,
+    },
     SourceFile {
         path: "src/web_login_postgres.rs",
         text: include_str!("../src/web_login_postgres.rs"),
+        allowed_value_idents: POSTGRES_VALUE_IDENTS,
     },
     SourceFile {
         path: "src/web_login_redis.rs",
         text: include_str!("../src/web_login_redis.rs"),
+        allowed_value_idents: REDIS_VALUE_IDENTS,
     },
 ];
 
@@ -173,75 +289,201 @@ enum Position {
     Value,
 }
 
-/// Every identifier allowed to the **left** of an `=`, i.e. every component of
-/// a sanctioned dotted field name: `session.store`, `session.op`,
-/// `session.table`, `error.message`. Four field names, six components.
+/// Every identifier allowed to the **left** of an `=`: every component of a
+/// sanctioned dotted `tracing` field name, plus `name`, which is
+/// `#[tracing::instrument]`'s own attribute key.
 ///
 /// These are field *names* in `tracing`'s macro grammar, not expressions: the
 /// macro turns them into a static string. Nothing here can carry a value, which
-/// is exactly why the list is separate from [`ALLOWED_VALUE_IDENTS`] — put them
+/// is exactly why the list is separate from the per-file value lists — put them
 /// in one list and `let message = format!("{sid}")` is sanctioned by the review
 /// that approved the field `error.message`.
-const ALLOWED_FIELD_IDENTS: &[&str] = &["error", "message", "op", "session", "store", "table"];
-
-/// Every identifier a scanned invocation may name where a **value** is
-/// computed: right of an `=`, a positional argument, or an inline format
-/// capture. This is the list a leak has to get past.
 ///
-/// **Adding a name here is the reviewable act.** Each one has been read against
-/// the question "can this carry the session id?", so extend it deliberately and
-/// never to make a red build green:
+/// **Shared across every module, unlike the value lists, and that asymmetry is
+/// deliberate** (HIK-274). A value name has to be reviewed per file because it
+/// names a *binding*, and the binding behind one spelling differs between
+/// files. A field component names nothing and can carry nothing, so there is no
+/// per-file fact for a review to establish.
+///
+/// The `auth.*` / `user.*` / `session.*` families here arrived with
+/// `src/web_login.rs`: `auth.gate.*`, `auth.login.*`, `auth.redirect.*`,
+/// `user.id`, `session.op`, and `state`. They are the span and event field names
+/// that the gate, the callback and the redirect guard publish.
+const ALLOWED_FIELD_IDENTS: &[&str] = &[
+    "auth",
+    "dest",
+    "error",
+    "fail_fast",
+    "gate",
+    "id",
+    "load_failed",
+    "login",
+    "message",
+    "minted",
+    "name",
+    "op",
+    "outcome",
+    "present",
+    "reason",
+    "redirect",
+    "refused",
+    "session",
+    "site",
+    "state",
+    "store",
+    "table",
+    "user",
+];
+
+/// The names common to every scanned module's value list.
+///
+/// Not a list in its own right — each module's const spells its own names out in
+/// full, so that reading one tells you the whole of what that file may say. This
+/// is documentation of the overlap, and the place the shared bullets live:
 ///
 /// * `e` — the error being reported. Downstream-derived text, which is why every
 ///   site puts it through `log_safe`; it is not derived from the sid.
+/// * `log_safe`, `format`, `to_string`, `as_str` — helper and method names, in
+///   callee position.
+///
+/// **The obligation on a new name is unchanged, and per-file scoping does not
+/// soften it.** A site spelled `.context(format!("… {sid} …"))` names `sid` and
+/// fails this test; so does any other new binding. When that happens the fix is
+/// to add the *reviewed* name to *that file's* list, with a bullet saying why it
+/// cannot carry the sid — not to widen a list until the build is green, which is
+/// the same defeat by a friendlier route.
+///
+/// **HIK-241 was owed a line here and needed none** in the two stores. That
+/// ticket made `WebSessionStore` fallible and put an `anyhow` context string on
+/// every error branch in both — **thirteen** new `.context(` sites, five in
+/// `web_login_postgres.rs` and eight in `web_login_redis.rs` — and added no
+/// name, because every one of those strings is a compile-time literal with no
+/// inline capture in it. Its five new `warn!` sites in `src/web_login.rs` are a
+/// different matter and were unscanned until HIK-274; they are why that file's
+/// list is the long one.
+#[allow(dead_code)]
+const VALUE_IDENTS_SHARED_BY_EVERY_MODULE: &[&str] =
+    &["as_str", "e", "format", "log_safe", "to_string"];
+
+/// `src/web_login.rs` — `gate`, `decide`, `callback`, `safe_dest`.
+///
+/// The long list, because this is where the protocol lives rather than the
+/// persistence. **`sid`, `new_sid` and `cookie_sid` are the live session-id
+/// bindings in this file and NONE of them is here** — that was checked name by
+/// name when the file was brought in scope, and `cookie_sid` was the one that
+/// failed: `span.record("auth.gate.session.present", cookie_sid.is_some())`
+/// named it, so `decide` now binds the bool first and records
+/// `session_present`. Sanctioning `cookie_sid` instead would have made a later
+/// `%cookie_sid` green, which is not even the rebinding residual — it needs no
+/// rebinding, only a sigil.
+///
+/// * `reason` — `origin_relative_dest`'s error, `&'static str`, one of exactly
+///   five compile-time literals (`missing`, `control_character`, `unparseable`,
+///   `not_origin_relative`, `escapes_root`). Named only in `safe_dest`, which
+///   has no session id in scope at all: its three parameters are the
+///   destination, the site name and an optional user id.
+/// * `dest` — two distinct bindings, neither derived from a sid. In `safe_dest`
+///   it is the raw caller-supplied destination (`Option<&str>`), the most
+///   attacker-controlled value in the module, which is why it goes through
+///   `log_safe` and is recorded as a bare `&str`. In `callback` it is
+///   `safe_dest`'s **return**, i.e. the sanitised origin-relative path.
+/// * `site` — `&'static str`, `"gate"` or `"callback"`, passed by the two call
+///   sites so one refusal line can say which guard fired.
+/// * `uid`, `user_id`, `resolved` — the Kratos identity. A stable handle to a
+///   person, not a bearer credential: it authenticates nobody. `resolved` is
+///   reached only as `resolved.user_id`, and because a dotted path is ruled on
+///   component by component, `resolved.id_token` would still fail on `id_token`.
+/// * `err` — `q.error`, the OAuth error the provider sent back. Provider-
+///   supplied and capped by `log_safe`.
+/// * `state_key` — the OAuth `state`. A key **into** the session's `redirects`
+///   map, and in `decide` a freshly minted uuid; it names a redirect entry, not
+///   a session. Recorded as a bare `&str` deliberately — see its site.
+/// * `g`, `fail_fast` — `GateState` and its `bool`. Startup configuration,
+///   chosen per route when the middleware is installed.
+/// * `minted` — a `bool` out of the `(sid, sess, minted)` destructure, saying
+///   whether *this* request created a session id. A distinct binding from the
+///   `sid` beside it, and a `bool` cannot carry one.
+/// * `span` — the `Span` handle, named at `.instrument(span)`. **The load-bearing
+///   half is that `.instrument()` formats nothing**: it attaches the span to a
+///   future, so no value of any kind is rendered there. The attribute form that
+///   *does* publish values is `fields( … )`, and [`identifiers`] recurses into
+///   that, so its contents are ruled on individually rather than being waved
+///   through as part of one opaque argument.
+/// * `unwrap_or_default` — a method name in callee position.
+/// * `tracing`, `field`, `Empty` — the path components of
+///   `tracing::field::Empty`, a unit struct meaning "declared, not yet set".
+/// * `skip_all` — a keyword in `#[tracing::instrument]`'s attribute grammar, not
+///   an expression. It is the *opposite* of a disclosure: it is what stops the
+///   macro recording every argument, `sid` among them.
+/// * `session_present` — the `bool` bound in `decide` by HIK-274 so that the
+///   `span.record` need not name `cookie_sid`. See above. Note that it replaced
+///   **two** names rather than one: `cookie_sid.is_some()` also put `is_some` in
+///   value position, and moving the call out of the argument retired that too.
+///   [`no_web_login_module_carries_a_dead_value_list_entry`] is what noticed —
+///   the draft list for this ticket had been derived before that edit and still
+///   carried `is_some`, which is precisely the stale entry that assertion exists
+///   to refuse.
+const WEB_LOGIN_VALUE_IDENTS: &[&str] = &[
+    "Empty",
+    "as_str",
+    "dest",
+    "e",
+    "err",
+    "fail_fast",
+    "field",
+    "format",
+    "g",
+    "log_safe",
+    "minted",
+    "reason",
+    "resolved",
+    "session_present",
+    "site",
+    "skip_all",
+    "span",
+    "state_key",
+    "to_string",
+    "tracing",
+    "uid",
+    "unwrap_or_default",
+    "user_id",
+];
+
+/// `src/web_login_postgres.rs`.
+///
 /// * `table` — reached only as `%self.table`, the configured table name. `self`
 ///   is a keyword and is exempt below, but the **field** it reaches for is ruled
 ///   on here, which is why `self.sql_load` would fail on `sql_load`.
-/// * `log_safe`, `format`, `to_string`, `as_str`, `is_empty` — helper and method
-///   names, in callee position.
-/// * `url`, `hosts` — construction-time redis connection settings in
-///   `from_url` / `from_sentinel`. Startup config, never a session id.
+/// * `name` — the configured table name, in `validate_table_name`'s `bail!`,
+///   **on today's tree**: config read once at construction, and the branch that
+///   names it is the one where it failed to be a Postgres identifier, so no
+///   request reaches it. Same data-flow caveat as `url` on the redis list.
+const POSTGRES_VALUE_IDENTS: &[&str] = &["as_str", "e", "log_safe", "name", "table", "to_string"];
+
+/// `src/web_login_redis.rs`.
+///
+/// * `url`, `hosts` — construction-time redis connection settings in `from_url`
+///   / `from_sentinel`. Startup config, never a session id.
 /// * `redact_url_userinfo` — the redaction helper `url` sits behind **on today's
 ///   tree**. That is an observation about the two sites that exist, not a rule
 ///   this lint enforces: it does not follow data flow, so a future
 ///   `bail!("cannot reach {url}")` names only `url`, passes green, and
 ///   republishes the redis password. If you add a site naming `url`, put it
 ///   through `redact_url_userinfo` — nothing here will remind you.
-/// * `name` — the configured table name, in `validate_table_name`'s `bail!`,
-///   **on today's tree**: config read once at construction, and the branch that
-///   names it is the one where it failed to be a Postgres identifier, so no
-///   request reaches it. Same caveat as `url`.
+/// * `is_empty` — a method name, in callee position.
 ///
-/// Six of these — `url`, `hosts`, `redact_url_userinfo`, `name`, `format`,
-/// `is_empty` — exist only because the scan was widened to the `anyhow` surface.
-/// They are startup-config and helper names, not request data, which is why they
-/// were acceptable to add — that is the standard, not "the build was red".
-///
-/// **HIK-241 was owed a line here and needed none.** That ticket made
-/// `WebSessionStore` fallible and put an `anyhow` context string on every error
-/// branch in both stores — **thirteen** new `.context(` sites, five in
-/// `web_login_postgres.rs` and eight in `web_login_redis.rs` — and it added no
-/// name, because every one of those strings is a compile-time literal with no
-/// inline capture in it, so the scan finds no identifier in any of them. Written
-/// down rather than left implicit: the sentence this replaces sent the next
-/// reader looking for a line that was never added.
-///
-/// **The obligation itself is unchanged, which is what makes that outcome worth
-/// stating.** A site spelled `.context(format!("… {sid} …"))` names `sid` and
-/// fails this test; so does any other new binding. When that happens the fix is
-/// to add the *reviewed* name, with a bullet above saying why it cannot carry
-/// the sid — not to widen the list until the build is green, which is the same
-/// defeat by a friendlier route.
-const ALLOWED_VALUE_IDENTS: &[&str] = &[
+/// `url`, `hosts`, `redact_url_userinfo` and `is_empty` exist only because the
+/// scan was widened to the `anyhow` surface. They are startup-config and helper
+/// names, not request data, which is why they were acceptable to add — that is
+/// the standard, not "the build was red".
+const REDIS_VALUE_IDENTS: &[&str] = &[
     "as_str",
     "e",
     "format",
     "hosts",
     "is_empty",
     "log_safe",
-    "name",
     "redact_url_userinfo",
-    "table",
     "to_string",
     "url",
 ];
@@ -594,15 +836,26 @@ struct Stripped {
 /// It costs nothing on plausible source. [`raw_string_starts_at`] requires the
 /// full `r` `#`* `"` prefix, so a raw *identifier* (`r#type`) is not touched —
 /// it cannot hide a delimiter, being `r#` plus an identifier and nothing else.
-/// And every `r"` a grep for the sequence turns up in these files is the tail of
-/// a word inside a string literal (`"mymaster".into()`, `query.get("user")`),
-/// which never reaches this branch at all.
+/// And every `r"` a grep for the sequence turns up in the scanned files is the
+/// tail of a word inside a string literal (`"mymaster".into()`,
+/// `query.get("user")`, `bad_request("login error")`), which never reaches this
+/// branch at all.
+///
+/// **That is a property of the tree, not of the files, and HIK-274 had to pay
+/// for it.** `src/web_login.rs` carried two `r#"…"#` JSON fixtures in its
+/// `#[cfg(test)]` module, and bringing that file in scope meant rewriting them
+/// as escaped ordinary literals — the refusal fired exactly as designed, before
+/// any allow-list question was reached. Expect it to recur: that file is
+/// majority test code and a raw string is the natural way to write JSON. See the
+/// module header's standing-tax section for what to do about it, and why
+/// teaching this function to lex raw strings is a separate ticket rather than a
+/// tidy-up.
 ///
 /// **No inventory count is quoted here, deliberately.** The sentence this
 /// replaces gave one, and HIK-241 falsified it the moment it put a `.context(`
 /// on every error branch in both stores: a numeral in an unowned comment goes
 /// stale on the next ticket that adds a logging site, which is most tickets in
-/// these two files. What this paragraph needs is only that the raw-string branch
+/// these files. What this paragraph needs is only that the raw-string branch
 /// is not reached on this tree, which the observation above establishes without
 /// counting anything — and the scanner's liveness is the *test's* job, asserted
 /// per file rather than described here.
@@ -836,7 +1089,27 @@ fn skip_ws(chars: &[char], mut i: usize) -> usize {
     i
 }
 
-/// Every scanned invocation in `text`, as (1-based line, label, body).
+/// One scanned invocation.
+#[derive(Debug)]
+struct Invocation {
+    /// 1-based line of the body's opening delimiter.
+    line: usize,
+    /// How the site is spelled, for a failure message: `warn!`, `context(`.
+    label: String,
+    /// The text between the delimiters.
+    body: String,
+    /// Where `body` sits in the text [`invocations`] was given, as **char**
+    /// indices — added by HIK-274 so a test can splice a canary into a real
+    /// site rather than into a synthetic imitation of one.
+    ///
+    /// These are usable against the *unstripped* source too, because
+    /// [`strip_comments`] replaces characters one for one and never changes the
+    /// length. That is relied on and asserted at the one place it matters, in
+    /// [`every_scanned_site_in_web_login_is_actually_checked`].
+    body_range: (usize, usize),
+}
+
+/// Every scanned invocation in `text`.
 ///
 /// # The delimiter and the spacing are matched, not assumed
 ///
@@ -871,9 +1144,9 @@ fn skip_ws(chars: &[char], mut i: usize) -> usize {
 /// measurement. Do not make this loop char-literal-aware and drop that refusal —
 /// [`arg_ranges`], [`field_value_split`] and [`raw_identifiers`] count the same
 /// brackets and would each still be blind.
-fn invocations(text: &str) -> Vec<(usize, String, String)> {
+fn invocations(text: &str) -> Vec<Invocation> {
     let chars: Vec<char> = text.chars().collect();
-    let mut out = Vec::new();
+    let mut out: Vec<Invocation> = Vec::new();
 
     for needle in INVOCATIONS {
         let pat: Vec<char> = needle.name.chars().collect();
@@ -959,12 +1232,64 @@ fn invocations(text: &str) -> Vec<(usize, String, String)> {
                 }
                 j += 1;
             }
-            let body: String = chars[body_start..j.saturating_sub(1)].iter().collect();
-            out.push((line, needle.label(), body));
+            let body_end = j.saturating_sub(1);
+            let body: String = chars[body_start..body_end].iter().collect();
+            out.push(Invocation {
+                line,
+                label: needle.label(),
+                body,
+                body_range: (body_start, body_end),
+            });
             at = body_start;
         }
     }
-    out.sort_by_key(|(line, _, _)| *line);
+    out.sort_by_key(|inv| inv.line);
+    out
+}
+
+/// One name a scanned site is not allowed to have used.
+struct Offence {
+    line: usize,
+    label: String,
+    body: String,
+    position: Position,
+    ident: String,
+}
+
+/// Every offence in an already-[`strip_comments`]ed module text, given that
+/// module's value list.
+///
+/// Factored out of the main test so the mutation proof
+/// ([`every_scanned_site_in_web_login_is_actually_checked`]) drives **this**
+/// code rather than a second, quietly diverging copy of the same loop — which
+/// is the shape that would let the proof pass while the lint itself was broken.
+fn offences_in(stripped_text: &str, allowed_value_idents: &[&str]) -> Vec<Offence> {
+    let mut out = Vec::new();
+    for inv in invocations(stripped_text) {
+        // One offence per distinct name per position per site:
+        // `session.id = %id` names `id` twice and is one mistake, not two.
+        let mut reported: Vec<(Position, String)> = Vec::new();
+        for (position, ident) in identifiers(&inv.body) {
+            let allowed = match position {
+                Position::Field => ALLOWED_FIELD_IDENTS.contains(&ident.as_str()),
+                Position::Value => allowed_value_idents.contains(&ident.as_str()),
+            };
+            if KEYWORDS.contains(&ident.as_str())
+                || allowed
+                || reported.contains(&(position, ident.clone()))
+            {
+                continue;
+            }
+            reported.push((position, ident.clone()));
+            out.push(Offence {
+                line: inv.line,
+                label: inv.label.clone(),
+                body: inv.body.clone(),
+                position,
+                ident,
+            });
+        }
+    }
     out
 }
 
@@ -1053,28 +1378,130 @@ fn field_value_split(chars: &[char]) -> Option<usize> {
 /// itself — is all value. That is the strict reading and it is the right one:
 /// `error!(sid)` is `tracing`'s field shorthand, where the name and the value
 /// are the same binding.
+///
+/// # `fields( … )` is recursed into, and that is a TIGHTENING (HIK-274)
+///
+/// `#[tracing::instrument(name = "…", skip_all, fields(a.b = %x))]` presents the
+/// whole `fields( … )` group as **one argument with no top-level `=`**, so the
+/// rule above read every name inside it — `a`, `b` *and* `x` — as
+/// [`Position::Value`]. That is not a cosmetic mis-labelling. Sanctioning `a`
+/// and `b` in Value position to make such a file scan clean would undo HIK-246's
+/// whole result: `let id = sid; warn!(x = %id)` is the evasion the two-list
+/// split exists to stop, and it stops it only because a field-name component is
+/// *not* thereby legal as a binding. `src/web_login.rs` has such an attribute
+/// and would have demanded exactly that trade.
+///
+/// So a `fields( … )` argument is split on its own commas and each item run
+/// through [`field_value_split`] as if it were a top-level argument. It only
+/// ever *splits* — nothing right of a top-level `=` is reclassified, and no name
+/// that was reported stops being reported.
+///
+/// **The names it moves are enumerated rather than counted**, because a count
+/// over this set goes stale on the next logging change while an enumeration
+/// merely goes visibly incomplete. Delete the recursion and the value position
+/// of `src/web_login.rs` demands exactly `auth`, `id`, `login`, `op`, `outcome`,
+/// `redirect`, `refused`, `session`, `user` — every one a component of a dotted
+/// field name — **and `fields`**, which is the group keyword and is discussed
+/// next. (A draft of this paragraph said "the ten that leave are all field-name
+/// components". Nine of them are; `fields` is not, and it is the one whose
+/// disposal needs an argument rather than an observation.)
+///
+/// **One name really is dropped rather than moved: `fields` itself.** It is the
+/// group keyword in `tracing`'s attribute grammar, not an expression, exactly as
+/// `skip_all` is — and a leak cannot hide behind it, because `fields(sid)` has
+/// no top-level `=` and still reports `sid` in Value position. What is lost is
+/// only the ability of an unrelated `fields(…)` *call* inside some other scanned
+/// body to be reported by its own name; its arguments are still read.
 fn identifiers(body: &str) -> Vec<(Position, String)> {
     let chars: Vec<char> = body.chars().collect();
     let mut out = Vec::new();
     for (s, e) in arg_ranges(&chars) {
-        let arg = &chars[s..e];
-        match field_value_split(arg) {
-            Some(k) => {
-                for n in raw_identifiers(&arg[..k]) {
-                    out.push((Position::Field, n));
-                }
-                for n in raw_identifiers(&arg[k + 1..]) {
-                    out.push((Position::Value, n));
-                }
+        push_argument(&chars[s..e], &mut out);
+    }
+    out
+}
+
+/// One argument of a scanned body, classified and pushed. Split out of
+/// [`identifiers`] so a `fields( … )` group can hand its items back to the same
+/// rule rather than to a second, drifting copy of it.
+fn push_argument(arg: &[char], out: &mut Vec<(Position, String)>) {
+    if let Some(k) = field_value_split(arg) {
+        for n in raw_identifiers(&arg[..k]) {
+            out.push((Position::Field, n));
+        }
+        for n in raw_identifiers(&arg[k + 1..]) {
+            out.push((Position::Value, n));
+        }
+        return;
+    }
+    if let Some(inner) = fields_group_body(arg) {
+        for (s, e) in arg_ranges(inner) {
+            push_argument(&inner[s..e], out);
+        }
+        return;
+    }
+    for n in raw_identifiers(arg) {
+        out.push((Position::Value, n));
+    }
+}
+
+/// If `arg` is exactly a `fields( … )` group, the chars between its parens.
+///
+/// Deliberately strict: the whole argument, once trimmed, must be the word
+/// `fields`, optional whitespace, `(`, and a matching `)` at the very end. So
+/// `x.fields(…)` does not match (it starts at `x`), `fieldsy(…)` does not match
+/// (no word boundary), and `fields(a) + b` does not match (something follows the
+/// closer) — each of which is an ordinary expression whose names must keep being
+/// read in Value position.
+fn fields_group_body(arg: &[char]) -> Option<&[char]> {
+    let start = skip_ws(arg, 0);
+    let mut end = arg.len();
+    while end > start && arg[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    let arg = &arg[start..end];
+
+    const KW: &[char] = &['f', 'i', 'e', 'l', 'd', 's'];
+    if arg.len() <= KW.len() || arg[..KW.len()] != *KW {
+        return None;
+    }
+    let open = skip_ws(arg, KW.len());
+    if arg.get(open) != Some(&'(') {
+        return None;
+    }
+    // The matching closer must be the last character, or this is not a group —
+    // it is a call sitting inside a larger expression.
+    if arg.last() != Some(&')') {
+        return None;
+    }
+    let inner = &arg[open + 1..arg.len() - 1];
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for &c in inner {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
             }
-            None => {
-                for n in raw_identifiers(arg) {
-                    out.push((Position::Value, n));
-                }
+        } else if c == '"' {
+            in_str = true;
+        } else if c == '(' || c == '[' || c == '{' {
+            depth += 1;
+        } else if c == ')' || c == ']' || c == '}' {
+            depth -= 1;
+            if depth < 0 {
+                return None;
             }
         }
     }
-    out
+    if depth != 0 {
+        return None;
+    }
+    Some(inner)
 }
 
 /// The identifier lexer: code identifiers, plus inline format captures inside
@@ -1143,11 +1570,11 @@ fn raw_identifiers(chars: &[char]) -> Vec<String> {
 }
 
 #[test]
-fn no_tracing_or_anyhow_line_in_either_session_store_names_an_unsanctioned_binding() {
+fn no_tracing_or_anyhow_line_in_a_web_login_module_names_an_unsanctioned_binding() {
     let mut offences: Vec<String> = Vec::new();
     let mut scanned = 0usize;
 
-    for file in STORES {
+    for file in SCANNED_MODULES {
         let source = strip_comments(file.text);
 
         // A construct the stripper refuses to guess at. Loud, because the
@@ -1169,7 +1596,7 @@ fn no_tracing_or_anyhow_line_in_either_session_store_names_an_unsanctioned_bindi
         // test would pass vacuously — the failure mode a source lint is most
         // prone to.
         //
-        // **Per file, never summed.** A total across `STORES` cannot see one
+        // **Per file, never summed.** A total across the table cannot see one
         // file go dark: postgres contributes invocations of its own, so a redis
         // scan that silently found nothing would still leave a healthy-looking
         // total. That matters concretely, because postgres' `malformed payload`
@@ -1190,33 +1617,20 @@ fn no_tracing_or_anyhow_line_in_either_session_store_names_an_unsanctioned_bindi
         );
         scanned += found.len();
 
-        for (line, label, body) in found {
-            // One offence per distinct name per position per site:
-            // `session.id = %id` names `id` twice and is one mistake, not two.
-            let mut reported: Vec<(Position, String)> = Vec::new();
-            for (pos, ident) in identifiers(&body) {
-                let allowed = match pos {
-                    Position::Field => ALLOWED_FIELD_IDENTS.contains(&ident.as_str()),
-                    Position::Value => ALLOWED_VALUE_IDENTS.contains(&ident.as_str()),
-                };
-                if KEYWORDS.contains(&ident.as_str())
-                    || allowed
-                    || reported.contains(&(pos, ident.clone()))
-                {
-                    continue;
-                }
-                reported.push((pos, ident.clone()));
-                let list = match pos {
-                    Position::Field => "ALLOWED_FIELD_IDENTS",
-                    Position::Value => "ALLOWED_VALUE_IDENTS",
-                };
-                offences.push(format!(
-                    "{}:{line} `{label}` names `{ident}` in {pos:?} position, which is not in \
-                     {list}: {}",
-                    file.path,
-                    body.trim().replace('\n', " ")
-                ));
-            }
+        for o in offences_in(&source.text, file.allowed_value_idents) {
+            let list = match o.position {
+                Position::Field => "ALLOWED_FIELD_IDENTS".to_string(),
+                Position::Value => format!("{}'s value list", file.path),
+            };
+            offences.push(format!(
+                "{}:{} `{}` names `{}` in {:?} position, which is not in {list}: {}",
+                file.path,
+                o.line,
+                o.label,
+                o.ident,
+                o.position,
+                o.body.trim().replace('\n', " ")
+            ));
         }
     }
 
@@ -1225,12 +1639,338 @@ fn no_tracing_or_anyhow_line_in_either_session_store_names_an_unsanctioned_bindi
         "the session id must never enter a formatted log line, and only sanctioned identifiers \
          may be named where one is built — {} offence(s) across {scanned} invocations:\n{}\n\n\
          If the name really cannot carry a session id, add it to the list named above *with the \
-         reason*. Do not widen a list to make this green, and do NOT delete this test: it is the \
-         ONLY oracle for 3 of the 10 sid-bearing sites in these two modules (both `serialize \
-         failed` branches and postgres' `malformed payload`), none of which any behavioural test \
-         can reach offline.",
+         reason*. Do not widen a list to make this green, and do NOT delete this test: for every \
+         site it covers that no behavioural test can reach offline — both `serialize failed` \
+         branches and postgres' `malformed payload` among them — this lint is the ONLY oracle \
+         there is.",
         offences.len(),
         offences.join("\n")
+    );
+}
+
+/// Every name on a module's value list must be **named by a site in that
+/// module**. A sanctioned name no site uses is deleted, not left (HIK-274).
+///
+/// This turns the standing warning above the lists — "do not widen a list to
+/// make this green" — from prose into an assertion. Prose does not fail. With
+/// it, the pre-emptive half of that mistake is not discouraged but
+/// *impossible*: a name added ahead of the site that would need it has nothing
+/// naming it and is reported here immediately, before it can sanction anything.
+///
+/// It does not, and cannot, catch the other half — a name added *alongside* a
+/// real site that genuinely names it. Nothing lexical can; that is what the
+/// bullet arguing why the name cannot carry a sid is for, and why review is
+/// still the control there.
+///
+/// **The shared [`ALLOWED_FIELD_IDENTS`] is deliberately not covered.** "Dead"
+/// there would mean dead across every module at once, which is a different
+/// assertion about a list whose entries cannot carry a value in the first place.
+/// Stated rather than left silent: a stale *field* entry is caught by nothing.
+#[test]
+fn no_web_login_module_carries_a_dead_value_list_entry() {
+    for file in SCANNED_MODULES {
+        let source = strip_comments(file.text);
+        assert!(
+            source.unsupported.is_empty(),
+            "{}: {:?}",
+            file.path,
+            source.unsupported
+        );
+
+        let mut named: Vec<String> = Vec::new();
+        for inv in invocations(&source.text) {
+            for (pos, ident) in identifiers(&inv.body) {
+                if pos == Position::Value && !named.contains(&ident) {
+                    named.push(ident);
+                }
+            }
+        }
+
+        let dead: Vec<&&str> = file
+            .allowed_value_idents
+            .iter()
+            .filter(|n| !named.iter().any(|seen| seen == *n))
+            .collect();
+
+        assert!(
+            dead.is_empty(),
+            "{}: {dead:?} is sanctioned in value position but no longer named by any scanned \
+             site in this file — delete the entry, and its bullet with it. A sanctioned name \
+             with nothing behind it is either a list widened ahead of the code, which is the \
+             exact defeat those bullets exist to prevent, or the residue of a log line someone \
+             removed. Neither should survive.",
+            file.path
+        );
+    }
+}
+
+/// The canary spliced into real source by the two mutation tests below. Chosen
+/// so that it is on no list and could not plausibly be added to one.
+const CANARY: &str = "hik274_canary_binding";
+
+/// The char index at which the line containing `offset` begins.
+fn line_start(chars: &[char], offset: usize) -> usize {
+    chars[..offset]
+        .iter()
+        .rposition(|c| *c == '\n')
+        .map(|i| i + 1)
+        .unwrap_or(0)
+}
+
+/// **T3 — the mutation proof, driven over EVERY scanned site rather than a
+/// hand-picked few.**
+///
+/// The trap this test is written around is HIK-274's own, and it is worth
+/// stating before the mechanism: **a mutation test that hands
+/// [`strip_comments`] / [`invocations`] / [`identifiers`] some text of its own
+/// is GREEN against the tree this ticket started from.** The scanner already
+/// worked on any string it was given; what was missing was the *file set*. So a
+/// proof built on synthetic source proves nothing about this ticket at all.
+///
+/// This one therefore takes its text **from [`SCANNED_MODULES`] by path, and
+/// panics if that path is absent** — which is what ties it to the thing that
+/// actually changed. It then splices [`CANARY`] into each real site's body in
+/// turn and asserts the full pipeline reports it, in [`Position::Value`], at
+/// that site's own line.
+///
+/// **It names no line number and no site, so it cannot go stale.** It covers
+/// HIK-241's five `warn!` sites and HIK-272's two without listing them, and it
+/// will cover the next one the day it is written. The ticket's own suggestion —
+/// "assert the three new `warn!` sites in turn" — was both wrong about the count
+/// and a list that would need editing on every future logging change.
+///
+/// The mutant is only ever *scanned*, never compiled.
+#[test]
+fn every_scanned_site_in_web_login_is_actually_checked() {
+    let file = SCANNED_MODULES
+        .iter()
+        .find(|f| f.path == "src/web_login.rs")
+        .expect(
+            "src/web_login.rs is absent from SCANNED_MODULES — that IS the HIK-274 defect, and \
+             this proof is meaningless without it",
+        );
+
+    assert!(
+        !file.allowed_value_idents.contains(&CANARY)
+            && !ALLOWED_FIELD_IDENTS.contains(&CANARY)
+            && !KEYWORDS.contains(&CANARY),
+        "the canary is sanctioned somewhere, so this test cannot fail"
+    );
+
+    let original: Vec<char> = file.text.chars().collect();
+    let stripped = strip_comments(file.text);
+    assert!(
+        stripped.unsupported.is_empty(),
+        "{:?}",
+        stripped.unsupported
+    );
+
+    // The splice uses offsets computed on the STRIPPED text against the
+    // ORIGINAL. That is sound only because stripping replaces characters one
+    // for one, so assert it rather than rely on it: if `strip_comments` ever
+    // grew a branch that changed the length, every splice below would land at
+    // the wrong place and the test would fail in a way nobody could read.
+    assert_eq!(
+        stripped.text.chars().count(),
+        original.len(),
+        "strip_comments is no longer length-preserving, so body_range offsets do not carry over \
+         to the original text"
+    );
+
+    let sites = invocations(&stripped.text);
+    assert!(!sites.is_empty(), "the scanner is not seeing {}", file.path);
+
+    for site in &sites {
+        let (body_start, _) = site.body_range;
+
+        let mut mutated: String = original[..body_start].iter().collect();
+        mutated.push_str(CANARY);
+        mutated.push_str(", ");
+        mutated.extend(original[body_start..].iter());
+
+        let mutated = strip_comments(&mutated);
+        assert!(
+            mutated.unsupported.is_empty(),
+            "the splice itself was refused at {}:{} — {:?}",
+            file.path,
+            site.line,
+            mutated.unsupported
+        );
+
+        let offences = offences_in(&mutated.text, file.allowed_value_idents);
+        assert!(
+            offences
+                .iter()
+                .any(|o| o.ident == CANARY && o.position == Position::Value && o.line == site.line),
+            "a canary spliced into the `{}` at {}:{} was NOT reported: this site is scanned by \
+             `invocations` but something downstream — `identifiers`, a list, the position rule — \
+             lets an arbitrary new binding through it.\nbody: {}",
+            site.label,
+            file.path,
+            site.line,
+            site.body.trim().replace('\n', " ")
+        );
+    }
+
+    // A readable control on top of the sweep, for the sites this ticket was
+    // actually filed about. **Located by their message literal, never by a line
+    // number**: a line number drifts silently onto a neighbouring site as the
+    // file grows and then asserts something nobody intended, whereas a message
+    // that has been reworded or removed fails loudly and says which one.
+    for message in [
+        // HIK-272, `safe_dest` — the most attacker-controlled value in the
+        // module travels on this line.
+        "web_login: post-login redirect destination refused",
+        // HIK-241, `callback` and `decide`.
+        "web_login: session store unavailable, login refused",
+        "web_login: rotated session stored, but the superseded row could not be removed",
+        "web_login: provider returned error",
+        "web_login: no stored state",
+    ] {
+        assert!(
+            sites.iter().any(|s| s.body.contains(message)),
+            "no scanned site in {} carries the message {message:?}. If that line was \
+             deliberately reworded, update this list; if it was removed, check the sweep above \
+             still covers whatever replaced it.",
+            file.path
+        );
+    }
+}
+
+/// **T4 — what T3 cannot kill, driven rather than asserted.**
+///
+/// Both rows assert the lint stays **green** on source that really does move a
+/// session id onto a log line. They are not decoration and they are not
+/// tolerated failures: they are the module header's two residuals made
+/// executable, so that the day someone closes either hole these go **red** and
+/// the prose describing them has to be corrected rather than quietly outliving
+/// the limitation it describes.
+///
+/// A residual that is only written down drifts. A residual that is asserted
+/// cannot.
+#[test]
+fn the_residuals_this_lint_cannot_close_are_pinned_as_gaps() {
+    let file = SCANNED_MODULES
+        .iter()
+        .find(|f| f.path == "src/web_login.rs")
+        .expect("src/web_login.rs must be scanned");
+
+    let original: Vec<char> = file.text.chars().collect();
+    let stripped = strip_comments(file.text);
+    let sites = invocations(&stripped.text);
+
+    // --- Residual 1: the scan is BY NAME. -------------------------------
+    // A log statement reached through a macro or helper that is not on
+    // `INVOCATIONS` is not scanned at all, so the sid it carries is invisible.
+    // Here the canary goes to `my_log!`, standing beside a real site, on its
+    // own line. No needle matches `my_log`, so nothing about it is ever read.
+    //
+    // Closing this needs the *name* of the offending helper to be knowable in
+    // advance, which it is not — see the module header. If this row ever goes
+    // red, that residual has been closed and the header must say so.
+    let victim = sites.first().expect("at least one scanned site");
+    let at = line_start(&original, victim.body_range.0);
+    let mut mutated: String = original[..at].iter().collect();
+    mutated.push_str(&format!("    my_log!({CANARY});\n"));
+    mutated.extend(original[at..].iter());
+    let mutated = strip_comments(&mutated);
+    assert!(mutated.unsupported.is_empty(), "{:?}", mutated.unsupported);
+    assert!(
+        !offences_in(&mutated.text, file.allowed_value_idents)
+            .iter()
+            .any(|o| o.ident == CANARY),
+        "the by-name residual has been CLOSED: a `my_log!` beside a scanned site is now \
+         reported. That is an improvement — update the module header's second residual, which \
+         still says such a site 'matches no needle, so its body is never read'."
+    );
+
+    // --- Residual 2: no data flow. --------------------------------------
+    // A name sanctioned in value position can be rebound above the site, and
+    // the shadowing `let` sits outside every scanned invocation, so the lint
+    // never sees it. Here `e` — sanctioned in every module, as the error being
+    // reported — is rebound to the canary immediately above a real site whose
+    // body names `e` through an inline capture.
+    //
+    // Closing this needs a real Rust parser over these modules, which is a
+    // different tool and its own ticket.
+    let victim = sites
+        .iter()
+        .find(|s| s.body.contains("{e:#}"))
+        .expect("a site naming `e` through an inline capture");
+    let at = line_start(&original, victim.body_range.0);
+    let mut mutated: String = original[..at].iter().collect();
+    mutated.push_str(&format!("    let e = {CANARY};\n"));
+    mutated.extend(original[at..].iter());
+    let mutated = strip_comments(&mutated);
+    assert!(mutated.unsupported.is_empty(), "{:?}", mutated.unsupported);
+    let offences = offences_in(&mutated.text, file.allowed_value_idents);
+    assert!(
+        !offences.iter().any(|o| o.ident == CANARY),
+        "the data-flow residual has been CLOSED: a `let` above a site is now followed. Update \
+         the module header's 'What it cannot do', which still says `let e = format!(\"{{sid}}\")` \
+         above one of these sites passes."
+    );
+    // And the mutated file is still wholly clean, which is what makes the gap a
+    // gap rather than an accident of where the canary landed: the rebinding is
+    // invisible *and* nothing else about it is reported, so a real leak written
+    // this way ships with the suite green.
+    assert!(
+        offences.is_empty(),
+        "the rebinding row is no longer isolating the residual — the mutated file now has \
+         unrelated offences, so its green result would not mean what it claims: {:?}",
+        offences
+            .iter()
+            .map(|o| format!("{}:{} {}", file.path, o.line, o.ident))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// **T1 — the file set is a property, not a hand-maintained list.**
+///
+/// This is the assertion HIK-274 exists to add, and it is the only one in this
+/// file that is red on the tree that ticket started from. Everything else here
+/// scans whatever text it is handed, so a mutation proof over synthetic source
+/// is green whether or not `src/web_login.rs` is in [`SCANNED_MODULES`] — the
+/// scanner was never the gap, the **file set** was. So this test takes the set
+/// from the filesystem at test time and compares it to the table.
+///
+/// It is red twice over, which is the point of writing it as a property:
+///
+/// * against the pre-HIK-274 tree, where `src/web_login.rs` exists on disk and
+///   is absent from the table — the ticket's own defect; and
+/// * the day someone adds `src/web_login_mysql.rs` and does not review it,
+///   which is the *class*, and which no hand-listed set of paths can catch.
+///
+/// **`src/mcp_resource_server/db_session_store.rs` cannot be picked up by this
+/// glob, and that is deliberate** — see the module header for why it is out of
+/// scope. Two independent reasons, so a change to either leaves it out:
+/// [`std::fs::read_dir`] does not recurse, and the entry for the
+/// `mcp_resource_server` directory is not a file and does not match
+/// `web_login*.rs` in any case. If that module is ever brought in scope it gets
+/// its own review and its own row, not a widened glob.
+#[test]
+fn every_web_login_module_in_src_is_scanned() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .expect("src/ is readable")
+        .map(|entry| entry.expect("a readable directory entry"))
+        .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("web_login") && name.ends_with(".rs"))
+        .map(|name| format!("src/{name}"))
+        .collect();
+    on_disk.sort();
+
+    let mut scanned: Vec<String> = SCANNED_MODULES.iter().map(|f| f.path.to_string()).collect();
+    scanned.sort();
+
+    assert_eq!(
+        scanned, on_disk,
+        "the set of `src/web_login*.rs` modules on disk and the set this lint scans have \
+         diverged. Every module implementing or gating a web-login session handles the `sid`, \
+         which IS the unsigned `hs_session` bearer credential, so an unscanned one is a leak \
+         that would be green everywhere. Add the file to the table and review its logging \
+         sites — do not narrow this test."
     );
 }
 
@@ -1255,7 +1995,7 @@ mod scanner {
         );
         invocations(&stripped.text)
             .into_iter()
-            .map(|(_, _, body)| body.trim().to_string())
+            .map(|inv| inv.body.trim().to_string())
             .collect()
     }
 
@@ -1369,7 +2109,10 @@ mod scanner {
         assert!(stripped.unsupported.is_empty());
         let found = invocations(&stripped.text);
         assert_eq!(found.len(), 1, "found {found:?}");
-        assert_eq!(found[0].0, 3, "the comment must not shift the line number");
+        assert_eq!(
+            found[0].line, 3,
+            "the comment must not shift the line number"
+        );
     }
 
     /// The **blinding** cases: a stripper that scans forward for a terminator
@@ -1411,7 +2154,7 @@ mod scanner {
         assert_eq!(
             invocations(&multi.text)
                 .into_iter()
-                .map(|(_, _, b)| b)
+                .map(|inv| inv.body)
                 .collect::<Vec<_>>(),
             vec![r#""{sid}""#]
         );
@@ -1539,7 +2282,7 @@ mod scanner {
                 !stripped.unsupported.is_empty()
                     || invocations(&stripped.text)
                         .iter()
-                        .any(|(_, _, body)| body.contains("leak")),
+                        .any(|inv| inv.body.contains("leak")),
                 "scanned past a char literal in silence, and the leak fell outside \
                  the body: {src:?}"
             );
@@ -1623,7 +2366,7 @@ let b = "redis://x"; error!(leak = %sid, "m");
                 !stripped.unsupported.is_empty()
                     || invocations(&stripped.text)
                         .iter()
-                        .any(|(_, _, body)| body.contains("leak")),
+                        .any(|inv| inv.body.contains("leak")),
                 "scanned past a raw string in silence, and the leak fell outside \
                  the body: {src:?}"
             );
@@ -1708,5 +2451,69 @@ let b = "redis://x"; error!(leak = %sid, "m");
                 "value:sql_load"
             ]
         );
+    }
+
+    /// **T5.** `fields( … )` is recursed into (HIK-274).
+    ///
+    /// Without this, `#[tracing::instrument(…, fields(session.op = %x))]`
+    /// presents the whole group as one argument with no top-level `=`, so every
+    /// name in it — the field components included — lands in
+    /// [`Position::Value`]. Making `src/web_login.rs` scan clean would then have
+    /// required sanctioning `session`, `op`, `user` and `id` as *bindings*,
+    /// which is precisely what B3 exists to prevent: it would make
+    /// `let id = sid; warn!(x = %id)` legal.
+    #[test]
+    fn a_fields_group_is_recursed_into_rather_than_read_as_one_value() {
+        // The real shape from `src/web_login.rs`'s `#[tracing::instrument]`.
+        assert_eq!(
+            idents("fields(session.op = tracing::field::Empty)"),
+            [
+                "field:session",
+                "field:op",
+                "value:tracing",
+                "value:field",
+                "value:Empty"
+            ]
+        );
+
+        // **The tightening must not lose a leak.** A value inside the group is
+        // still Value, so the allow-list still gets to rule on it — this is the
+        // row that stops the recursion becoming a blanket exemption for
+        // everything written inside `fields(…)`.
+        assert_eq!(idents("fields(x = %sid)"), ["field:x", "value:sid"]);
+        // No `=` inside the group at all: `tracing`'s field shorthand, where the
+        // name and the value are the same binding. Still Value.
+        assert_eq!(idents("fields(sid)"), ["value:sid"]);
+
+        // Several items, and the group as one argument among others.
+        assert_eq!(
+            idents(r#"name = "auth.login", skip_all, fields(a.b = %sid, c = %d)"#),
+            [
+                "field:name",
+                "value:skip_all",
+                "field:a",
+                "field:b",
+                "value:sid",
+                "field:c",
+                "value:d"
+            ]
+        );
+
+        // The negatives. An ordinary call argument is NOT recursed into: `a` in
+        // `f(a = b)` stays in Value position, because outside `tracing`'s field
+        // grammar there is nothing turning it into a static string.
+        assert_eq!(idents("f(a = b)"), ["value:f", "value:a", "value:b"]);
+        // Nor does a `fields(…)` that is not the whole argument qualify — in
+        // both of these it is an expression, not the attribute keyword.
+        assert_eq!(
+            idents("fields(a = b) + c"),
+            ["value:fields", "value:a", "value:b", "value:c"]
+        );
+        assert_eq!(
+            idents("x.fields(a = b)"),
+            ["value:x", "value:fields", "value:a", "value:b"]
+        );
+        // And the bare word is just a name.
+        assert_eq!(idents("fields"), ["value:fields"]);
     }
 }

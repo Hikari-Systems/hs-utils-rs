@@ -1285,7 +1285,18 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
     let span = tracing::Span::current();
 
     let cookie_sid = read_cookie(headers, &wl.cfg.cookie_name);
-    span.record("auth.gate.session.present", cookie_sid.is_some());
+    // The bool is bound before it is recorded so that the `span.record` names
+    // `session_present` and not `cookie_sid`, which **is** the session id — i.e.
+    // the unsigned `hs_session` bearer credential itself.
+    // `tests/session_store_sid_source_lint.rs` allow-lists identifiers by name
+    // and does not follow data flow, so sanctioning `cookie_sid` in value
+    // position to let this line scan clean would leave a later
+    // `%cookie_sid` green. That is not the lint's standing rebinding residual:
+    // it needs no rebinding at all, just a sigil. By the lint's own rule — if a
+    // name cannot be argued for, the code changes — the binding moves out.
+    // Behaviour is unchanged: same field, same type, same value, same span.
+    let session_present = cookie_sid.is_some();
+    span.record("auth.gate.session.present", session_present);
 
     // No cookie ⇒ nothing to load ⇒ the request cannot be authenticated. Asking
     // the store anyway would be a guaranteed miss on a made-up id.
@@ -2009,9 +2020,16 @@ mod tests {
                     // orphaned session that outlives the access token's hour,
                     // and a doc comment naming it while nothing drove it is the
                     // claim-without-evidence this ticket keeps failing on.
-                    r#"{"access_token":"at-1","refresh_token":"rt-1","token_type":"bearer","expires_in":3600,"id_token":"idt-1"}"#
+                    //
+                    // Escaped rather than `r#"…"#` because this file is scanned
+                    // by `tests/session_store_sid_source_lint.rs`, whose comment
+                    // stripper refuses a raw string outright rather than lexing
+                    // one — see that test's `strip_comments` for the two ways a
+                    // raw string desynchronises it. The refusal is loud, so this
+                    // is a legibility cost and never a silent one.
+                    "{\"access_token\":\"at-1\",\"refresh_token\":\"rt-1\",\"token_type\":\"bearer\",\"expires_in\":3600,\"id_token\":\"idt-1\"}"
                 } else {
-                    r#"{"sub":"kratos-identity-9"}"#
+                    "{\"sub\":\"kratos-identity-9\"}"
                 };
                 let _ = write!(
                     stream,
