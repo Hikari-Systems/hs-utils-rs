@@ -90,6 +90,8 @@ The rewrites are harmless — a browser resolves dot segments the same way and t
 
 `escapes_root` is a misnomer and is kept only because `botsafely-controller` already publishes that vocabulary: it never fires for an input that escapes the root, and what it fires for in practice is the protocol-relative form the reconstruction can manufacture out of a dot-segment input. (It also catches a cannot-be-a-base URL whose origin aliases the sentinel, which nothing reaches from either call site.)
 
+**Also in v0.32.1: `JwtClaims::scopes()` reads Hydra's `scp`.** Ory Hydra puts a JWT access token's scopes in `scp` (an array), and `scopes()` read only the RFC 9068 `scope` string, so `AuthExtension.scopes` was empty for every Hydra token. It now merges `scope` with `scp` (array or string), without duplicates. Nothing failed open on the old behaviour (an empty list grants nothing), but an MCP server that gates tools on `mcp:read` / `mcp:write` saw none, as woodhouse-controller did. No signature change; a server that ignores scopes is unaffected. HIK-274 (the sid-disclosure lint now scans `src/web_login*`) is in this release too and changes no runtime behaviour.
+
 ### v0.32.0 — `WebSessionStore` is fallible (HIK-241)
 
 All three trait methods changed. Any type implementing `WebSessionStore` outside this crate must change with them:
