@@ -34,11 +34,27 @@ pub struct JwtClaims {
 }
 
 impl JwtClaims {
+    /// The token's scopes: the space-separated `scope` claim (RFC 9068) and
+    /// the `scp` claim, an array or a string, in that order, without
+    /// duplicates. Ory Hydra issues JWT access tokens with `scp` only, so a
+    /// reader of `scope` alone sees every Hydra token as having no scopes,
+    /// and any scope check on it fails closed.
     pub fn scopes(&self) -> Vec<String> {
-        match &self.scope {
-            Some(s) => s.split_whitespace().map(str::to_string).collect(),
-            None => Vec::new(),
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |s: &str| {
+            if !s.is_empty() && !out.iter().any(|x| x == s) {
+                out.push(s.to_string());
+            }
+        };
+        if let Some(s) = &self.scope {
+            s.split_whitespace().for_each(&mut push);
         }
+        match self.raw.get("scp") {
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).for_each(&mut push),
+            Some(Value::String(s)) => s.split_whitespace().for_each(&mut push),
+            _ => {}
+        }
+        out
     }
 }
 
@@ -160,5 +176,49 @@ impl JwtVerifier {
             client_id,
             raw,
         })
+    }
+}
+
+#[cfg(test)]
+mod scopes_tests {
+    use super::JwtClaims;
+    use serde_json::{json, Value};
+
+    fn claims(scope: Option<&str>, raw: Value) -> JwtClaims {
+        JwtClaims {
+            sub: "u".into(),
+            aud: "a".into(),
+            iss: None,
+            exp: 0,
+            iat: None,
+            scope: scope.map(str::to_string),
+            client_id: None,
+            raw,
+        }
+    }
+
+    #[test]
+    fn hydra_scp_array_is_read() {
+        let c = claims(
+            None,
+            json!({ "scp": ["mcp:read", "mcp:write", "offline_access"] }),
+        );
+        assert_eq!(c.scopes(), vec!["mcp:read", "mcp:write", "offline_access"]);
+    }
+
+    #[test]
+    fn scope_string_and_scp_string_are_read_and_merged() {
+        assert_eq!(
+            claims(Some("openid mcp:read"), json!({})).scopes(),
+            vec!["openid", "mcp:read"]
+        );
+        let c = claims(Some("mcp:read"), json!({ "scp": "mcp:read mcp:write" }));
+        assert_eq!(c.scopes(), vec!["mcp:read", "mcp:write"], "no duplicates");
+    }
+
+    #[test]
+    fn no_scope_claims_means_no_scopes() {
+        assert!(claims(None, json!({ "sub": "u" })).scopes().is_empty());
+        assert!(claims(None, json!({ "scp": 5 })).scopes().is_empty());
     }
 }
