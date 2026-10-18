@@ -58,6 +58,15 @@ There is no CHANGELOG in this repo, so "the plan" cannot live in one. It goes in
 
 ## Migrating consumers
 
+### v0.32.2 — the advertised resource metadata URL is path-inserted
+
+A 401's `WWW-Authenticate` named `resource_metadata="<resource_server_url>/.well-known/oauth-protected-resource"`
+(`https://h/mcp/.well-known/…`), a URL behind the auth layer itself, so it answered 401 and strict MCP clients
+(woodhouse-controller before its fallback) found no authorization server. It is now path-inserted as RFC 9728 §3.1
+says and as the TS `hs.utils` already does (`https://h/.well-known/oauth-protected-resource/mcp`, from
+`metadata::prm_url`), and `metadata::router` also serves that path when the resource's path is not `/mcp`. No
+signature change: bump the tag.
+
 ### v0.32.1 — the post-login redirect is sanitised (HIK-272)
 
 No API change — nothing is added, removed or re-typed, so this is a patch and a consumer bump is a one-line tag change. What changes is **behaviour**, at two points a consumer never calls directly: `gate` sanitises the request target before storing it as the `state → destination` map, and `callback` sanitises again before emitting the `Location`. Both were previously verbatim, which made the completed-login redirect an open redirect against a victim who is *necessarily* authenticated by the time it fires.

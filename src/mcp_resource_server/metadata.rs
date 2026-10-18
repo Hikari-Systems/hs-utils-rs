@@ -75,19 +75,47 @@ impl MetadataState {
     }
 }
 
+/// `resource_server_url` split into its origin and its path (no trailing slash; empty at the root).
+fn split_resource(resource_server_url: &str) -> (&str, &str) {
+    let url = resource_server_url.trim_end_matches('/');
+    let after_scheme = url.find("://").map_or(0, |i| i + 3);
+    match url[after_scheme..].find('/') {
+        Some(i) => url.split_at(after_scheme + i),
+        None => (url, ""),
+    }
+}
+
+/// The protected-resource metadata URL for `resource_server_url`, path-inserted as RFC 9728 §3.1
+/// says (`https://h/mcp` → `https://h/.well-known/oauth-protected-resource/mcp`), as the TS
+/// `hs.utils` advertises it. [`router`] serves it.
+pub fn prm_url(resource_server_url: &str) -> String {
+    let (origin, path) = split_resource(resource_server_url);
+    format!("{origin}/.well-known/oauth-protected-resource{path}")
+}
+
 pub fn router(state: MetadataState) -> Router {
-    Router::new()
+    let (_, path) = split_resource(&state.auth_cfg.resource_server_url);
+    let mut r = Router::new()
         .route("/.well-known/oauth-protected-resource", get(prm_handler))
-        .route("/.well-known/oauth-protected-resource/mcp", get(prm_handler))
         .route(
-            "/.well-known/oauth-authorization-server",
-            get(as_metadata_handler),
-        )
-        .route(
-            "/.well-known/client-metadata/{client_id}",
-            get(client_metadata_handler),
-        )
-        .with_state(state)
+            "/.well-known/oauth-protected-resource/mcp",
+            get(prm_handler),
+        );
+    if !path.is_empty() && path != "/mcp" {
+        r = r.route(
+            &format!("/.well-known/oauth-protected-resource{path}"),
+            get(prm_handler),
+        );
+    }
+    r.route(
+        "/.well-known/oauth-authorization-server",
+        get(as_metadata_handler),
+    )
+    .route(
+        "/.well-known/client-metadata/{client_id}",
+        get(client_metadata_handler),
+    )
+    .with_state(state)
 }
 
 async fn prm_handler(State(state): State<MetadataState>) -> Response {
@@ -218,4 +246,34 @@ fn upstream_error() -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod prm_url_tests {
+    use super::prm_url;
+
+    /// RFC 9728 §3.1: the well-known part goes between the host and the resource's path.
+    #[test]
+    fn the_metadata_url_is_path_inserted() {
+        assert_eq!(
+            prm_url("https://bae-mcp.example.com/mcp"),
+            "https://bae-mcp.example.com/.well-known/oauth-protected-resource/mcp"
+        );
+        assert_eq!(
+            prm_url("https://h.example.com/mcp/"),
+            "https://h.example.com/.well-known/oauth-protected-resource/mcp"
+        );
+        assert_eq!(
+            prm_url("https://h.example.com:8443/api/mcp"),
+            "https://h.example.com:8443/.well-known/oauth-protected-resource/api/mcp"
+        );
+        assert_eq!(
+            prm_url("https://h.example.com"),
+            "https://h.example.com/.well-known/oauth-protected-resource"
+        );
+        assert_eq!(
+            prm_url("http://localhost:3000/"),
+            "http://localhost:3000/.well-known/oauth-protected-resource"
+        );
+    }
 }

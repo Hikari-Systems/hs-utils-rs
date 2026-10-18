@@ -110,10 +110,7 @@ fn extract_bearer(req: &Request<Body>) -> Option<String> {
 }
 
 fn unauthorized(cfg: &McpAuthConfig, error_code: &str) -> Response {
-    let prm_url = format!(
-        "{}/.well-known/oauth-protected-resource",
-        cfg.resource_server_url.trim_end_matches('/')
-    );
+    let prm_url = super::metadata::prm_url(&cfg.resource_server_url);
     let www_authenticate = format!(
         "Bearer realm=\"{}\", error=\"{}\", resource_metadata=\"{}\"",
         cfg.resource_server_url, error_code, prm_url
