@@ -886,6 +886,39 @@ fn store_unavailable() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, STORE_UNAVAILABLE_BODY).into_response()
 }
 
+/// `GET /api/account?dest_uri=…` for a consumer: send the browser to the login
+/// host's account settings page (`settings_url`, e.g.
+/// `https://login.<env>hikari-systems.com/settings`) with
+/// `return_to=<this app's origin><dest>`, so the account pages can offer
+/// "Back to <app>" to the page the user left.
+///
+/// `dest` goes through the same sanitiser as the post-login redirect, so a
+/// hostile `dest_uri` becomes `/` (with the usual refusal `warn!`), never an
+/// off-origin `return_to`. hs-login-controller vouches for `return_to` again
+/// against the client's registered redirect URIs before the page shows it.
+///
+/// An empty `settings_url` answers 404 (the consumer has not configured one);
+/// one that is not a URL answers 500.
+pub fn account_redirect(settings_url: &str, headers: &HeaderMap, dest: Option<&str>) -> Response {
+    let settings = settings_url.trim();
+    if settings.is_empty() {
+        return (StatusCode::NOT_FOUND, "account settings are not configured").into_response();
+    }
+    let dest = match dest {
+        Some(d) => safe_dest(Some(d), "account", None),
+        None => "/".to_string(),
+    };
+    let return_to = format!("{}{dest}", forwarded_for(headers, "", "").base_url);
+    match reqwest::Url::parse_with_params(settings, &[("return_to", return_to.as_str())]) {
+        Ok(u) => see_other(u.as_str(), None),
+        Err(e) => {
+            tracing::error!("web_login: account settings URL is not a URL: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "account settings URL is misconfigured")
+                .into_response()
+        }
+    }
+}
+
 /// Max length for an attacker-supplied value recorded on a log line.
 const MAX_LOGGED_LEN: usize = 256;
 
@@ -1543,6 +1576,32 @@ mod tests {
         // login host's "Back to <app>" link.
         assert_eq!(q.get("hs_return_to").unwrap(), "https://app.example.com/report?id=5");
         assert!(parsed.as_str().starts_with("https://auth.example.com/oauth2/auth?"));
+    }
+
+    #[test]
+    fn account_redirect_returns_to_the_sanitised_page_on_this_origin() {
+        let settings = "https://login.example.com/settings";
+        let loc = |dest: Option<&str>| {
+            let r = account_redirect(settings, &https_headers(), dest);
+            assert_eq!(r.status(), StatusCode::SEE_OTHER);
+            let l = r.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+            let u = reqwest::Url::parse(&l).unwrap();
+            assert!(l.starts_with("https://login.example.com/settings?"), "{l}");
+            u.query_pairs().find(|(k, _)| k == "return_to").unwrap().1.into_owned()
+        };
+        assert_eq!(loc(Some("/bots?tab=2")), "https://app.example.com/bots?tab=2");
+        assert_eq!(loc(None), "https://app.example.com/");
+        // A hostile dest never leaves the origin.
+        assert_eq!(loc(Some("//evil.example.com/x")), "https://app.example.com/");
+        assert_eq!(loc(Some("https://evil.example.com/")), "https://app.example.com/");
+    }
+
+    #[test]
+    fn account_redirect_without_a_settings_url_is_a_404() {
+        let r = account_redirect("  ", &https_headers(), Some("/"));
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let r = account_redirect("not a url", &https_headers(), Some("/"));
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

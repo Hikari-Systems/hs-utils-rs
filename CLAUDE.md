@@ -58,6 +58,15 @@ There is no CHANGELOG in this repo, so "the plan" cannot live in one. It goes in
 
 ## Migrating consumers
 
+### v0.32.4 — `web_login::account_redirect` for an app's "My account" link
+
+New, nothing changed: `account_redirect(settings_url, headers, dest)` answers an app's `GET /api/account?dest_uri=`
+with a 303 to the login host's settings page carrying `return_to=<app origin><sanitised dest>`, so the account pages
+show "Back to <app>" to the page the user left. `dest` goes through `safe_dest` (refusals log with
+`auth.redirect.site=account` and fall to `/`). An empty `settings_url` is a 404, a non-URL a 500. Wire it to an
+`auth.accountSettingsUrl` config value (woodhouse-controller's name for it) and link the app's user menu to
+`/api/account?dest_uri=<current path>`.
+
 ### v0.32.3 — the authorize URL carries the return page (`hs_return_to`)
 
 `web_login`'s gate adds `hs_return_to=<this app's origin><the sanitised page>` to the IdP authorize URL. The IdP
