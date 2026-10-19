@@ -58,6 +58,15 @@ There is no CHANGELOG in this repo, so "the plan" cannot live in one. It goes in
 
 ## Migrating consumers
 
+### v0.32.3 — the authorize URL carries the return page (`hs_return_to`)
+
+`web_login`'s gate adds `hs_return_to=<this app's origin><the sanitised page>` to the IdP authorize URL. The IdP
+ignores it; hs-login-controller reads it off Hydra's login request and gives the login host's account pages a
+"Back to <app>" link to exactly that page, but only when its origin matches one of the client's registered redirect
+URIs. Before this the account pages (passkeys, profile photo) had no way back to the app. It is the value already
+stored for the callback (`safe_dest`), so nothing unsanitised leaves the app. No signature change: bump the tag. A
+consumer on an older tag still gets a "Back to <app>" link, to the app's origin rather than the page.
+
 ### v0.32.2 — the advertised resource metadata URL is path-inserted
 
 A 401's `WWW-Authenticate` named `resource_metadata="<resource_server_url>/.well-known/oauth-protected-resource"`

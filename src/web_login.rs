@@ -340,8 +340,15 @@ impl WebLogin {
         format!("{base}{}", self.cfg.callback_uri)
     }
 
-    fn authorize_url(&self, state_key: &str, headers: &HeaderMap) -> String {
+    /// The IdP authorize URL. `return_path` is the **sanitised** page the user
+    /// was on ([`safe_dest`]); it rides along as `hs_return_to` (absolute, on
+    /// this app's browser-facing origin) so the login host's account pages can
+    /// offer a way back to it. The IdP ignores the parameter; hs-login-controller
+    /// reads it off the login request and only uses it when its origin matches
+    /// one of this client's registered redirect URIs.
+    fn authorize_url(&self, state_key: &str, headers: &HeaderMap, return_path: &str) -> String {
         let redirect_uri = self.redirect_uri(headers);
+        let return_to = format!("{}{return_path}", forwarded_for(headers, "", "").base_url);
         reqwest::Url::parse_with_params(
             &self.cfg.authorize_url,
             &[
@@ -350,6 +357,7 @@ impl WebLogin {
                 ("redirect_uri", redirect_uri.as_str()),
                 ("state", state_key),
                 ("scope", self.cfg.scopes.as_str()),
+                ("hs_return_to", return_to.as_str()),
             ],
         )
         .map(|u| u.to_string())
@@ -1399,7 +1407,7 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
     // authenticated, so there is no id to put on the refusal line.
     let orig = safe_dest(uri.path_and_query().map(|pq| pq.as_str()), "gate", None);
     let state_key = uuid::Uuid::new_v4().to_string();
-    sess.redirects.insert(state_key.clone(), orig);
+    sess.redirects.insert(state_key.clone(), orig.clone());
     if let Err(e) = wl.store.store(&sid, &sess).await {
         // **Fatal, unlike the `load` above, and the difference is what the write
         // is for.** `callback` reads this `state` back out of the store, so a
@@ -1424,7 +1432,7 @@ async fn decide(g: &GateState, headers: &HeaderMap, uri: &Uri) -> GateDecision {
     }
     span.record("auth.gate.outcome", "redirect_to_login");
     span.record("auth.gate.session.minted", minted);
-    GateDecision::Respond(see_other(&wl.authorize_url(&state_key, headers), set_cookie))
+    GateDecision::Respond(see_other(&wl.authorize_url(&state_key, headers, &orig), set_cookie))
 }
 
 #[cfg(test)]
@@ -1520,7 +1528,7 @@ mod tests {
 
     #[test]
     fn authorize_url_has_oauth_params() {
-        let u = wl().authorize_url("state-123", &https_headers());
+        let u = wl().authorize_url("state-123", &https_headers(), "/report?id=5");
         let parsed = reqwest::Url::parse(&u).unwrap();
         let q: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(q.get("response_type").unwrap(), "code");
@@ -1531,6 +1539,9 @@ mod tests {
             q.get("redirect_uri").unwrap(),
             "https://app.example.com/oauth2/callback"
         );
+        // The sanitised return page, absolute on the app's own origin, for the
+        // login host's "Back to <app>" link.
+        assert_eq!(q.get("hs_return_to").unwrap(), "https://app.example.com/report?id=5");
         assert!(parsed.as_str().starts_with("https://auth.example.com/oauth2/auth?"));
     }
 
