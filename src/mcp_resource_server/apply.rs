@@ -25,8 +25,11 @@ use super::dcr::{dcr_router, DcrState};
 use super::hydra_client_store::HydraClientStore;
 use super::jwt::JwtVerifier;
 use super::kratos_resolver::KratosUserResolver;
-use super::metadata::{router as metadata_router, MetadataState};
+use super::metadata::{
+    router as metadata_router, sub_resource_router, MetadataState, SubResourceValidator,
+};
 use super::middleware::AuthState;
+use super::resource::{sub_resource_mapper, ResourceAuthState};
 use super::stores::{
     AsmCache, ClientStore, DcrRateLimitStore, InMemoryAsmCache,
     InMemoryClientStore, InMemoryDcrRateLimitStore, InMemoryJwksCacheStore,
@@ -117,4 +120,29 @@ pub fn apply_mcp_auth(
         auth_cfg: cfg,
     };
     (router, auth_state)
+}
+
+/// [`apply_mcp_auth`] for a server with sub-resources under its
+/// `resource_server_url` (woodhouse's `/mcp/o/{orgId}`): the same router plus
+/// the sub-resource metadata route ([`sub_resource_router`]), and a
+/// [`ResourceAuthState`] (built with [`sub_resource_mapper`]) for
+/// [`auth_middleware_per_resource`](super::resource::auth_middleware_per_resource).
+/// `accept` decides which sub-paths exist, for both.
+pub fn apply_mcp_auth_with(
+    cfg: Arc<McpAuthConfig>,
+    stores: McpAuthStores,
+    resolver: Arc<KratosUserResolver>,
+    accept: SubResourceValidator,
+) -> (Router, ResourceAuthState) {
+    let metadata = MetadataState::new(
+        Arc::clone(&cfg),
+        Arc::clone(&stores.asm),
+        Arc::clone(&stores.clients),
+    );
+    let resource_for = sub_resource_mapper(&cfg.resource_server_url, Arc::clone(&accept));
+    let (router, auth_state) = apply_mcp_auth(cfg, stores, resolver);
+    (
+        router.merge(sub_resource_router(metadata, accept)),
+        ResourceAuthState::new(auth_state, resource_for),
+    )
 }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -76,7 +76,7 @@ impl MetadataState {
 }
 
 /// `resource_server_url` split into its origin and its path (no trailing slash; empty at the root).
-fn split_resource(resource_server_url: &str) -> (&str, &str) {
+pub(super) fn split_resource(resource_server_url: &str) -> (&str, &str) {
     let url = resource_server_url.trim_end_matches('/');
     let after_scheme = url.find("://").map_or(0, |i| i + 3);
     match url[after_scheme..].find('/') {
@@ -119,7 +119,41 @@ pub fn router(state: MetadataState) -> Router {
 }
 
 async fn prm_handler(State(state): State<MetadataState>) -> Response {
-    let cfg = &state.auth_cfg;
+    prm_response(&state.auth_cfg, &state.auth_cfg.resource_server_url)
+}
+
+/// A validator for the part of a request path after the resource's own path and its `/` (for
+/// `https://h/mcp`, `o/<id>` in `/mcp/o/<id>`). It sees the raw path, not percent-decoded, and
+/// should accept only the canonical form of a sub-resource: whatever it accepts becomes a
+/// resource, and so an audience matched byte for byte.
+pub type SubResourceValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Protected-resource metadata for sub-resources of `resource_server_url`:
+/// `GET /.well-known/oauth-protected-resource{path}/{rest}` names `resource =
+/// <resource_server_url>/{rest}` when `accept(rest)`, and is 404 otherwise. Merge it next to
+/// [`router`], which it does not change.
+pub fn sub_resource_router(state: MetadataState, accept: SubResourceValidator) -> Router {
+    let (_, path) = split_resource(&state.auth_cfg.resource_server_url);
+    let prefix = format!("/.well-known/oauth-protected-resource{path}/");
+    let route = format!("{prefix}{{*rest}}");
+    let handler = move |State(state): State<MetadataState>, uri: Uri| {
+        let prefix = prefix.clone();
+        let accept = Arc::clone(&accept);
+        async move {
+            // The raw path: `Path` would percent-decode `rest`.
+            match uri.path().strip_prefix(prefix.as_str()) {
+                Some(rest) if accept(rest) => {
+                    let base = state.auth_cfg.resource_server_url.trim_end_matches('/');
+                    prm_response(&state.auth_cfg, &format!("{base}/{rest}"))
+                }
+                _ => (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))).into_response(),
+            }
+        }
+    };
+    Router::new().route(&route, get(handler)).with_state(state)
+}
+
+fn prm_response(cfg: &McpAuthConfig, resource: &str) -> Response {
     let authorization_servers: Vec<String> = cfg
         .authorization_server_url
         .as_ref()
@@ -127,7 +161,7 @@ async fn prm_handler(State(state): State<MetadataState>) -> Response {
         .map(|s| vec![s.trim_end_matches('/').to_string()])
         .unwrap_or_default();
     json_with_cors(json!({
-        "resource": cfg.resource_server_url,
+        "resource": resource,
         "authorization_servers": authorization_servers,
         "scopes_supported": cfg.supported_scopes,
         "bearer_methods_supported": ["header"],
