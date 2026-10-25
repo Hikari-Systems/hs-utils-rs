@@ -58,6 +58,18 @@ There is no CHANGELOG in this repo, so "the plan" cannot live in one. It goes in
 
 ## Migrating consumers
 
+### v0.33.0 — a resource (and `aud`) per path for MCP servers with sub-resources (HIK-592)
+
+New, nothing changed: `apply_mcp_auth`, `auth_middleware` and `JwtVerifier::verify` answer exactly as before (a
+golden test pins their 401 and metadata). A server with resources under its URL (woodhouse's `/mcp/o/{orgId}`) calls
+`apply_mcp_auth_with(cfg, stores, resolver, accept)` instead and layers `auth_middleware_per_resource` with the
+returned `ResourceAuthState`. `accept(rest)` decides which `{path}/{rest}` exist (raw path, never percent-decoded);
+it drives both the 404s and `/.well-known/oauth-protected-resource{path}/{rest}`. Per path, the token's `aud` must
+contain that resource byte for byte and no other value equal to `expected_audience` or under it at a `/`, so a token
+with two of the server's audiences is refused everywhere. Nothing is normalised: Hydra copies `..`, `%2e%2e`, a
+trailing `/`, `?` and `#` into `aud` verbatim. The middleware must see the full path (layer it outside any `nest`),
+and the resource it verified is in the `VerifiedResource` extension.
+
 ### v0.32.4 — `web_login::account_redirect` for an app's "My account" link
 
 New, nothing changed: `account_redirect(settings_url, headers, dest)` answers an app's `GET /api/account?dest_uri=`

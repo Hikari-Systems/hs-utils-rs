@@ -28,9 +28,10 @@ pub mod jwt;
 pub mod kratos_resolver;
 pub mod metadata;
 pub mod middleware;
+pub mod resource;
 pub mod stores;
 
-pub use apply::{apply_mcp_auth, McpAuthStores};
+pub use apply::{apply_mcp_auth, apply_mcp_auth_with, McpAuthStores};
 pub use claims::OauthProfile;
 pub use config::McpAuthConfig;
 pub use dcr::dcr_router;
@@ -47,8 +48,12 @@ pub use db_session_store::DbSessionStore;
 #[cfg(feature = "mcp-session-store")]
 pub use rmcp::transport::streamable_http_server::session::store::{SessionState, SessionStore};
 pub use hydra_client_store::HydraClientStore;
-pub use metadata::MetadataState;
+pub use metadata::{MetadataState, SubResourceValidator};
 pub use middleware::{AuthExtension, AuthState};
+pub use resource::{
+    auth_middleware_per_resource, is_canonical_uuid, sub_resource_mapper, ResourceAuthState,
+    ResourceFor, VerifiedResource,
+};
 pub use stores::{
     AsmCache, ClientRegistration, ClientStore, DcrRateLimitStore,
     InMemoryAsmCache, InMemoryClientStore, InMemoryDcrRateLimitStore,

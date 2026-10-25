@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -19,7 +19,7 @@ use serde_json::json;
 
 use super::claims::OauthProfile;
 use super::config::McpAuthConfig;
-use super::jwt::JwtVerifier;
+use super::jwt::{JwtClaims, JwtVerifier};
 use super::kratos_resolver::KratosUserResolver;
 
 /// Per-request auth context attached to the axum request extensions.
@@ -63,6 +63,21 @@ pub async fn auth_middleware(
         }
     };
 
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let extension = extension_for(&state, &claims, method, path).await;
+    request.extensions_mut().insert(extension);
+    next.run(request).await
+}
+
+/// The [`AuthExtension`] for verified `claims`, with the debug line both
+/// middlewares log.
+pub(super) async fn extension_for(
+    state: &AuthState,
+    claims: &JwtClaims,
+    method: Method,
+    path: String,
+) -> AuthExtension {
     let resolved = state.resolver.resolve(&claims.raw).await;
 
     let scopes = claims.scopes();
@@ -74,8 +89,6 @@ pub async fn auth_middleware(
         scopes: scopes.clone(),
     };
 
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
     tracing::debug!(
         target: "auth",
         "{method} {path} userId={user} email={email} name={name} sub={sub} client={client} scopes={scopes}",
@@ -87,11 +100,10 @@ pub async fn auth_middleware(
         scopes = scopes.join(","),
     );
 
-    request.extensions_mut().insert(extension);
-    next.run(request).await
+    extension
 }
 
-fn extract_bearer(req: &Request<Body>) -> Option<String> {
+pub(super) fn extract_bearer(req: &Request<Body>) -> Option<String> {
     let header = req.headers().get(header::AUTHORIZATION)?;
     let raw = header.to_str().ok()?.trim();
     let prefix = "Bearer ";
@@ -110,10 +122,15 @@ fn extract_bearer(req: &Request<Body>) -> Option<String> {
 }
 
 fn unauthorized(cfg: &McpAuthConfig, error_code: &str) -> Response {
-    let prm_url = super::metadata::prm_url(&cfg.resource_server_url);
+    unauthorized_for(&cfg.resource_server_url, error_code)
+}
+
+/// 401 naming `resource` as the realm and its path-inserted metadata URL.
+pub(super) fn unauthorized_for(resource: &str, error_code: &str) -> Response {
+    let prm_url = super::metadata::prm_url(resource);
     let www_authenticate = format!(
         "Bearer realm=\"{}\", error=\"{}\", resource_metadata=\"{}\"",
-        cfg.resource_server_url, error_code, prm_url
+        resource, error_code, prm_url
     );
 
     let mut resp = (
