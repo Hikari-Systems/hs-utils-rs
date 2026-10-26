@@ -44,14 +44,43 @@ pub struct VerifiedResource(pub String);
 pub struct ResourceAuthState {
     auth: AuthState,
     resource_for: ResourceFor,
+    base: String,
+}
+
+/// `s` with at most one trailing `/` removed.
+fn strip_one_slash(s: &str) -> &str {
+    s.strip_suffix('/').unwrap_or(s)
 }
 
 impl ResourceAuthState {
-    /// `auth.auth_cfg.expected_audience` is the server's base audience: any
-    /// `aud` value equal to it or under it at a `/` counts as one of this
-    /// server's, and a token may carry exactly one, the path's resource.
+    /// `auth.auth_cfg.expected_audience`, less at most one trailing `/`, is
+    /// the server's base audience: any `aud` value equal to it or under it
+    /// at a `/` counts as one of this server's, and a token may carry
+    /// exactly one, the path's resource. Every resource `resource_for`
+    /// returns must be the base or under it; the middleware refuses (401)
+    /// any request whose resource is not, so a mapper built from a
+    /// different URL fails closed instead of letting one token reach two
+    /// resources.
     pub fn new(auth: AuthState, resource_for: ResourceFor) -> Self {
-        Self { auth, resource_for }
+        let base = strip_one_slash(&auth.auth_cfg.expected_audience).to_string();
+        Self {
+            auth,
+            resource_for,
+            base,
+        }
+    }
+
+    /// The base audience the one-audience rule is checked against.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// True when `resource` is the base or under it at a `/`.
+    fn covers(&self, resource: &str) -> bool {
+        resource == self.base
+            || resource
+                .strip_prefix(self.base.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
     }
 
     pub fn auth(&self) -> &AuthState {
@@ -114,10 +143,19 @@ pub async fn auth_middleware_per_resource(
         None => return unauthorized_for(&resource, "missing Bearer token"),
     };
 
+    if !state.covers(&resource) {
+        tracing::error!(
+            "resource {resource} is not under the base audience {}; refusing (check \
+             expectedAudience against resourceServerUrl)",
+            state.base
+        );
+        return unauthorized_for(&resource, "invalid_token");
+    }
+
     let auth = &state.auth;
     let claims = match auth
         .verifier
-        .verify_for_resource(&token, &resource, &auth.auth_cfg.expected_audience)
+        .verify_for_resource(&token, &resource, &state.base)
         .await
     {
         Ok(c) => c,
@@ -195,9 +233,13 @@ mod tests {
     }
 
     fn cfg() -> Arc<McpAuthConfig> {
+        cfg_with(BASE, BASE)
+    }
+
+    fn cfg_with(resource: &str, audience: &str) -> Arc<McpAuthConfig> {
         let cfg: McpAuthConfig = serde_json::from_value(json!({
-            "resourceServerUrl": BASE,
-            "expectedAudience": BASE,
+            "resourceServerUrl": resource,
+            "expectedAudience": audience,
             "supportedScopes": "mcp:read,mcp:write",
             "enableDcr": "false",
         }))
@@ -248,8 +290,12 @@ mod tests {
     }
 
     async fn per_resource_app() -> Router {
+        per_resource_app_with(cfg()).await
+    }
+
+    async fn per_resource_app_with(cfg: Arc<McpAuthConfig>) -> Router {
         let (public, state) =
-            apply_mcp_auth_with(cfg(), stores().await, resolver(), woodhouse_accept());
+            apply_mcp_auth_with(cfg, stores().await, resolver(), woodhouse_accept());
         let mcp = Router::new()
             .route("/mcp", any(echo))
             .route("/mcp/{*rest}", any(echo))
@@ -480,6 +526,62 @@ mod tests {
             )
             .await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{rest}");
+        }
+    }
+
+    // --- the base audience and the resource URL agree -------------------
+
+    /// A trailing `/` on `expectedAudience` must not widen the one-audience
+    /// rule: a token naming the base and an org is still refused at both.
+    #[tokio::test]
+    async fn a_trailing_slash_on_the_audience_keeps_one_resource_per_token() {
+        let app = per_resource_app_with(cfg_with(BASE, &format!("{BASE}/"))).await;
+        let at_a = format!("/mcp/o/{ORG_A}");
+        let two = token(json!([BASE, org(ORG_A)]));
+        for path in ["/mcp", at_a.as_str()] {
+            let resp = call(&app, path, Some(&two)).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        let resp = call(&app, &at_a, Some(&token(json!(org(ORG_A))))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = call(&app, "/mcp", Some(&token(json!(BASE)))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "must be resourceServerUrl")]
+    async fn a_different_audience_refuses_to_construct() {
+        let _ = per_resource_app_with(cfg_with(BASE, "https://other.example.test/mcp")).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "must be resourceServerUrl")]
+    async fn more_than_one_trailing_slash_refuses_to_construct() {
+        let _ = per_resource_app_with(cfg_with(BASE, &format!("{BASE}//"))).await;
+    }
+
+    /// `ResourceAuthState::new` with a map built from another URL fails
+    /// closed: no token, not even an exact one, gets through.
+    #[tokio::test]
+    async fn a_mapper_outside_the_base_fails_closed() {
+        let (public, state) = apply_mcp_auth(cfg(), stores().await, resolver());
+        let other = "https://other.example.test/mcp";
+        let state = ResourceAuthState::new(state, sub_resource_mapper(other, woodhouse_accept()));
+        assert_eq!(state.base(), BASE);
+        let app = public.merge(
+            Router::new()
+                .route("/mcp", any(echo))
+                .route("/mcp/{*rest}", any(echo))
+                .route_layer(from_fn_with_state(state, auth_middleware_per_resource)),
+        );
+        let at_a = format!("/mcp/o/{ORG_A}");
+        for (path, aud) in [
+            ("/mcp", json!(other)),
+            (at_a.as_str(), json!(format!("{other}/o/{ORG_A}"))),
+            (at_a.as_str(), json!([other, format!("{other}/o/{ORG_A}")])),
+        ] {
+            let resp = call(&app, path, Some(&token(aud.clone()))).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{aud} at {path}");
         }
     }
 
