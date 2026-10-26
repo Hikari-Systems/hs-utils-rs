@@ -128,6 +128,14 @@ pub fn apply_mcp_auth(
 /// [`ResourceAuthState`] (built with [`sub_resource_mapper`]) for
 /// [`auth_middleware_per_resource`](super::resource::auth_middleware_per_resource).
 /// `accept` decides which sub-paths exist, for both.
+///
+/// # Panics
+///
+/// When `expected_audience` (less at most one trailing `/`) is not
+/// `resource_server_url` (less its trailing `/`s). The per-resource check
+/// treats `expected_audience` as the base of every resource the map
+/// returns, so the two must name the same URL or one token could reach two
+/// resources. This is a start-up configuration error.
 pub fn apply_mcp_auth_with(
     cfg: Arc<McpAuthConfig>,
     stores: McpAuthStores,
@@ -138,6 +146,17 @@ pub fn apply_mcp_auth_with(
         Arc::clone(&cfg),
         Arc::clone(&stores.asm),
         Arc::clone(&stores.clients),
+    );
+    let resource_base = cfg.resource_server_url.trim_end_matches('/');
+    let audience_base = cfg
+        .expected_audience
+        .strip_suffix('/')
+        .unwrap_or(&cfg.expected_audience);
+    assert!(
+        audience_base == resource_base,
+        "mcp auth: expectedAudience ({}) must be resourceServerUrl ({}) for per-resource auth",
+        cfg.expected_audience,
+        cfg.resource_server_url,
     );
     let resource_for = sub_resource_mapper(&cfg.resource_server_url, Arc::clone(&accept));
     let (router, auth_state) = apply_mcp_auth(cfg, stores, resolver);
