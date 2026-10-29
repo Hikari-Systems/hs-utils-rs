@@ -14,6 +14,12 @@
 //!   `LISTEN`, so no sticky sessions are needed. Reuses any [`sqlx::PgPool`]
 //!   (build one with [`crate::db::build_pool`]); the channel carries no rows,
 //!   so any reachable database works.
+//! - [`RedisEventBus`] (`pubsub-redis`) — redis `PUBLISH`/`SUBSCRIBE` on the
+//!   session store's redis (Sentinel or single node). The same shape as
+//!   [`PgEventBus`]: `publish` issues `PUBLISH`, a background task holds a
+//!   dedicated `SUBSCRIBE` connection and rebroadcasts locally, re-resolving
+//!   the master (Sentinel) and reconnecting with backoff when it drops.
+//!   Delivery is fire-and-forget, as with `NOTIFY`.
 //! - [`InMemoryEventBus`] — a single-process [`tokio::sync::broadcast`] with no
 //!   cross-replica fan-out. The dev / no-Postgres fallback.
 //!
@@ -179,6 +185,107 @@ where
     }
 }
 
+/// Redis `PUBLISH`/`SUBSCRIBE` bus. Built by `SessionSetup::event_bus` for a
+/// redis session store; the connection never leaves the crate.
+#[cfg(feature = "pubsub-redis")]
+pub struct RedisEventBus<E> {
+    conn: std::sync::Arc<crate::web_login_redis::RedisConn>,
+    tx: broadcast::Sender<E>,
+    channel: String,
+}
+
+#[cfg(feature = "pubsub-redis")]
+impl<E> RedisEventBus<E>
+where
+    E: Serialize + DeserializeOwned + Clone + Send + 'static,
+{
+    /// Build the bus and spawn its `SUBSCRIBE` task. Requires a Tokio runtime.
+    pub(crate) fn new(conn: std::sync::Arc<crate::web_login_redis::RedisConn>, channel: impl Into<String>, capacity: usize) -> Self {
+        let channel = channel.into();
+        let (tx, _) = broadcast::channel(capacity);
+        tokio::spawn(redis_subscribe_loop::<E>(conn.clone(), tx.clone(), channel.clone()));
+        Self { conn, tx, channel }
+    }
+}
+
+#[cfg(feature = "pubsub-redis")]
+impl<E> EventBus<E> for RedisEventBus<E>
+where
+    E: Serialize + DeserializeOwned + Clone + Send + 'static,
+{
+    fn publish(&self, event: E) {
+        let conn = self.conn.clone();
+        let channel = self.channel.clone();
+        tokio::spawn(async move {
+            let payload = match serde_json::to_string(&event) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("pubsub publish: serialise failed: {e:#}");
+                    return;
+                }
+            };
+            let res = async {
+                let mut c = conn.conn().await?;
+                redis::cmd("PUBLISH")
+                    .arg(&channel)
+                    .arg(&payload)
+                    .query_async::<i64>(&mut c)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+            .await;
+            if let Err(e) = res {
+                tracing::warn!("pubsub publish (redis PUBLISH) failed: {e:#}");
+            }
+        });
+    }
+    fn subscribe(&self) -> broadcast::Receiver<E> {
+        self.tx.subscribe()
+    }
+}
+
+/// Long-lived `SUBSCRIBE` task, as [`listen_loop`]: (re)connect, subscribe,
+/// rebroadcast each message (skipping any that don't deserialise to `E`), and
+/// reconnect with exponential backoff (1s→30s) when the connection drops.
+#[cfg(feature = "pubsub-redis")]
+async fn redis_subscribe_loop<E>(
+    conn: std::sync::Arc<crate::web_login_redis::RedisConn>,
+    tx: broadcast::Sender<E>,
+    channel: String,
+) where
+    E: DeserializeOwned + Clone + Send + 'static,
+{
+    use futures_util::StreamExt;
+    const BASE: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(30);
+    let mut backoff = BASE;
+    loop {
+        match conn.pubsub().await {
+            Ok(mut ps) => match ps.subscribe(&channel).await {
+                Ok(()) => {
+                    backoff = BASE;
+                    tracing::info!("pubsub SUBSCRIBEd to '{channel}'");
+                    let mut stream = ps.on_message();
+                    while let Some(msg) = stream.next().await {
+                        let Ok(payload) = msg.get_payload::<String>() else { continue };
+                        match serde_json::from_str::<E>(&payload) {
+                            Ok(event) => {
+                                let _ = tx.send(event);
+                            }
+                            Err(e) => tracing::debug!("pubsub: ignoring unparseable payload on '{channel}': {e}"),
+                        }
+                    }
+                    tracing::warn!("pubsub subscription to '{channel}' ended; reconnecting");
+                }
+                Err(e) => tracing::warn!("pubsub SUBSCRIBE failed on '{channel}': {e:#}"),
+            },
+            Err(e) => tracing::warn!("pubsub redis connect failed: {e:#}"),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX);
+    }
+}
+
 #[cfg(feature = "pubsub-axum")]
 pub use self::sse::sse_stream;
 
@@ -231,5 +338,29 @@ mod tests {
         let mut rx = bus.subscribe();
         bus.publish(42);
         assert_eq!(rx.recv().await.unwrap(), 42);
+    }
+}
+
+#[cfg(all(test, feature = "pubsub-redis"))]
+mod redis_tests {
+    use super::*;
+
+    /// Two buses on two connections (two replicas) when `HS_UTILS_TEST_REDIS_URL`
+    /// is set; skipped otherwise.
+    #[tokio::test]
+    async fn redis_bus_fans_out_across_replicas() {
+        let Ok(url) = std::env::var("HS_UTILS_TEST_REDIS_URL") else {
+            eprintln!("HS_UTILS_TEST_REDIS_URL not set; skipping");
+            return;
+        };
+        let conn = || crate::web_login_redis::RedisSessionStore::from_url(&url, Duration::from_secs(60)).unwrap().shared_conn();
+        let channel = format!("hs-utils-test-{}", std::process::id());
+        let (a, b) = (RedisEventBus::<String>::new(conn(), &channel, 8), RedisEventBus::<String>::new(conn(), &channel, 8));
+        let mut rx = b.subscribe();
+        // Let b's SUBSCRIBE land before publishing (fire-and-forget, like NOTIFY).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        a.publish("hello".into());
+        let got = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.expect("delivered").unwrap();
+        assert_eq!(got, "hello");
     }
 }

@@ -40,6 +40,8 @@ src/
   logging.rs       — init()
   middleware.rs    — timing(), ApiKey middleware, forwarded_for(), ForwardedInfo
   server.rs        — run() wrapping HttpServer
+  session_store.rs — build_session_store(): the session store, plus locks() / event_bus() on its database
+  lock.rs          — LockManager / LockGuard: named locks (Postgres advisory, or in-process)
 ```
 
 ---
@@ -57,6 +59,36 @@ There is no CHANGELOG in this repo, so "the plan" cannot live in one. It goes in
 ---
 
 ## Migrating consumers
+
+### v0.34.0 — the session pool is private; `SessionSetup::locks()` and `::event_bus()` instead
+
+**Breaking:** `SessionSetup::pg_pool` is gone. Nothing outside this crate gets the session store's pool or redis
+connection any more; it gets what is built on them, on the store's own backend:
+
+- `setup.locks() -> Option<lock::LockManager>` (feature `lock`): named locks for short critical sections.
+  `manager.acquire(name, wait).await -> Result<LockGuard, LockError>` (`Busy` after `wait`), then
+  `guard.release().await`; dropping a guard releases too.
+  - `lock-postgres`, Postgres store: session-level advisory locks (`pg_try_advisory_lock`, key
+    `hashtextextended('hs_utils.lock:' || name, 0)`) on a connection held for the guard's life. A dropped
+    guard closes its connection, so the server frees the lock; so does a dead replica's.
+  - `lock-redis`, redis store: `SET hs_utils:lock:<name> <token> NX PX <lease>`, released only while the key
+    still holds the guard's token. A **lease**: a dead holder frees it after `with_lease` (default 60 s), and a
+    holder stalled past it loses it while still running, so size the lease above the longest section.
+  - Memory store: in-process (`is_shared() == false`).
+  - Any store whose backend feature is off: `None`, never a local lock posing as shared.
+- `setup.event_bus::<E>(channel, capacity) -> Option<Arc<dyn pubsub::EventBus<E>>>` (feature `pubsub`):
+  a `PgEventBus` (`LISTEN/NOTIFY`) for Postgres, a `RedisEventBus` (`PUBLISH/SUBSCRIBE`, feature
+  `pubsub-redis`) for redis, an `InMemoryEventBus` for memory, else `None`. Call it once per channel (each call
+  spawns that channel's listener task).
+
+New features: `lock`, `lock-postgres` (implies `web-login-postgres`), `lock-redis` (implies `web-login-redis`),
+`pubsub-redis` (implies `pubsub` and `web-login-redis`). `pubsub` itself is unchanged.
+
+The compiler finds every consumer that read `pg_pool`. Of those listed above, only `botsafely-controller` did, and it
+never used it (it kept it on `Auth` for a planned bus); its bump deletes the field. A consumer that needs the bus calls
+`setup.event_bus(…)` where it used to pass the pool to `PgEventBus::new` — the same bus, on the same pool.
+`RedisSessionStore` now resolves a Sentinel master with `Sentinel::async_master_for` per operation (what
+`SentinelClient` did internally), so the lock and bus can share its connection; no behaviour change.
 
 ### v0.33.0 — a resource (and `aud`) per path for MCP servers with sub-resources (HIK-592)
 

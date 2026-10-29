@@ -31,6 +31,11 @@ pub mod web_login;
 #[cfg(feature = "web-login")]
 pub mod session_store;
 
+// Named cross-replica locks, handed out by `SessionSetup::locks` on the
+// session store's backend (its pool or connection stays private).
+#[cfg(feature = "lock")]
+pub mod lock;
+
 #[cfg(feature = "web-login-redis")]
 pub mod web_login_redis;
 

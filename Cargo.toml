@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 
 [features]
@@ -9,6 +9,18 @@ db = ["dep:sqlx"]
 # in-memory fallback). Needs a Postgres pool (db) and the Tokio runtime for the
 # background LISTEN task.
 pubsub = ["db", "tokio/rt", "tokio/sync", "tokio/time"]
+# A redis PUBLISH/SUBSCRIBE `RedisEventBus`, handed out by
+# `SessionSetup::event_bus` for a redis session store (Sentinel or single node,
+# the same connection as the sessions).
+pubsub-redis = ["pubsub", "web-login-redis", "dep:futures-util"]
+# Named locks (`lock::LockManager`) for short critical sections across replicas,
+# handed out by `SessionSetup::locks` on the session store's own backend. `lock`
+# alone is the in-process backend (memory sessions); pick the shared ones:
+lock = ["dep:tokio", "tokio/sync", "tokio/time"]
+# Session-level advisory locks on a Postgres session store's database.
+lock-postgres = ["lock", "web-login-postgres"]
+# `SET NX PX` leases on a redis session store's redis.
+lock-redis = ["lock", "web-login-redis", "dep:uuid", "tokio/rt"]
 # Adds the axum Server-Sent Events helper (`pubsub::sse_stream`).
 pubsub-axum = ["pubsub", "dep:axum", "dep:tokio-stream"]
 web = ["dep:actix-web", "dep:actix-service", "dep:actix-http", "dep:futures-util"]

@@ -24,12 +24,15 @@
 //! working; it is the "behaviour selected by an absent key" shape that this
 //! module exists to retire, so it tells you to set the key.
 //!
-//! # Why the pool comes back with the store
+//! # What else comes back with the store
 //!
-//! [`SessionSetup::pg_pool`] is handed back rather than hidden because the
-//! Postgres session pool is also the pool a `LISTEN/NOTIFY` event bus wants.
-//! Building the store and then building a second pool against the same database
-//! doubles the connection count for no reason.
+//! The Postgres session pool is also what a cross-replica lock or a
+//! `LISTEN/NOTIFY` event bus wants, and building a second pool against the same
+//! database doubles the connection count for no reason. The pool itself never
+//! leaves this crate: [`SessionSetup`] hands out what is built on it instead —
+//! [`SessionSetup::locks`] (`crate::lock`) and, with `pubsub`,
+//! [`SessionSetup::event_bus`] — each falling back to its single-process form
+//! for a memory store, and absent for redis rather than pretending to be shared.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,16 +74,68 @@ impl SessionStoreKind {
     }
 }
 
-/// What a controller gets back: the store, what it is, and the pool if one was
-/// built.
+/// What a controller gets back: the store, what it is, and (through
+/// [`locks`](Self::locks) / [`event_bus`](Self::event_bus)) the shared
+/// primitives built on the same database. The pool stays private.
 pub struct SessionSetup {
     pub store: Arc<dyn WebSessionStore>,
     pub kind: SessionStoreKind,
-    /// Present only for [`SessionStoreKind::Postgres`]. Reuse it for anything
-    /// else that needs this database — an event bus, a sweeper — instead of
-    /// opening a second pool.
+    /// Present only for [`SessionStoreKind::Postgres`].
     #[cfg(feature = "db")]
-    pub pg_pool: Option<sqlx::PgPool>,
+    #[cfg_attr(not(any(feature = "lock-postgres", feature = "pubsub")), allow(dead_code))]
+    pool: Option<sqlx::PgPool>,
+    /// Present only for [`SessionStoreKind::Redis`].
+    #[cfg(feature = "web-login-redis")]
+    #[cfg_attr(not(any(feature = "lock-redis", feature = "pubsub-redis")), allow(dead_code))]
+    redis: Option<Arc<crate::web_login_redis::RedisConn>>,
+}
+
+impl SessionSetup {
+    /// Named locks on the session store's own backend (`crate::lock`):
+    /// advisory locks for Postgres (`lock-postgres`), leases for redis
+    /// (`lock-redis`), in-process ones for a memory store. `None` when the
+    /// store's backend wasn't compiled in, never a local lock that would look
+    /// shared and not be. Cheap; call it once and keep the result.
+    #[cfg(feature = "lock")]
+    pub fn locks(&self) -> Option<crate::lock::LockManager> {
+        match self.kind {
+            #[cfg(feature = "lock-postgres")]
+            SessionStoreKind::Postgres => self.pool.clone().map(crate::lock::LockManager::postgres),
+            #[cfg(feature = "lock-redis")]
+            SessionStoreKind::Redis => self.redis.clone().map(crate::lock::LockManager::redis),
+            SessionStoreKind::Memory => Some(crate::lock::LockManager::local()),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// A typed event bus on the session store's own backend
+    /// (`crate::pubsub`): `LISTEN/NOTIFY` for Postgres, `PUBLISH/SUBSCRIBE`
+    /// for redis (`pubsub-redis`), both fanning out to every replica; an
+    /// in-memory one for a memory store; `None` when the store's backend wasn't
+    /// compiled in. Each call spawns that channel's listener task, so call it
+    /// once per channel and share the bus. Needs a Tokio runtime.
+    #[cfg(feature = "pubsub")]
+    pub fn event_bus<E>(&self, channel: &str, capacity: usize) -> Option<Arc<dyn crate::pubsub::EventBus<E>>>
+    where
+        E: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        use crate::pubsub::EventBus;
+        match self.kind {
+            SessionStoreKind::Postgres => self
+                .pool
+                .clone()
+                .map(|p| Arc::new(crate::pubsub::PgEventBus::<E>::new(p, channel, capacity)) as Arc<dyn EventBus<E>>),
+            #[cfg(feature = "pubsub-redis")]
+            SessionStoreKind::Redis => self
+                .redis
+                .clone()
+                .map(|c| Arc::new(crate::pubsub::RedisEventBus::<E>::new(c, channel, capacity)) as Arc<dyn EventBus<E>>),
+            SessionStoreKind::Memory => Some(Arc::new(crate::pubsub::InMemoryEventBus::<E>::new(capacity))),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
 }
 
 /// Shows the kind, not the store or the pool: the kind is the thing worth
@@ -187,7 +242,9 @@ fn memory(ttl: Duration) -> SessionSetup {
         store: Arc::new(InMemorySessionStore::new(ttl)),
         kind: SessionStoreKind::Memory,
         #[cfg(feature = "db")]
-        pg_pool: None,
+        pool: None,
+        #[cfg(feature = "web-login-redis")]
+        redis: None,
     }
 }
 
@@ -224,7 +281,9 @@ async fn postgres(cfg: &SessionConfig, _ttl: Duration) -> Result<SessionSetup> {
     Ok(SessionSetup {
         store: Arc::new(store),
         kind: SessionStoreKind::Postgres,
-        pg_pool: Some(pool),
+        pool: Some(pool),
+        #[cfg(feature = "web-login-redis")]
+        redis: None,
     })
 }
 
@@ -281,11 +340,13 @@ fn redis_store(cfg: &SessionConfig, ttl: Duration) -> Result<SessionSetup> {
         }
     };
 
+    let redis = Some(store.shared_conn());
     Ok(SessionSetup {
         store: Arc::new(store),
         kind: SessionStoreKind::Redis,
         #[cfg(feature = "db")]
-        pg_pool: None,
+        pool: None,
+        redis,
     })
 }
 
@@ -312,6 +373,49 @@ mod tests {
 
     /// The whole point of the named key: "memory" is a choice you can state,
     /// which is what makes its absence a misconfiguration rather than a default.
+    /// A memory store hands out single-process primitives and says so.
+    #[cfg(feature = "lock")]
+    #[tokio::test]
+    async fn a_memory_store_hands_out_local_locks() {
+        let c = SessionConfig { store: Some("memory".into()), ..cfg() };
+        let s = build_session_store(&c).await.unwrap();
+        let locks = s.locks().expect("memory sessions get local locks");
+        assert!(!locks.is_shared(), "a local lock must not claim to be shared");
+        let g = locks.acquire("x", std::time::Duration::from_millis(10)).await.unwrap();
+        g.release().await;
+    }
+
+    #[cfg(feature = "pubsub")]
+    #[tokio::test]
+    async fn a_memory_store_hands_out_an_in_memory_bus() {
+        let c = SessionConfig { store: Some("memory".into()), ..cfg() };
+        let bus = build_session_store(&c).await.unwrap().event_bus::<String>("ch", 8).expect("memory bus");
+        let mut rx = bus.subscribe();
+        bus.publish("hi".into());
+        assert_eq!(rx.recv().await.unwrap(), "hi");
+    }
+
+    /// A redis store hands out redis leases with `lock-redis`, and nothing at
+    /// all without it: never a local lock posing as shared.
+    #[cfg(all(feature = "lock", feature = "web-login-redis"))]
+    #[tokio::test]
+    async fn a_redis_store_hands_out_redis_locks_or_none() {
+        let c = SessionConfig {
+            store: Some("redis".into()),
+            redis: Some(SessionRedisConfig {
+                url: vec!["redis://session-redis:6379/0".into()],
+                ..Default::default()
+            }),
+            ..cfg()
+        };
+        let locks = build_session_store(&c).await.unwrap().locks();
+        if cfg!(feature = "lock-redis") {
+            assert!(locks.expect("lock-redis").is_shared());
+        } else {
+            assert!(locks.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn memory_can_be_selected_deliberately() {
         let c = SessionConfig { store: Some("memory".into()), ..cfg() };

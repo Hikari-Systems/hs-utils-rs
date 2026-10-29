@@ -56,7 +56,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use redis::sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServerType};
+use redis::sentinel::{Sentinel, SentinelNodeConnectionInfo};
 use redis::{AsyncCommands, RedisConnectionInfo, TlsMode};
 use tokio::sync::Mutex;
 
@@ -401,19 +401,60 @@ fn hex_nibble(b: u8) -> Option<u8> {
     (b as char).to_digit(16).map(|d| d as u8)
 }
 
-/// How this store reaches redis. Not public: callers choose by constructor,
-/// and every operation goes through [`RedisSessionStore::conn`], so the two
-/// modes cannot diverge in serialisation, key layout or failure handling.
+/// How this crate reaches redis: the session store, and the lock and event-bus
+/// backends built on the same redis (`crate::lock`, `crate::pubsub`), so the
+/// two modes cannot diverge between them. Not public: callers choose by
+/// [`RedisSessionStore`]'s constructors.
+pub(crate) struct RedisConn {
+    backend: Backend,
+}
+
 enum Backend {
     /// Resolve the current master through Sentinel on every operation.
-    Sentinel(Arc<Mutex<SentinelClient>>),
+    Sentinel {
+        sentinel: Mutex<Sentinel>,
+        master_name: String,
+        node: SentinelNodeConnectionInfo,
+    },
     /// A single node. `Client` holds parsed connection info, not a socket.
     Direct(redis::Client),
 }
 
+impl RedisConn {
+    /// A client for the current master. Sentinel re-resolves it each call so a
+    /// failover is picked up without restarting; the direct path is the one
+    /// node it was given.
+    async fn client(&self) -> Result<redis::Client> {
+        match &self.backend {
+            Backend::Sentinel { sentinel, master_name, node } => sentinel
+                .lock()
+                .await
+                .async_master_for(master_name, Some(node))
+                .await
+                .context("sentinel: resolve the master"),
+            Backend::Direct(client) => Ok(client.clone()),
+        }
+    }
+
+    /// A fresh connection to the master.
+    pub(crate) async fn conn(&self) -> Result<redis::aio::MultiplexedConnection> {
+        self.client()
+            .await?
+            .get_multiplexed_async_connection()
+            .await
+            .context("redis get_multiplexed_async_connection")
+    }
+
+    /// A dedicated pub/sub connection to the master.
+    #[cfg(feature = "pubsub-redis")]
+    pub(crate) async fn pubsub(&self) -> Result<redis::aio::PubSub> {
+        self.client().await?.get_async_pubsub().await.context("redis get_async_pubsub")
+    }
+}
+
 /// Redis [`WebSessionStore`], over a Sentinel cluster or a single node.
 pub struct RedisSessionStore {
-    backend: Backend,
+    conn: Arc<RedisConn>,
     ttl_secs: u64,
     prefix: String,
 }
@@ -448,7 +489,9 @@ impl RedisSessionStore {
         let client = redis::Client::open(url)
             .with_context(|| format!("open redis client for {}", redact_url_userinfo(url)))?;
         Ok(Self {
-            backend: Backend::Direct(client),
+            conn: Arc::new(RedisConn {
+                backend: Backend::Direct(client),
+            }),
             ttl_secs: ttl.as_secs().max(1),
             prefix: Self::DEFAULT_PREFIX.to_string(),
         })
@@ -480,16 +523,16 @@ impl RedisSessionStore {
             }),
         };
 
-        let sentinel = SentinelClient::build(
-            hosts,
-            cfg.master_name.clone(),
-            Some(node_info),
-            SentinelServerType::Master,
-        )
-        .context("build redis sentinel client")?;
+        let sentinel = Sentinel::build(hosts).context("build redis sentinel client")?;
 
         Ok(Self {
-            backend: Backend::Sentinel(Arc::new(Mutex::new(sentinel))),
+            conn: Arc::new(RedisConn {
+                backend: Backend::Sentinel {
+                    sentinel: Mutex::new(sentinel),
+                    master_name: cfg.master_name.clone(),
+                    node: node_info,
+                },
+            }),
             ttl_secs: ttl.as_secs().max(1),
             prefix: Self::DEFAULT_PREFIX.to_string(),
         })
@@ -499,23 +542,16 @@ impl RedisSessionStore {
         format!("{}{sid}", self.prefix)
     }
 
-    /// Borrow a fresh connection. Sentinel re-resolves the master each call so
-    /// a failover is picked up without restarting; the direct path opens to the
-    /// one node it was given. Every read and write goes through here, which is
-    /// what keeps the two modes indistinguishable above this line.
+    /// Borrow a fresh connection (see [`RedisConn::conn`]). Every read and
+    /// write goes through here, which is what keeps the two modes
+    /// indistinguishable above this line.
     async fn conn(&self) -> Result<redis::aio::MultiplexedConnection> {
-        match &self.backend {
-            Backend::Sentinel(sentinel) => {
-                let mut s = sentinel.lock().await;
-                s.get_async_connection()
-                    .await
-                    .context("sentinel get_async_connection")
-            }
-            Backend::Direct(client) => client
-                .get_multiplexed_async_connection()
-                .await
-                .context("redis get_multiplexed_async_connection"),
-        }
+        self.conn.conn().await
+    }
+
+    /// The connection, for the lock and event-bus backends on the same redis.
+    pub(crate) fn shared_conn(&self) -> Arc<RedisConn> {
+        self.conn.clone()
     }
 }
 
@@ -755,7 +791,7 @@ mod tests {
         assert!(RedisSessionStore::from_sentinel(cfg, TTL).is_err());
     }
 
-    /// The property the `Backend` enum exists to guarantee: the connection
+    /// The property `RedisConn` exists to guarantee: the connection
     /// source is the *only* difference. A session written by a Sentinel-backed
     /// replica must be readable by a URL-backed one, which requires the key to
     /// be byte-identical — so this is what makes "same store locally and in
