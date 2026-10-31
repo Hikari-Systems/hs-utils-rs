@@ -49,6 +49,49 @@ pub use crate::config::{DbConfig, DbSslConfig};
 /// unset by default (no idle reaping); set it so an over-grown pool can shed
 /// idle connections back toward `minpool`.
 pub async fn build_pool(cfg: &DbConfig) -> Result<PgPool> {
+    let (opts, port) = connect_options(cfg)?;
+
+    tracing::info!(
+        host = %cfg.host,
+        port = %port,
+        user = %cfg.username,
+        "Connecting to database"
+    );
+
+    let result = pool_options(cfg)
+        .connect_with(opts)
+        .await
+        .context("Failed to connect to database");
+
+    match &result {
+        Ok(_) => tracing::info!(host = %cfg.host, user = %cfg.username, "Database connected"),
+        Err(e) => tracing::error!(host = %cfg.host, user = %cfg.username, error = %e, "Database connection failed"),
+    }
+
+    result
+}
+
+/// How long a caller of a lazy pool waits for a connection. sqlx's 30 s default
+/// suits a pool known to have connected; here the database may simply be down,
+/// and a request should hear that promptly rather than hang.
+const LAZY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// As [`build_pool`], but opens nothing yet: the first query connects, and each
+/// later one tries again until the database answers. Only bad config is an error
+/// here; a database that is down or refuses the login surfaces on the queries.
+/// Needs a Tokio runtime.
+pub fn build_lazy_pool(cfg: &DbConfig) -> Result<PgPool> {
+    let (opts, port) = connect_options(cfg)?;
+    tracing::info!(
+        host = %cfg.host,
+        port = %port,
+        user = %cfg.username,
+        "Database pool ready; it connects on first use"
+    );
+    Ok(pool_options(cfg).acquire_timeout(LAZY_ACQUIRE_TIMEOUT).connect_lazy_with(opts))
+}
+
+fn connect_options(cfg: &DbConfig) -> Result<(PgConnectOptions, u16)> {
     let port: u16 = if cfg.port.is_empty() {
         5432
     } else {
@@ -84,29 +127,15 @@ pub async fn build_pool(cfg: &DbConfig) -> Result<PgPool> {
         opts = opts.ssl_root_cert(ca);
     }
 
-    tracing::info!(
-        host = %cfg.host,
-        port = %port,
-        user = %cfg.username,
-        "Connecting to database"
-    );
+    Ok((opts, port))
+}
 
+fn pool_options(cfg: &DbConfig) -> PgPoolOptions {
     let mut pool_opts = PgPoolOptions::new()
         .min_connections(cfg.minpool.unwrap_or(0))
         .max_connections(cfg.maxpool.unwrap_or(3));
     if let Some(secs) = cfg.idletimeoutsecs {
         pool_opts = pool_opts.idle_timeout(Duration::from_secs(u64::from(secs)));
     }
-
-    let result = pool_opts
-        .connect_with(opts)
-        .await
-        .context("Failed to connect to database");
-
-    match &result {
-        Ok(_) => tracing::info!(host = %cfg.host, user = %cfg.username, "Database connected"),
-        Err(e) => tracing::error!(host = %cfg.host, user = %cfg.username, error = %e, "Database connection failed"),
-    }
-
-    result
+    pool_opts
 }

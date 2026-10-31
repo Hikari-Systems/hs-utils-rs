@@ -60,6 +60,23 @@ There is no CHANGELOG in this repo, so "the plan" cannot live in one. It goes in
 
 ## Migrating consumers
 
+### v0.35.0 — `session.requiredAtBoot`: a session store that isn't essential at boot
+
+**Not breaking** for a consumer of `build_session_store`: unset means `true`, which is what it already did. New:
+`session.requiredAtBoot` (`session__requiredAtBoot`) and `db::build_lazy_pool`.
+
+- `true` or unset: a Postgres store that can't connect is a startup error. This is the standard failure.
+- `false`, for a service whose login isn't essential: it starts regardless, connects on demand, and creates its table
+  in the background, retrying endlessly (backing off to once a minute) until the table is usable; a pre-provisioned one
+  it can read counts. It never falls back to memory, so session requests fail until then. With no Postgres configured
+  it never connects or retries. A changed password still needs a restart: the pool holds what it was given.
+
+**The compiler will not tell you this:** a consumer with its own `build_web_session_store` (5drive-demo-controller,
+slackbot-controller, graph-d3-mcpui when this was written) ignores the key and still swallows the failure into `None`.
+Move it to `build_session_store`, and set `session.store` in its `hs-backend-spot` block. Moving makes a failed
+connection stop that service, so set `session__requiredAtBoot: "false"` there if its login isn't essential. Locks and
+event buses from a `false` store share the lazy pool, so they too fail until the database answers.
+
 ### v0.34.0 — the session pool is private; `SessionSetup::locks()` and `::event_bus()` instead
 
 **Breaking:** `SessionSetup::pg_pool` is gone. Nothing outside this crate gets the session store's pool or redis

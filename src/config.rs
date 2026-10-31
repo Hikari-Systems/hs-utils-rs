@@ -837,4 +837,11 @@ pub struct SessionConfig {
     /// Session lifetime in seconds. Defaults to 24h.
     #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
     pub ttl_secs: Option<u32>,
+    /// Whether the Postgres store must connect for the service to start at all.
+    /// Unset or `true`: a failed connection is a startup error, so the service
+    /// never reports healthy without its sessions. `false` is for a service
+    /// whose login isn't essential: it starts regardless and connects on demand,
+    /// never falling back to another store; session requests fail until then.
+    #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
+    pub required_at_boot: Option<bool>,
 }

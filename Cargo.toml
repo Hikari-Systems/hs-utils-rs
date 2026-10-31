@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.34.0"
+version = "0.35.0"
 edition = "2021"
 
 [features]
@@ -55,7 +55,7 @@ web-login-redis = ["web-login", "dep:redis"]
 # Postgres cross-replica session store for web-login. Persists sessions in a
 # `web_sessions` table over the service's existing PgPool, so browser login
 # survives multiple replicas behind a load balancer without a redis dependency.
-web-login-postgres = ["web-login", "db"]
+web-login-postgres = ["web-login", "db", "dep:tokio", "tokio/rt"]
 # mcp-data-service-backed rmcp SessionStore for cross-replica streamable-HTTP
 # sessions. Pulls rmcp to implement its SessionStore trait.
 mcp-session-store = ["mcp-resource-server", "dep:rmcp"]
@@ -186,7 +186,7 @@ tower-http = { version = "0.6", default-features = false, features = ["trace"], 
 http = { version = "1", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 # `ServiceExt::oneshot`, so the otel-axum tests can drive the REAL TraceLayer
 # instead of testing its helpers in isolation — a correct `redact_query` proves
 # nothing if `make_span` stops calling it. Already in the tree transitively via

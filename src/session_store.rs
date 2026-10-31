@@ -24,6 +24,18 @@
 //! working; it is the "behaviour selected by an absent key" shape that this
 //! module exists to retire, so it tells you to set the key.
 //!
+//! # A store that isn't essential at boot
+//!
+//! A Postgres store has to connect for the service to start, and that is the
+//! default because a service reporting healthy without its sessions is the
+//! failure this module exists to remove. `session.requiredAtBoot: false` is the
+//! opt-out for a service whose login isn't essential: it starts regardless, on a
+//! pool that connects on demand, and creates its table in the background once it
+//! can, trying for as long as it takes. It is still the Postgres store: session
+//! requests fail until then, and nothing falls back to memory. With no Postgres
+//! configured there is nothing to connect to, so it never connects or retries.
+//! A new password still needs a restart.
+//!
 //! # What else comes back with the store
 //!
 //! The Postgres session pool is also what a cross-replica lock or a
@@ -258,7 +270,12 @@ async fn postgres(cfg: &SessionConfig, _ttl: Duration) -> Result<SessionSetup> {
         .context("session.db is not set")?;
     anyhow::ensure!(!db.host.trim().is_empty(), "session.db.host is empty");
 
-    let pool = crate::db::build_pool(db).await.context("build session db pool")?;
+    let required = cfg.required_at_boot.unwrap_or(true);
+    let pool = if required {
+        crate::db::build_pool(db).await.context("build session db pool")?
+    } else {
+        crate::db::build_lazy_pool(db).context("build session db pool")?
+    };
 
     let table = cfg
         .table
@@ -271,11 +288,18 @@ async fn postgres(cfg: &SessionConfig, _ttl: Duration) -> Result<SessionSetup> {
         .with_table(table)
         .context("invalid session table name")?;
 
-    // Not fatal: a pre-provisioned table the service's role may not ALTER is a
-    // supported deployment, and failing startup over it would be worse than the
-    // first query failing loudly.
-    if let Err(e) = store.ensure_schema().await {
-        tracing::warn!("session table ensure_schema failed (pre-provisioned?): {e:#}");
+    if required {
+        // Not fatal: a pre-provisioned table the service's role may not ALTER is a
+        // supported deployment, and failing startup over it would be worse than the
+        // first query failing loudly.
+        if let Err(e) = store.ensure_schema().await {
+            tracing::warn!("session table ensure_schema failed (pre-provisioned?): {e:#}");
+        }
+    } else {
+        let bg = store.clone();
+        tokio::spawn(async move {
+            ensure_schema_eventually(|| table_ready(&bg), Duration::from_secs(5), Duration::from_secs(60)).await;
+        });
     }
 
     Ok(SessionSetup {
@@ -285,6 +309,43 @@ async fn postgres(cfg: &SessionConfig, _ttl: Duration) -> Result<SessionSetup> {
         #[cfg(feature = "web-login-redis")]
         redis: None,
     })
+}
+
+/// The table is there once this role can make it or, for a table pre-provisioned
+/// by someone else, read it. Being refused CREATE alone proves nothing: a role
+/// refused CONNECT gets the same SQLSTATE at login.
+#[cfg(feature = "web-login-postgres")]
+async fn table_ready(store: &crate::web_login_postgres::PgSessionStore) -> Result<()> {
+    match store.ensure_schema().await {
+        Ok(()) => Ok(()),
+        Err(e) if store.table_is_readable().await => {
+            tracing::warn!("session table ensure_schema failed, but the table is readable (pre-provisioned?): {e:#}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Runs `ensure` until it succeeds, however long that takes, doubling the wait
+/// from `first` up to `max`. Only a store configured to connect ever gets here.
+#[cfg(feature = "web-login-postgres")]
+async fn ensure_schema_eventually<F, Fut>(mut ensure: F, first: Duration, max: Duration)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut wait = first;
+    loop {
+        match ensure().await {
+            Ok(()) => {
+                tracing::info!("session store connected; its table is ready");
+                return;
+            }
+            Err(e) => tracing::error!("session store not ready, trying again in {wait:?}: {e:#}"),
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(max);
+    }
 }
 
 #[cfg(not(feature = "web-login-postgres"))]
@@ -362,6 +423,96 @@ mod tests {
 
     fn cfg() -> SessionConfig {
         SessionConfig::default()
+    }
+
+    /// Nothing listens on port 1, so a connection there fails at once.
+    #[cfg(feature = "web-login-postgres")]
+    fn unreachable_postgres(required_at_boot: Option<bool>) -> SessionConfig {
+        SessionConfig {
+            store: Some("postgres".into()),
+            db: Some(DbConfig {
+                host: "127.0.0.1".into(),
+                port: "1".into(),
+                database: "sessions".into(),
+                username: "svc".into(),
+                password: "hunter2".into(),
+                ..Default::default()
+            }),
+            required_at_boot,
+            ..cfg()
+        }
+    }
+
+    /// The standard: a store that can't connect stops the service starting,
+    /// whether the key is unset or says so. (Paused time: sqlx retries a refused
+    /// connection for its 30 s acquire timeout.)
+    #[cfg(feature = "web-login-postgres")]
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_cannot_connect_is_a_startup_error_by_default() {
+        for required in [None, Some(true)] {
+            let err = build_session_store(&unreachable_postgres(required)).await.unwrap_err();
+            assert!(format!("{err:#}").contains("could not be built"), "{err:#}");
+        }
+    }
+
+    /// The opt-out starts regardless and stays the Postgres store, not memory;
+    /// a session request then fails rather than quietly working on one replica.
+    #[cfg(feature = "web-login-postgres")]
+    #[tokio::test(start_paused = true)]
+    async fn not_required_at_boot_starts_on_postgres_and_never_downgrades() {
+        let s = build_session_store(&unreachable_postgres(Some(false))).await.unwrap();
+        assert_eq!(s.kind, SessionStoreKind::Postgres);
+        assert!(s.kind.is_shared());
+        assert!(s.store.load("sid").await.is_err(), "no database: an error, not an empty session");
+    }
+
+    /// Inference honours it too: a config without `session.store` isn't stricter.
+    #[cfg(feature = "web-login-postgres")]
+    #[tokio::test]
+    async fn not_required_at_boot_applies_to_an_inferred_store() {
+        let c = SessionConfig { store: None, ..unreachable_postgres(Some(false)) };
+        assert_eq!(build_session_store(&c).await.unwrap().kind, SessionStoreKind::Postgres);
+    }
+
+    /// No Postgres configured: the opt-out changes nothing and connects to nothing.
+    #[tokio::test]
+    async fn not_required_at_boot_with_no_postgres_config_never_connects() {
+        for db in [None, Some(DbConfig::default())] {
+            let c = SessionConfig { db, required_at_boot: Some(false), ..cfg() };
+            assert_eq!(build_session_store(&c).await.unwrap().kind, SessionStoreKind::Memory);
+        }
+    }
+
+    #[test]
+    fn required_at_boot_reads_as_config_and_from_an_env_string() {
+        for (json, want) in [
+            (r#"{}"#, None),
+            (r#"{"requiredAtBoot":false}"#, Some(false)),
+            (r#"{"requiredAtBoot":"false"}"#, Some(false)),
+            (r#"{"requiredAtBoot":true}"#, Some(true)),
+        ] {
+            let c: SessionConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(c.required_at_boot, want, "{json}");
+        }
+    }
+
+    /// It keeps trying through any failure, doubling up to the cap, and stops only once done.
+    #[cfg(feature = "web-login-postgres")]
+    #[tokio::test(start_paused = true)]
+    async fn the_table_is_retried_until_it_can_be_made() {
+        let tries = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        ensure_schema_eventually(
+            || async {
+                let n = tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < 200 { anyhow::bail!("connection refused") } else { Ok(()) }
+            },
+            Duration::from_secs(5),
+            Duration::from_secs(12),
+        )
+        .await;
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 201);
+        assert_eq!(started.elapsed(), Duration::from_secs(5 + 10 + 12 * 198));
     }
 
     #[tokio::test]

@@ -164,6 +164,11 @@ impl PgSessionStore {
         Ok(())
     }
 
+    /// Whether this role can read the table, however it came to exist.
+    pub(crate) async fn table_is_readable(&self) -> bool {
+        sqlx::query(&format!("SELECT 1 FROM {} LIMIT 0", self.table)).execute(&self.pool).await.is_ok()
+    }
+
     /// Delete expired rows, returning the number reclaimed. Reads already
     /// ignore expired sessions, so this is housekeeping — run it on a timer.
     pub async fn sweep_expired(&self) -> Result<u64> {
