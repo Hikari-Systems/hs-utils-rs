@@ -60,6 +60,12 @@ There is no CHANGELOG in this repo, so "the plan" cannot live in one. It goes in
 
 ## Migrating consumers
 
+### v0.36.0 — jsonwebtoken 10, rmcp 2
+
+**Breaking** for a consumer that names rmcp itself: move its own `rmcp` requirement to `2.1`. `model::Content` is now
+`ContentBlock` (`RawContent` and `.raw` are gone; use `as_text()`), `Annotated` and `RawResource` are gone (`Resource::new`),
+and `ProgressNotificationParam` is built with `new` / `with_total` / `with_message`.
+
 ### v0.35.0 — `session.requiredAtBoot`: a session store that isn't essential at boot
 
 **Not breaking** for a consumer of `build_session_store`: unset means `true`, which is what it already did. New:
