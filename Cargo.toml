@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.36.0"
+version = "0.36.1"
 edition = "2021"
 
 [features]
@@ -132,7 +132,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # matched-path and the build fails — it compiled during development purely
 # because `controller`/`async-graphql-axum` happened to turn it on.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query", "matched-path"], optional = true }
-jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"], optional = true }
+jsonwebtoken = { version = ">=10.3", default-features = false, features = ["aws_lc_rs"], optional = true }
 moka = { version = "0.12", default-features = false, features = ["future"], optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time"], optional = true }
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"], optional = true }
