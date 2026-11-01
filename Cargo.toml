@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.35.0"
+version = "0.36.0"
 edition = "2021"
 
 [features]
@@ -132,13 +132,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # matched-path and the build fails — it compiled during development purely
 # because `controller`/`async-graphql-axum` happened to turn it on.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query", "matched-path"], optional = true }
-jsonwebtoken = { version = "9", default-features = false, optional = true }
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"], optional = true }
 moka = { version = "0.12", default-features = false, features = ["future"], optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time"], optional = true }
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"], optional = true }
 async-trait = { version = "0.1", optional = true }
 uuid = { version = "1", default-features = false, features = ["v4"], optional = true }
-rmcp = { version = "1.6", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
+rmcp = { version = "2.1", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
 # `tokio-rustls-comp` is load-bearing, not tidiness: without a TLS feature the
 # redis crate compiles `rediss://` URLs and `TlsMode` out entirely — a URL is
 # rejected at parse time and `RedisSentinelConfig.tls` is silently inert. rustls
