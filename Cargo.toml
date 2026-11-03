@@ -1,7 +1,8 @@
 [package]
 name = "hs-utils"
-version = "0.36.1"
+version = "0.36.2"
 edition = "2021"
+license = "Apache-2.0"
 
 [features]
 db = ["dep:sqlx"]
@@ -99,12 +100,11 @@ otel-axum = ["otel", "dep:axum", "dep:tower-http"]
 # shaped by a module its name does not mention.
 #
 # The cost was real: a service wanting Kratos avatar ingest had to compile an
-# entire Hydra login/consent provider it does not use. botsafely-controller is
-# exactly that case — no `hydra` block, login through `web_login` — so the
-# capability was simply unreachable for it.
+# entire Hydra login/consent provider it does not use (e.g. a service with no
+# `hydra` block that logs in through `web_login`).
 avatar-hook = ["dep:axum", "dep:reqwest", "reqwest/multipart"]
 # Ory Hydra login/consent/logout provider bridge (axum). A reusable port of the
-# hs-login-controller bridge: resolves the Kratos identity and accepts/rejects
+# login-controller bridge: resolves the Kratos identity and accepts/rejects
 # Hydra login/consent/logout challenges via Hydra's admin API. Mount its router
 # on a public path (`/api/oauth/*`).
 #

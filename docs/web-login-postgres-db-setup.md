@@ -16,7 +16,7 @@ verbatim.
 
 1. Choose a **table name** for this service. It must be unique within any database
    shared with other services. Convention: `<service>_web_session`
-   (e.g. `lloquent_web_session`). It must be a valid Postgres identifier —
+   (e.g. `myapp_web_session`). It must be a valid Postgres identifier —
    `^[A-Za-z_][A-Za-z0-9_]*$`, ≤63 chars — or `PgSessionStore::with_table`
    returns an error at boot.
 2. Choose a **runtime role** name (e.g. `<service>_app`) and decide the
