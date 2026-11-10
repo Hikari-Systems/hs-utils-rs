@@ -358,19 +358,22 @@ pub fn init(level: &str, cfg: &OtelConfig) -> Result<OtelGuard> {
         (None, None)
     };
 
-    // The metrics layer sees this crate's request/client spans at INFO
+    // The metrics layer sees this crate's request/client spans at any level
     // whatever the log level says; nothing else.
-    let metrics_filter = tracing_subscriber::filter::Targets::new()
-        .with_target("hs_utils", tracing::Level::INFO);
+    let metrics_filter: fn(&tracing::Metadata<'_>) -> bool = metrics_filter;
 
     tracing_subscriber::registry()
         .with(fmt_layer())
+        // Before the export layer: on entering a quiet span it makes an
+        // unsampled context current, which the export layer then parents
+        // that span's children on.
+        .with(quiet_layer())
         .with(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
                 .with_filter(export_filter(level, cfg)),
         )
-        .with(span_metrics.map(|m| m.with_filter(metrics_filter)))
+        .with(span_metrics.map(|m| m.with_filter(tracing_subscriber::filter::filter_fn(metrics_filter))))
         .init();
 
     let instruments = meter.as_ref().map(|m| metrics::install(m, cfg.process_metrics));
@@ -423,13 +426,34 @@ pub fn inject_span_context(span: &tracing::Span, headers: &mut http::HeaderMap) 
     });
 }
 
+/// What an outbound call made inside `span` sends as `traceparent`: the
+/// span's own context, or — when the export layer does not see the span (a
+/// `DEBUG` client span under `otel.level=info`) — the context it would have
+/// had as a parent, so the far end still continues the caller's trace rather
+/// than starting a root.
+#[cfg(feature = "http-client")]
+pub(crate) fn inject_outbound_context(span: &tracing::Span, headers: &mut http::HeaderMap) {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    let own = span.context();
+    let cx = if own.span().span_context().is_valid() { own } else { opentelemetry::Context::current() };
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&cx, &mut HeaderInjector(headers));
+    });
+}
+
 /// Send a reqwest 0.12 request in a client span with `traceparent`; see
 /// [`crate::http_client::send`].
 #[cfg(feature = "http-client")]
-pub use crate::http_client::{send, send_opaque};
+pub use crate::http_client::{send, send_at, send_opaque, send_opaque_at, send_with, TraceOptions};
 
 /// Client spans for other calls (SMTP, a queue); see [`crate::telemetry`].
 pub use crate::telemetry::{client_span, record_error, record_outcome, set_path_redactor};
+
+/// One span per GraphQL operation (async-graphql), for a controller's schema;
+/// the same type as `controller::graphql::OtelExtension`.
+#[cfg(feature = "otel-graphql")]
+pub use crate::graphql_otel::OtelExtension;
 
 /// Extract a remote trace context from inbound request headers.
 pub fn extract_context(headers: &http::HeaderMap) -> opentelemetry::Context {
@@ -464,6 +488,102 @@ impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
 pub(crate) mod metrics;
 mod procfs;
 
+// ── quiet requests ──────────────────────────────────────────────────────────
+
+/// Marks a span the export layer does not see whose children must not be
+/// exported either; see [`QuietLayer`].
+struct Quiet;
+
+/// If the export layer does not see `span` (a `DEBUG` server span under
+/// `otel.level=info`), mark it so [`QuietLayer`] suppresses everything beneath
+/// it. A span the export does see is left alone: its children are its own.
+#[cfg(any(feature = "otel-axum", feature = "otel-actix"))]
+pub(crate) fn quiet_unless_exported(span: &tracing::Span) {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    use tracing_subscriber::registry::LookupSpan as _;
+    if span.context().span().span_context().is_valid() {
+        return;
+    }
+    let Some(id) = span.id() else { return };
+    tracing::dispatcher::get_default(|dispatch| {
+        if let Some(span) = dispatch.downcast_ref::<tracing_subscriber::Registry>().and_then(|r| r.span(&id)) {
+            span.extensions_mut().insert(Quiet);
+        }
+    });
+}
+
+thread_local! {
+    static QUIET_GUARDS: std::cell::RefCell<Vec<(tracing::span::Id, opentelemetry::ContextGuard)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// While a [`Quiet`] span is entered, an UNSAMPLED OpenTelemetry context is
+/// current. A span the export layer filtered out leaves its children with no
+/// parent it can see, so they would start new root traces; under this context
+/// the parent-based sampler drops them instead, and the `traceparent` they
+/// send on says "not sampled", so the service called drops its side too.
+///
+/// The same mechanism `tracing-opentelemetry` uses for the spans it does see
+/// (a per-thread guard stack, pushed on enter and popped on exit).
+pub(crate) struct QuietLayer;
+
+type MetaFilter = tracing_subscriber::filter::FilterFn<fn(&tracing::Metadata<'_>) -> bool>;
+
+/// [`QuietLayer`], seeing only the server spans it may have to act on.
+pub(crate) fn quiet_layer<S>() -> tracing_subscriber::filter::Filtered<QuietLayer, MetaFilter, S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    let only_server_spans: fn(&tracing::Metadata<'_>) -> bool = |meta| {
+        meta.is_span() && meta.name() == crate::telemetry::SERVER_SPAN && meta.target().starts_with("hs_utils")
+    };
+    QuietLayer.with_filter(tracing_subscriber::filter::filter_fn(only_server_spans))
+}
+
+fn unsampled_context() -> opentelemetry::Context {
+    use opentelemetry::trace::{SpanContext, TraceContextExt as _, TraceFlags, TraceState};
+    use opentelemetry_sdk::trace::IdGenerator as _;
+    // Real ids: a parent with an invalid (all-zero) context is no parent at
+    // all, and the sampler would start a sampled root.
+    let ids = RandomIdGenerator::default();
+    let cx = SpanContext::new(ids.new_trace_id(), ids.new_span_id(), TraceFlags::default(), true, TraceState::default());
+    opentelemetry::Context::new().with_remote_span_context(cx)
+}
+
+impl<S> tracing_subscriber::Layer<S> for QuietLayer
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let quiet = ctx.span(id).is_some_and(|s| s.extensions().get::<Quiet>().is_some());
+        if quiet {
+            let guard = unsampled_context().attach();
+            QUIET_GUARDS.with(|g| g.borrow_mut().push((id.clone(), guard)));
+        }
+    }
+
+    fn on_exit(&self, id: &tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        // Taken out of the stack before it is dropped: dropping a guard
+        // touches the OpenTelemetry context stack, not this one.
+        let guard = QUIET_GUARDS.with(|g| {
+            let mut g = g.borrow_mut();
+            g.iter().rposition(|(i, _)| i == id).map(|pos| g.remove(pos))
+        });
+        drop(guard);
+    }
+}
+
+/// What the span-metrics layer sees: this crate's request and client spans,
+/// at ANY level — a `DEBUG` healthcheck or polling call is still a request to
+/// count — and nothing else (it ignores everything else anyway).
+pub(crate) fn metrics_filter(meta: &tracing::Metadata<'_>) -> bool {
+    use crate::telemetry::{CLIENT_SPAN, HTTP_CLIENT_SPAN, SERVER_SPAN};
+    meta.is_span()
+        && meta.target().starts_with("hs_utils")
+        && matches!(meta.name(), SERVER_SPAN | HTTP_CLIENT_SPAN | CLIENT_SPAN)
+}
+
 // ── framework layers ────────────────────────────────────────────────────────
 
 #[cfg(any(feature = "otel-axum", feature = "otel-actix"))]
@@ -480,3 +600,73 @@ pub use axum_layer::axum_trace_layer;
 mod actix_layer;
 #[cfg(feature = "otel-actix")]
 pub use actix_layer::{actix_trace, ActixTrace, ActixTraceMiddleware};
+
+/// A subscriber shaped like the one [`init`] installs — quiet layer, export
+/// layer behind an `EnvFilter`, span metrics behind [`metrics_filter`] — but
+/// exporting to memory, for the framework layers' tests.
+#[cfg(all(test, any(feature = "otel-axum", feature = "otel-actix")))]
+pub(crate) mod test_export {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider, SpanData};
+    use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Layer as _};
+
+    pub(crate) struct Export {
+        pub spans: InMemorySpanExporter,
+        pub meter: SdkMeterProvider,
+        pub metrics: InMemoryMetricExporter,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl Export {
+        pub(crate) fn finished(&self) -> Vec<SpanData> {
+            self.spans.get_finished_spans().unwrap()
+        }
+        pub(crate) fn points(&self) -> Vec<super::metrics::tests::Point> {
+            super::metrics::tests::points(&self.meter, &self.metrics)
+        }
+    }
+
+    /// Install it for this thread, exporting at `level` (an `otel.level`).
+    pub(crate) fn install(level: &str) -> Export {
+        opentelemetry::global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
+        let spans = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
+            .build();
+        let (meter, metrics) = super::metrics::tests::provider();
+        let filter: fn(&tracing::Metadata<'_>) -> bool = super::metrics_filter;
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(super::quiet_layer())
+                .with(
+                    tracing_opentelemetry::layer()
+                        .with_tracer(provider.tracer("test"))
+                        .with_filter(EnvFilter::new(level)),
+                )
+                .with(
+                    super::metrics::SpanMetrics::new(&meter)
+                        .with_filter(tracing_subscriber::filter::filter_fn(filter)),
+                ),
+        );
+        Export { spans, meter, metrics, _guard }
+    }
+
+    /// A one-shot HTTP server answering 204, handing back the request head
+    /// it was sent (lower-cased), for checking the `traceparent` sent on.
+    #[cfg(feature = "http-client")]
+    pub(crate) async fn next_hop() -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/next", l.local_addr().unwrap());
+        let seen = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = s.read(&mut buf).await.unwrap();
+            s.write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n").await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_lowercase()
+        });
+        (url, seen)
+    }
+}

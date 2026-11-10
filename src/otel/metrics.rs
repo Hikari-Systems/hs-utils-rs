@@ -402,16 +402,16 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
     use tracing_subscriber::layer::SubscriberExt;
 
     /// One exported data point, flattened: (metric, value-or-count, attributes).
-    type Point = (String, f64, Vec<(String, String)>);
+    pub(crate) type Point = (String, f64, Vec<(String, String)>);
 
-    fn provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
+    pub(crate) fn provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
         let exporter = InMemoryMetricExporter::default();
         let provider = SdkMeterProvider::builder()
             .with_reader(PeriodicReader::builder(exporter.clone()).build())
@@ -419,7 +419,7 @@ mod tests {
         (provider, exporter)
     }
 
-    fn points(provider: &SdkMeterProvider, exporter: &InMemoryMetricExporter) -> Vec<Point> {
+    pub(crate) fn points(provider: &SdkMeterProvider, exporter: &InMemoryMetricExporter) -> Vec<Point> {
         provider.force_flush().unwrap();
         let mut out = Vec::new();
         let attrs = |a: &mut dyn Iterator<Item = &KeyValue>| {
@@ -463,7 +463,7 @@ mod tests {
         out
     }
 
-    fn has(p: &[Point], name: &str, attr: (&str, &str)) -> Option<f64> {
+    pub(crate) fn has(p: &[Point], name: &str, attr: (&str, &str)) -> Option<f64> {
         p.iter()
             .rev()
             .find(|(n, _, a)| n == name && a.iter().any(|(k, v)| k == attr.0 && v == attr.1))
@@ -503,6 +503,41 @@ mod tests {
         assert_eq!(has(&p, "http.server.active_requests", ("http.request.method", "GET")), Some(0.0), "in-flight must return to zero");
         assert_eq!(has(&p, "http.server.active_requests", ("http.request.method", "POST")), Some(0.0), "a dropped request leaves the count");
         assert_eq!(has(&p, "hs.client.operation.duration", ("client.outcome", "busy")), Some(1.0));
+    }
+
+    /// The filter `init` gives this layer lets a `DEBUG` request or client
+    /// span through — a healthcheck or a polling call is still counted — and
+    /// keeps everything else out.
+    #[test]
+    fn debug_request_and_client_spans_are_still_counted() {
+        use tracing_subscriber::Layer as _;
+        let (provider, exporter) = provider();
+        let filter: fn(&tracing::Metadata<'_>) -> bool = crate::otel::metrics_filter;
+        let _g = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(SpanMetrics::new(&provider).with_filter(tracing_subscriber::filter::filter_fn(filter))),
+        );
+
+        let req = tracing::debug_span!(
+            "http.server",
+            http.request.method = "GET",
+            http.route = tracing::field::Empty,
+            http.response.status_code = tracing::field::Empty,
+        );
+        req.record("http.route", "/healthcheck");
+        req.record("http.response.status_code", 200u16);
+        drop(req);
+        drop(tracing::debug_span!(
+            "http.client",
+            http.request.method = "GET",
+            server.address = "poller",
+            http.response.status_code = 200u16,
+        ));
+        drop(tracing::debug_span!("not.ours.to.count", http.request.method = "GET"));
+
+        let p = points(&provider, &exporter);
+        assert_eq!(has(&p, "http.server.request.duration", ("http.route", "/healthcheck")), Some(1.0), "{p:?}");
+        assert_eq!(has(&p, "http.client.request.duration", ("server.address", "poller")), Some(1.0), "{p:?}");
     }
 
     /// Another crate's span named like ours is not ours.

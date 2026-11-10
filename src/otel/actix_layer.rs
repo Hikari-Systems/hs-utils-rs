@@ -320,4 +320,105 @@ mod tests {
         }
     }
 
+    /// What a healthcheck does that is worth suppressing: a child span of its
+    /// own and, with `http-client`, a backend call.
+    async fn healthcheck(next: web::Data<String>) -> HttpResponse {
+        let child = tracing::info_span!("healthcheck.child");
+        let _ = &next;
+        async {
+            tracing::info!("checking");
+            #[cfg(feature = "http-client")]
+            {
+                use crate::http_client::SendTraced as _;
+                let _ = reqwest::Client::new().get(next.as_str()).send_traced().await;
+            }
+        }
+        .instrument(child)
+        .await;
+        HttpResponse::Ok().finish()
+    }
+
+    /// The Docker healthcheck polls `/healthcheck` every few seconds. At
+    /// `otel.level=info` nothing of it is exported — not its server span, not
+    /// a child span, not its backend call's client span — and the
+    /// `traceparent` it sends on says "not sampled", so the next service
+    /// drops its side too. The request is still a request to the metrics.
+    #[actix_web::test]
+    async fn a_healthcheck_exports_nothing_at_info_but_is_still_counted() {
+        let ex = crate::otel::test_export::install("info");
+        #[cfg(feature = "http-client")]
+        let (next, seen) = crate::otel::test_export::next_hop().await;
+        #[cfg(not(feature = "http-client"))]
+        let next = String::new();
+
+        let app = test::init_service(
+            App::new()
+                .wrap(actix_trace())
+                .app_data(web::Data::new(next))
+                .route("/healthcheck", web::get().to(healthcheck))
+                .route("/api/items/{id}", web::get().to(HttpResponse::Ok)),
+        )
+        .await;
+        let _ = test::call_service(&app, test::TestRequest::get().uri("/healthcheck").to_request()).await;
+        let _ = test::call_service(&app, test::TestRequest::get().uri("/api/items/1").to_request()).await;
+
+        let names: Vec<String> = ex.finished().iter().map(|s| s.name.to_string()).collect();
+        assert_eq!(names, ["GET /api/items/{id}"], "only the ordinary request is exported");
+        #[cfg(feature = "http-client")]
+        {
+            let req = seen.await.unwrap();
+            let tp = req.lines().find(|l| l.starts_with("traceparent:")).expect("traceparent still sent");
+            assert!(tp.trim_end().ends_with("-00"), "the next hop must be told not to sample: {tp}");
+        }
+        let p = ex.points();
+        assert_eq!(
+            crate::otel::metrics::tests::has(&p, "http.server.request.duration", ("http.route", "/healthcheck")),
+            Some(1.0),
+            "{p:?}"
+        );
+    }
+
+    /// With `otel.level=debug` the healthcheck is an ordinary trace: its span,
+    /// its child beneath it.
+    #[actix_web::test]
+    async fn a_healthcheck_is_exported_at_debug() {
+        let ex = crate::otel::test_export::install("debug");
+        #[cfg(feature = "http-client")]
+        let (next, _seen) = crate::otel::test_export::next_hop().await;
+        #[cfg(not(feature = "http-client"))]
+        let next = String::new();
+        let app = test::init_service(
+            App::new()
+                .wrap(actix_trace())
+                .app_data(web::Data::new(next))
+                .route("/healthcheck", web::to(healthcheck)),
+        )
+        .await;
+        let _ = test::call_service(&app, test::TestRequest::post().uri("/healthcheck").to_request()).await;
+
+        let spans = ex.finished();
+        let server = spans.iter().find(|s| s.name == "POST /healthcheck").expect("healthcheck span exported");
+        let child = spans.iter().find(|s| s.name == "healthcheck.child").expect("child exported");
+        assert_eq!(child.parent_span_id, server.span_context.span_id());
+        assert_eq!(child.span_context.trace_id(), server.span_context.trace_id());
+    }
+
+    /// Only the exact path: `/healthcheck/deep` and `/healthchecks` are
+    /// ordinary routes.
+    #[actix_web::test]
+    async fn only_the_exact_healthcheck_path_is_quiet() {
+        let ex = crate::otel::test_export::install("info");
+        let app = test::init_service(
+            App::new()
+                .wrap(actix_trace())
+                .route("/healthcheck/deep", web::get().to(HttpResponse::Ok))
+                .route("/healthchecks", web::get().to(HttpResponse::Ok)),
+        )
+        .await;
+        let _ = test::call_service(&app, test::TestRequest::get().uri("/healthcheck/deep").to_request()).await;
+        let _ = test::call_service(&app, test::TestRequest::get().uri("/healthchecks").to_request()).await;
+        let mut names: Vec<String> = ex.finished().iter().map(|s| s.name.to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["GET /healthcheck/deep", "GET /healthchecks"]);
+    }
 }

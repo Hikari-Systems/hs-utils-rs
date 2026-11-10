@@ -52,6 +52,12 @@ pub mod web_login_postgres;
 #[cfg(feature = "controller")]
 pub mod controller;
 
+// `OtelExtension`: re-exported as `otel::OtelExtension` (otel-graphql) and
+// `controller::graphql::OtelExtension` (controller). Neither feature implies
+// the other, so it lives in neither module.
+#[cfg(any(feature = "controller", feature = "otel-graphql"))]
+mod graphql_otel;
+
 #[cfg(feature = "consent-bridge")]
 pub mod hydra_bridge;
 

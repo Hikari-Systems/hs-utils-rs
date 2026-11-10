@@ -484,6 +484,8 @@ fn redis_store(_cfg: &SessionConfig, _ttl: Duration) -> Result<SessionSetup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the redis tests name it.
+    #[cfg_attr(not(feature = "web-login-redis"), allow(unused_imports))]
     use crate::config::{SessionRedisConfig, DbConfig};
 
     fn cfg() -> SessionConfig {
@@ -725,7 +727,10 @@ mod tests {
 
 #[cfg(test)]
 mod sentinel_config_tests {
+    // Every test here but the env-override one is redis-only.
+    #[cfg_attr(not(feature = "web-login-redis"), allow(unused_imports))]
     use super::*;
+    #[cfg_attr(not(feature = "web-login-redis"), allow(unused_imports))]
     use crate::config::SessionRedisConfig;
 
     /// Sentinel must be reachable from the environment, not just from

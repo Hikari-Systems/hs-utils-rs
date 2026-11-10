@@ -27,7 +27,7 @@ use super::stores::{
     AsmCache, ClientRegistration, ClientStore, DcrRateLimitStore, JsonWebKeySet,
     JwksCacheEntry, JwksCacheStore,
 };
-use crate::http_client::SendTraced as _;
+use crate::http_client::{SendTraced as _, TraceOptions};
 
 pub const DEFAULT_MCP_DATA_SERVICE_URL: &str = "http://mcp-data-service:3000";
 
@@ -44,6 +44,22 @@ pub trait HttpTransport: Send + Sync {
         api_key: &str,
         body: Option<Value>,
     ) -> Option<(u16, Vec<u8>)>;
+
+    /// As [`request`](Self::request), for a URL whose path carries a
+    /// credential (an MCP session id): `route` (`/api/mcpSession/{id}`) is
+    /// what may be traced or logged in its place. The default ignores it and
+    /// calls `request`; [`ReqwestTransport`] records and logs only `route`.
+    async fn request_as(
+        &self,
+        method: &str,
+        url: &str,
+        route: &str,
+        api_key: &str,
+        body: Option<Value>,
+    ) -> Option<(u16, Vec<u8>)> {
+        let _ = route;
+        self.request(method, url, api_key, body).await
+    }
 }
 
 /// Production reqwest transport.
@@ -59,6 +75,46 @@ impl Default for ReqwestTransport {
     }
 }
 
+impl ReqwestTransport {
+    /// `route`: when set, the path the span and the log line show in place of
+    /// the URL's own.
+    async fn send(
+        &self,
+        method: &str,
+        url: &str,
+        route: Option<&str>,
+        api_key: &str,
+        body: Option<Value>,
+    ) -> Option<(u16, Vec<u8>)> {
+        let m = reqwest::Method::from_bytes(method.as_bytes()).ok()?;
+        let mut req = self.client.request(m, url).header("X-Api-Key", api_key);
+        if let Some(b) = body {
+            req = req.header("Content-Type", "application/json").json(&b);
+        }
+        let opts = match route {
+            Some(r) => TraceOptions::new().path(r),
+            None => TraceOptions::new(),
+        };
+        match req.send_traced_with(opts).await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let bytes = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+                Some((status, bytes))
+            }
+            Err(err) => {
+                // `without_url`: a reqwest error's text carries the full URL,
+                // which is what `route` is standing in for.
+                let err = err.without_url();
+                match route {
+                    Some(r) => tracing::error!("mcp-data-service request {method} {r} failed: {err}"),
+                    None => tracing::error!("mcp-data-service request to {url} failed: {err}"),
+                }
+                None
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn request(
@@ -68,22 +124,18 @@ impl HttpTransport for ReqwestTransport {
         api_key: &str,
         body: Option<Value>,
     ) -> Option<(u16, Vec<u8>)> {
-        let m = reqwest::Method::from_bytes(method.as_bytes()).ok()?;
-        let mut req = self.client.request(m, url).header("X-Api-Key", api_key);
-        if let Some(b) = body {
-            req = req.header("Content-Type", "application/json").json(&b);
-        }
-        match req.send_traced().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let bytes = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
-                Some((status, bytes))
-            }
-            Err(err) => {
-                tracing::error!("mcp-data-service request to {url} failed: {err}");
-                None
-            }
-        }
+        self.send(method, url, None, api_key, body).await
+    }
+
+    async fn request_as(
+        &self,
+        method: &str,
+        url: &str,
+        route: &str,
+        api_key: &str,
+        body: Option<Value>,
+    ) -> Option<(u16, Vec<u8>)> {
+        self.send(method, url, Some(route), api_key, body).await
     }
 }
 
@@ -150,20 +202,52 @@ impl McpDataServiceClient {
         path_and_query: &str,
         body: Option<Value>,
     ) -> Option<(u16, Vec<u8>)> {
+        self.req_inner(method, path_and_query, None, body).await
+    }
+
+    /// As [`req`](Self::req) for a path that carries a credential: `route`
+    /// (`/api/mcpSession/{id}`) is all the span and the logs see, and an error
+    /// response's body is not logged (the far end may echo the path).
+    #[cfg(feature = "mcp-session-store")]
+    pub(crate) async fn req_as(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        route: &str,
+        body: Option<Value>,
+    ) -> Option<(u16, Vec<u8>)> {
+        self.req_inner(method, path_and_query, Some(route), body).await
+    }
+
+    async fn req_inner(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        route: Option<&str>,
+        body: Option<Value>,
+    ) -> Option<(u16, Vec<u8>)> {
         let url = self.url(path_and_query);
-        let res = self
-            .transport
-            .request(method, &url, &self.api_key, body)
-            .await;
+        let res = match route {
+            Some(r) => self.transport.request_as(method, &url, r, &self.api_key, body).await,
+            None => self.transport.request(method, &url, &self.api_key, body).await,
+        };
         if let Some((status, bytes)) = &res {
             if *status != 204 && *status != 404 && !(200..300).contains(status) {
-                let snippet: String = String::from_utf8_lossy(bytes)
-                    .chars()
-                    .take(500)
-                    .collect();
-                tracing::error!(
-                    "mcp-data-service HTTP {status} for {url}: {snippet}"
-                );
+                match route {
+                    Some(r) => tracing::error!(
+                        "mcp-data-service HTTP {status} for {method} {r} ({}-byte body not logged)",
+                        bytes.len()
+                    ),
+                    None => {
+                        let snippet: String = String::from_utf8_lossy(bytes)
+                            .chars()
+                            .take(500)
+                            .collect();
+                        tracing::error!(
+                            "mcp-data-service HTTP {status} for {url}: {snippet}"
+                        );
+                    }
+                }
             }
         }
         res

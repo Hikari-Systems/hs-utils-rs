@@ -27,6 +27,11 @@ use rmcp::transport::streamable_http_server::session::store::{
 use super::config::McpAuthConfig;
 use super::db_stores::{enc, McpDataServiceClient};
 
+/// What the span and the logs show for every call: the session id is the
+/// session's bearer credential, so it never leaves this process except in the
+/// request itself.
+const ROUTE: &str = "/api/mcpSession/{id}";
+
 /// Default session TTL refreshed on every `store` (24h).
 const DEFAULT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -69,7 +74,7 @@ impl DbSessionStore {
 impl SessionStore for DbSessionStore {
     async fn load(&self, session_id: &str) -> Result<Option<SessionState>, SessionStoreError> {
         let path = format!("/api/mcpSession/{}", enc(session_id));
-        let Some((status, bytes)) = self.client.req("GET", &path, None).await else {
+        let Some((status, bytes)) = self.client.req_as("GET", &path, ROUTE, None).await else {
             return Ok(None); // transport failure → fail-open
         };
         if !(200..300).contains(&status) {
@@ -78,7 +83,8 @@ impl SessionStore for DbSessionStore {
         match serde_json::from_slice::<RawSession>(&bytes) {
             Ok(raw) => Ok(Some(SessionState::new(raw.initialize_params))),
             Err(e) => {
-                tracing::error!("mcpSession {session_id}: malformed stored payload: {e}");
+                // Not the id: it is the session's credential.
+                tracing::error!("mcpSession: malformed stored payload: {e}");
                 Ok(None)
             }
         }
@@ -90,13 +96,13 @@ impl SessionStore for DbSessionStore {
             "initializeParams": state.initialize_params,
             "ttlMs": self.ttl_ms,
         });
-        let _ = self.client.req("PUT", &path, Some(body)).await; // logged+swallowed
+        let _ = self.client.req_as("PUT", &path, ROUTE, Some(body)).await; // logged+swallowed
         Ok(())
     }
 
     async fn delete(&self, session_id: &str) -> Result<(), SessionStoreError> {
         let path = format!("/api/mcpSession/{}", enc(session_id));
-        let _ = self.client.req("DELETE", &path, None).await;
+        let _ = self.client.req_as("DELETE", &path, ROUTE, None).await;
         Ok(())
     }
 }
@@ -188,5 +194,51 @@ mod tests {
         let s = store_with(t.clone());
         s.delete("sid").await.unwrap();
         assert_eq!(t.calls.lock().unwrap()[0].0, "DELETE");
+    }
+
+    /// The session id is a bearer credential. Through the REAL transport,
+    /// against a data service that fails every way it can (an error status
+    /// whose body echoes the id, a malformed payload, a refused connection),
+    /// the id reaches no span field and no log line.
+    #[tokio::test]
+    async fn the_session_id_reaches_no_span_and_no_log() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const SID: &str = "sid_SECRET_0123";
+
+        async fn answer(reply: &'static str) -> String {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", l.local_addr().unwrap());
+            tokio::spawn(async move {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let _ = s.read(&mut buf).await.unwrap();
+                s.write_all(reply.as_bytes()).await.unwrap();
+            });
+            base
+        }
+
+        let cap = crate::telemetry::test_capture::capture();
+        let _g = crate::telemetry::test_capture::install(&cap);
+
+        let base = answer("HTTP/1.1 500 Internal Server Error\r\ncontent-length: 29\r\nconnection: close\r\n\r\nno session sid_SECRET_0123 ok").await;
+        let s = DbSessionStore::new(McpDataServiceClient::new(base, "k"));
+        assert!(s.load(SID).await.unwrap().is_none());
+
+        let base = answer("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n[]").await;
+        let s = DbSessionStore::new(McpDataServiceClient::new(base, "k"));
+        assert!(s.load(SID).await.unwrap().is_none(), "malformed payload is absent");
+
+        // Nothing listens on the discard port: a transport error.
+        let s = DbSessionStore::new(McpDataServiceClient::new("http://127.0.0.1:9", "k"));
+        s.delete(SID).await.unwrap();
+
+        let rec = cap.lock().unwrap().clone();
+        assert!(!rec.iter().any(|(_, v)| v.contains("SECRET")), "the session id leaked: {rec:?}");
+        assert!(
+            rec.iter().any(|(k, v)| k == "url.full" && v.ends_with("/api/mcpSession/{id}")),
+            "the route should still be visible: {rec:?}"
+        );
+        let logged = rec.iter().filter(|(k, _)| k == "message").count();
+        assert!(logged >= 3, "each failure should still be logged: {rec:?}");
     }
 }

@@ -27,8 +27,22 @@ pub(crate) struct Inbound<'a> {
     pub user_agent: Option<&'a str>,
 }
 
+/// The path a container's Docker healthcheck polls, every few seconds, on
+/// every service. Its server span is `DEBUG`, so an `otel.level=info` export
+/// never sees it or anything beneath it; see [`server_span`].
+pub(crate) const HEALTHCHECK_PATH: &str = "/healthcheck";
+
 /// The server span for one inbound request, adopting `parent` (the context
 /// extracted from its `traceparent`).
+///
+/// A request for exactly [`HEALTHCHECK_PATH`] (any method) gets a `DEBUG`
+/// span: same name, same fields, so `http.server.request.duration` still
+/// counts it, but an `otel.level=info` export does not see it. Its children
+/// would then be orphans the export DOES see — new roots, one trace per poll
+/// — so the request is also marked for [`super::QuietLayer`], which makes an
+/// unsampled context current while it runs: everything beneath it, and the
+/// `traceparent` it sends on, is dropped by the parent-based sampler. With
+/// `otel.level=debug` the span is exported like any other, children and all.
 pub(crate) fn server_span(req: Inbound<'_>, parent: opentelemetry::Context) -> tracing::Span {
     // `url.path` is attacker-supplied and unbounded — the same "free inbound
     // bytes turned into billable outbound ones" argument that bounds the user
@@ -37,25 +51,37 @@ pub(crate) fn server_span(req: Inbound<'_>, parent: opentelemetry::Context) -> t
     // carry a credential (`/hooks/{token}/…`) that the template hides from the
     // span name but the concrete path would publish.
     let path = truncate(&crate::telemetry::redact_path(req.path), MAX_ATTR_LEN);
-    // The name must stay `telemetry::SERVER_SPAN`; the metrics layer keys on it.
-    let span = tracing::info_span!(
-        "http.server",
-        otel.name = tracing::field::Empty,
-        otel.kind = "server",
-        otel.status_code = tracing::field::Empty,
-        http.request.method = %req.method,
-        http.route = tracing::field::Empty,
-        url.path = %path,
-        url.query = %redact_query(req.query),
-        network.protocol.version = %req.version,
-        user_agent.original = %truncate(req.user_agent.unwrap_or_default(), MAX_ATTR_LEN),
-        http.response.status_code = tracing::field::Empty,
-    );
+    let query = redact_query(req.query);
+    let user_agent = truncate(req.user_agent.unwrap_or_default(), MAX_ATTR_LEN);
+    let quiet = req.path == HEALTHCHECK_PATH;
+    // A span's level is fixed at its callsite, so one callsite per level.
+    macro_rules! span_at {
+        ($mac:ident) => {
+            // The name must stay `telemetry::SERVER_SPAN`; the metrics layer keys on it.
+            tracing::$mac!(
+                "http.server",
+                otel.name = tracing::field::Empty,
+                otel.kind = "server",
+                otel.status_code = tracing::field::Empty,
+                http.request.method = %req.method,
+                http.route = tracing::field::Empty,
+                url.path = %path,
+                url.query = %query,
+                network.protocol.version = %req.version,
+                user_agent.original = %user_agent,
+                http.response.status_code = tracing::field::Empty,
+            )
+        };
+    }
+    let span = if quiet { span_at!(debug_span) } else { span_at!(info_span) };
     record_route(&span, req.method, req.route);
     // Fails only when the subscriber has no OpenTelemetry layer (tracing
     // disabled) — in that case there is no parent to adopt and the local span
     // is still perfectly good, so this is not worth logging per request.
     let _ = span.set_parent(parent);
+    if quiet {
+        super::quiet_unless_exported(&span);
+    }
     span
 }
 

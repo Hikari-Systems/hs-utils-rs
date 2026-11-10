@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.37.1"
+version = "0.37.2"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -69,7 +69,7 @@ mcp-session-store = ["mcp-resource-server", "dep:rmcp"]
 # Kratos admin client. Controllers keep ownership of their own AppState, schema
 # build and handlers; they pull these elements in. Requires web-login for the
 # session store + KratosUserResolver/ReqwestKratosFetcher.
-controller = ["web-login", "dep:async-graphql", "dep:async-graphql-axum", "dep:chrono"]
+controller = ["web-login", "dep:async-graphql", "async-graphql/default", "dep:async-graphql-axum", "dep:chrono"]
 # Adds the Stripe + payment-data clients and the payments resolver fragments
 # (checkPaidState, listSubscriptionPlans, subscription mutations) on top of the
 # controller toolkit. Stripe is a hand-rolled reqwest client (no `stripe` crate);
@@ -94,8 +94,16 @@ otel = [
     "dep:rustls",
 ]
 # Adds `otel::axum_trace_layer()` — a tower-http TraceLayer emitting HTTP
-# semantic-convention attributes and adopting the inbound traceparent.
-otel-axum = ["otel", "dep:axum", "dep:tower-http"]
+# semantic-convention attributes and adopting the inbound traceparent — and
+# `otel::OtelExtension` (otel-graphql), since an axum service with a GraphQL
+# schema is a controller.
+otel-axum = ["otel", "dep:axum", "dep:tower-http", "otel-graphql"]
+# `otel::OtelExtension`: one span per async-graphql operation. Framework-free,
+# and needs nothing of `controller` (nor of web-login), so a service with a
+# schema but without `controller` can have it. Not implied by `otel-actix`:
+# the actix services are data services, with no schema to put it on, and
+# async-graphql is a heavy build for nothing — add this feature if one has.
+otel-graphql = ["otel", "dep:async-graphql"]
 # Adds `otel::actix_trace()` — actix-web middleware producing the same server
 # span as the axum layer (route-template names, redacted query, traceparent).
 otel-actix = ["otel", "web"]
@@ -158,7 +166,9 @@ rmcp = { version = "2.1", default-features = false, features = ["server", "trans
 # to match sqlx (`runtime-tokio-rustls`), reqwest (`rustls-tls`) and the otel
 # exporter, so the process has one TLS stack rather than three.
 redis = { version = "0.27", features = ["tokio-comp", "sentinel", "connection-manager", "tokio-rustls-comp"], optional = true }
-async-graphql = { version = "7", optional = true }
+# No default features here: `controller` turns them on (`async-graphql/default`,
+# as before), and `otel-graphql` — the extension trait alone — does not need them.
+async-graphql = { version = "7", default-features = false, optional = true }
 async-graphql-axum = { version = "7", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 hmac = { version = "0.13", optional = true }

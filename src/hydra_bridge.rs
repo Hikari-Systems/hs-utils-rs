@@ -89,6 +89,11 @@ impl HydraBridge {
     }
 
     // ── Hydra v2 admin API ──────────────────────────────────────────────────
+    //
+    // Every call here carries a login/consent/logout challenge in its query.
+    // The span redacts query values, but a reqwest error's text is the full
+    // URL, and the handlers log the error chain (`{e:#}`) — so each send
+    // drops the URL from its error (`without_url`) before it is wrapped.
 
     async fn get_login_request(&self, challenge: &str) -> Result<LoginRequest> {
         let resp = self
@@ -97,6 +102,7 @@ impl HydraBridge {
             .query(&[("login_challenge", challenge)])
             .send_traced()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Hydra getOAuth2LoginRequest failed")?;
         ensure_ok(resp.status(), "getOAuth2LoginRequest")?;
         resp.json().await.context("Hydra login request decode")
@@ -114,6 +120,7 @@ impl HydraBridge {
             .json(body)
             .send_traced()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Hydra acceptOAuth2LoginRequest failed")?;
         ensure_ok(resp.status(), "acceptOAuth2LoginRequest")?;
         resp.json().await.context("Hydra accept-login decode")
@@ -126,6 +133,7 @@ impl HydraBridge {
             .query(&[("consent_challenge", challenge)])
             .send_traced()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Hydra getOAuth2ConsentRequest failed")?;
         ensure_ok(resp.status(), "getOAuth2ConsentRequest")?;
         resp.json().await.context("Hydra consent request decode")
@@ -143,6 +151,7 @@ impl HydraBridge {
             .json(body)
             .send_traced()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Hydra acceptOAuth2ConsentRequest failed")?;
         ensure_ok(resp.status(), "acceptOAuth2ConsentRequest")?;
         resp.json().await.context("Hydra accept-consent decode")
@@ -160,6 +169,7 @@ impl HydraBridge {
             .json(body)
             .send_traced()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Hydra rejectOAuth2ConsentRequest failed")?;
         ensure_ok(resp.status(), "rejectOAuth2ConsentRequest")?;
         resp.json().await.context("Hydra reject-consent decode")
@@ -172,6 +182,7 @@ impl HydraBridge {
             .query(&[("logout_challenge", challenge)])
             .send_traced()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Hydra acceptOAuth2LogoutRequest failed")?;
         ensure_ok(resp.status(), "acceptOAuth2LogoutRequest")?;
         resp.json().await.context("Hydra accept-logout decode")
@@ -661,5 +672,39 @@ fn ensure_ok(status: reqwest::StatusCode, op: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("{op}: upstream returned {status}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A login challenge rides in Hydra's query string. The handlers log the
+    /// error chain (`{e:#}`); a reqwest error's text is the full URL, so it
+    /// must be stripped before it is wrapped — and the span redacts the value.
+    #[tokio::test]
+    async fn a_failed_hydra_call_does_not_carry_the_challenge() {
+        let cap = crate::telemetry::test_capture::capture();
+        let _g = crate::telemetry::test_capture::install(&cap);
+        let b = HydraBridge::new(HydraBridgeConfig {
+            // Nothing listens on the discard port.
+            hydra_admin_url: "http://127.0.0.1:9".into(),
+            kratos_public_url: String::new(),
+            kratos_admin_url: String::new(),
+            accounts_host: String::new(),
+            auth_host: String::new(),
+            claims_namespace: String::new(),
+        });
+        let errs = [
+            format!("{:#}", b.get_login_request("chal_SECRET").await.unwrap_err()),
+            format!("{:#}", b.get_consent_request("chal_SECRET").await.unwrap_err()),
+            format!("{:#}", b.accept_logout_request("chal_SECRET").await.unwrap_err()),
+        ];
+        for e in &errs {
+            assert!(!e.contains("SECRET"), "the challenge leaked into the error: {e}");
+        }
+        let rec = cap.lock().unwrap().clone();
+        assert!(!rec.iter().any(|(_, v)| v.contains("SECRET")), "the challenge reached a span: {rec:?}");
+        assert!(rec.iter().any(|(k, v)| k == "url.full" && v.ends_with("login_challenge=<redacted>")), "{rec:?}");
     }
 }

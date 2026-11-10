@@ -236,4 +236,68 @@ mod tests {
         assert!(out.ends_with('…'));
         assert_eq!(truncate("curl/8.5.0", MAX_ATTR_LEN), "curl/8.5.0");
     }
+
+    /// The axum twin of the actix healthcheck test: nothing of a
+    /// `/healthcheck` request is exported at `otel.level=info` (span, child,
+    /// backend call), the next hop is told not to sample, and the request is
+    /// still counted; at `debug` it is an ordinary trace.
+    #[tokio::test]
+    async fn a_healthcheck_exports_nothing_at_info_but_is_still_counted() {
+        use tracing::Instrument;
+        for level in ["info", "debug"] {
+            let ex = crate::otel::test_export::install(level);
+            #[cfg(feature = "http-client")]
+            let (next, seen) = crate::otel::test_export::next_hop().await;
+            #[cfg(not(feature = "http-client"))]
+            let next = String::new();
+
+            let app = axum::Router::new()
+                .route(
+                    "/healthcheck",
+                    axum::routing::get(move || async move {
+                        let _ = &next;
+                        async {
+                            tracing::info!("checking");
+                            #[cfg(feature = "http-client")]
+                            {
+                                use crate::http_client::SendTraced as _;
+                                let _ = reqwest::Client::new().get(next.as_str()).send_traced().await;
+                            }
+                        }
+                        .instrument(tracing::info_span!("healthcheck.child"))
+                        .await;
+                        "ok"
+                    }),
+                )
+                .route("/api/items/{id}", axum::routing::get(|| async { "ok" }))
+                .layer(axum_trace_layer());
+            let get = |uri: &str| http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap();
+            let _ = app.clone().oneshot(get("/healthcheck")).await.unwrap();
+            let _ = app.oneshot(get("/api/items/1")).await.unwrap();
+
+            let spans = ex.finished();
+            let names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
+            if level == "info" {
+                assert_eq!(names, ["GET /api/items/{id}"], "only the ordinary request is exported");
+                #[cfg(feature = "http-client")]
+                {
+                    let req = seen.await.unwrap();
+                    let tp = req.lines().find(|l| l.starts_with("traceparent:")).expect("traceparent still sent");
+                    assert!(tp.trim_end().ends_with("-00"), "the next hop must be told not to sample: {tp}");
+                }
+            } else {
+                let server = spans.iter().find(|s| s.name == "GET /healthcheck").expect("exported at debug");
+                let child = spans.iter().find(|s| s.name == "healthcheck.child").expect("child exported");
+                assert_eq!(child.parent_span_id, server.span_context.span_id());
+                #[cfg(feature = "http-client")]
+                let _ = seen.await;
+            }
+            let p = ex.points();
+            assert_eq!(
+                crate::otel::metrics::tests::has(&p, "http.server.request.duration", ("http.route", "/healthcheck")),
+                Some(1.0),
+                "{level}: {p:?}"
+            );
+        }
+    }
 }

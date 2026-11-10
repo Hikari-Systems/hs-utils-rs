@@ -216,6 +216,19 @@ pub(crate) fn redact_path(path: &str) -> String {
     }
 }
 
+/// How much of an outbound URL the client span's `url.full` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UrlRecord<'a> {
+    /// The path, and the query's parameter names (never their values).
+    Full,
+    /// `scheme://host:port` only: the URL's path is (or may be) a credential.
+    Origin,
+    /// This path in place of the real one — a route template such as
+    /// `/api/session/{id}`, for a path segment that is a credential — and the
+    /// query's parameter names.
+    Path(&'a str),
+}
+
 /// The parts of an outbound URL a span may carry.
 pub(crate) struct Outbound<'a> {
     pub method: &'a str,
@@ -224,8 +237,11 @@ pub(crate) struct Outbound<'a> {
     pub port: Option<u16>,
     pub path: &'a str,
     pub query: Option<&'a str>,
-    /// Record the origin only: the URL's path is (or may be) a credential.
-    pub opaque: bool,
+    pub record: UrlRecord<'a>,
+    /// The span's level. `INFO` unless the caller asked for less (a hot
+    /// polling loop); `WARN` and `ERROR` are treated as `INFO` — a span's
+    /// level is how verbose it is, not how bad.
+    pub level: tracing::Level,
 }
 
 /// A client span for one outbound HTTP request, named `{METHOD} {host}`.
@@ -236,24 +252,39 @@ pub(crate) struct Outbound<'a> {
 /// URL with a session token, a Stripe idempotency key).
 pub(crate) fn http_client_span(out: Outbound<'_>) -> tracing::Span {
     let port = out.port.map(|p| format!(":{p}")).unwrap_or_default();
-    let full = if out.opaque {
-        truncate(&format!("{}://{}{port}", out.scheme, out.host), MAX_ATTR_LEN)
-    } else {
+    let with_path = |path: &str| {
         let query = redact_query(out.query);
         let sep = if query.is_empty() { "" } else { "?" };
-        truncate(&format!("{}://{}{port}{}{sep}{query}", out.scheme, out.host, out.path), MAX_ATTR_LEN)
+        truncate(&format!("{}://{}{port}{path}{sep}{query}", out.scheme, out.host), MAX_ATTR_LEN)
     };
-    tracing::info_span!(
-        "http.client",
-        otel.name = %format!("{} {}", out.method, out.host),
-        otel.kind = "client",
-        otel.status_code = tracing::field::Empty,
-        http.request.method = %out.method,
-        server.address = %truncate(out.host, MAX_ATTR_LEN),
-        server.port = out.port.map(i64::from),
-        url.full = %full,
-        http.response.status_code = tracing::field::Empty,
-    )
+    let full = match out.record {
+        UrlRecord::Full => with_path(out.path),
+        UrlRecord::Path(path) => with_path(path),
+        UrlRecord::Origin => truncate(&format!("{}://{}{port}", out.scheme, out.host), MAX_ATTR_LEN),
+    };
+    let name = format!("{} {}", out.method, out.host);
+    let address = truncate(out.host, MAX_ATTR_LEN);
+    // A span's level is fixed at its callsite, so one callsite per level.
+    macro_rules! span_at {
+        ($mac:ident) => {
+            tracing::$mac!(
+                "http.client",
+                otel.name = %name,
+                otel.kind = "client",
+                otel.status_code = tracing::field::Empty,
+                http.request.method = %out.method,
+                server.address = %address,
+                server.port = out.port.map(i64::from),
+                url.full = %full,
+                http.response.status_code = tracing::field::Empty,
+            )
+        };
+    }
+    match out.level {
+        tracing::Level::TRACE => span_at!(trace_span),
+        tracing::Level::DEBUG => span_at!(debug_span),
+        _ => span_at!(info_span),
+    }
 }
 
 /// Record an outbound response. A 5xx from the far end marks the span
@@ -332,7 +363,8 @@ mod tests {
             port: Some(4434),
             path: "/admin/identities/abc",
             query: Some("token=ory_st_SECRET&page=2"),
-            opaque: false,
+            record: UrlRecord::Full,
+            level: tracing::Level::INFO,
         });
         let rec = cap.lock().unwrap().clone();
         let url = rec.iter().find(|(k, _)| k == "url.full").map(|(_, v)| v.clone()).unwrap();
@@ -354,12 +386,60 @@ mod tests {
             port: None,
             path: "/services/T000/B000/XXXXSECRETXXXX",
             query: Some("x=1"),
-            opaque: true,
+            record: UrlRecord::Origin,
+            level: tracing::Level::INFO,
         });
         let rec = cap.lock().unwrap().clone();
         let url = rec.iter().find(|(k, _)| k == "url.full").map(|(_, v)| v.clone()).unwrap();
         assert_eq!(url, "https://hooks.slack.com");
         assert!(!rec.iter().any(|(_, v)| v.contains("SECRET")), "{rec:?}");
+    }
+
+    /// A path segment that is a credential (a session id the far end treats
+    /// as a bearer): the caller's template replaces the path, so the route
+    /// stays readable and the id never reaches the span.
+    #[test]
+    fn a_path_record_replaces_the_concrete_path() {
+        let cap = crate::telemetry::test_capture::capture();
+        let _g = crate::telemetry::test_capture::install(&cap);
+        let _span = http_client_span(Outbound {
+            method: "GET",
+            scheme: "http",
+            host: "data-service",
+            port: Some(3000),
+            path: "/api/session/SESSION_SECRET",
+            query: Some("ttl=1"),
+            record: UrlRecord::Path("/api/session/{id}"),
+            level: tracing::Level::INFO,
+        });
+        let rec = cap.lock().unwrap().clone();
+        let url = rec.iter().find(|(k, _)| k == "url.full").map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(url, "http://data-service:3000/api/session/{id}?ttl=<redacted>");
+        assert!(!rec.iter().any(|(_, v)| v.contains("SESSION_SECRET")), "{rec:?}");
+    }
+
+    /// A debug client span is a different callsite with the same name and
+    /// fields, so the metrics layer and the tests treat it alike.
+    #[test]
+    fn a_client_span_takes_the_level_asked_for() {
+        let cap = crate::telemetry::test_capture::capture();
+        let _g = crate::telemetry::test_capture::install(&cap);
+        let out = |level| Outbound {
+            method: "GET",
+            scheme: "http",
+            host: "h",
+            port: None,
+            path: "/",
+            query: None,
+            record: UrlRecord::Full,
+            level,
+        };
+        let levels = [tracing::Level::TRACE, tracing::Level::DEBUG, tracing::Level::INFO, tracing::Level::ERROR]
+            .map(|l| http_client_span(out(l)).metadata().map(|m| *m.level()));
+        assert_eq!(
+            levels,
+            [tracing::Level::TRACE, tracing::Level::DEBUG, tracing::Level::INFO, tracing::Level::INFO].map(Some)
+        );
     }
 
     #[test]

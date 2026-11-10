@@ -132,16 +132,21 @@ impl AvatarHook {
     /// Download an external image URL and forward its bytes to image-service,
     /// returning the new image id.
     async fn download_and_store(&self, image_url: &str) -> Result<String> {
+        // The picture URL is the identity provider's, and can be signed (a
+        // signature or token in its query or path): the span records its
+        // origin only, and neither the error nor the log line carries it.
         let resp = self
             .http
             .get(image_url)
-            .send_traced()
+            .send_traced_opaque()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("avatar download failed")?;
         if !resp.status().is_success() {
             return Err(anyhow!(
-                "avatar download HTTP {} from {image_url}",
-                resp.status()
+                "avatar download HTTP {} from {}",
+                resp.status(),
+                origin(image_url)
             ));
         }
         let content_type = resp
@@ -336,6 +341,14 @@ fn trunc(s: &str) -> String {
     s.chars().take(200).collect()
 }
 
+/// `scheme://host[:port]` of `url`, for a message about a URL that may be
+/// signed; a URL that does not parse is not echoed at all.
+fn origin(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_else(|_| "<unparseable url>".to_string())
+}
+
 /// Percent-encode a path segment (mirrors `encodeURIComponent`).
 fn urlenc(s: &str) -> String {
     const KEEP: &[u8] = b"-_.!~*'()";
@@ -370,5 +383,45 @@ mod tests {
         assert!(!ct_eq(b"secret", b"secreu"));
         assert!(!ct_eq(b"secret", b"sec"));
         assert!(ct_eq(b"", b""));
+    }
+
+    fn hook() -> AvatarHook {
+        AvatarHook::new(AvatarHookConfig {
+            webhook_key: String::new(),
+            image_service: DataServiceConfig::default(),
+            kratos_admin_url: "http://127.0.0.1:9".into(),
+            image_type: "userIcon".into(),
+        })
+    }
+
+    /// A provider picture URL can be signed. Whether the download is refused
+    /// or answered with an error status, neither the error chain (which the
+    /// handler logs) nor the span carries anything past its origin.
+    #[tokio::test]
+    async fn a_picture_url_reaches_no_error_and_no_span_past_its_origin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cap = crate::telemetry::test_capture::capture();
+        let _g = crate::telemetry::test_capture::install(&cap);
+
+        let refused = hook().download_and_store("http://127.0.0.1:9/a/PATHSECRET?sig=QUERYSECRET").await;
+        let refused = format!("{:#}", refused.unwrap_err());
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = s.read(&mut buf).await.unwrap();
+            s.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+        });
+        let denied = hook().download_and_store(&format!("{base}/a/PATHSECRET?sig=QUERYSECRET")).await;
+        let denied = format!("{:#}", denied.unwrap_err());
+
+        for msg in [&refused, &denied] {
+            assert!(!msg.contains("SECRET"), "the picture URL leaked into the error: {msg}");
+        }
+        assert!(denied.contains(&base), "the origin is kept: {denied}");
+        let rec = cap.lock().unwrap().clone();
+        assert!(!rec.iter().any(|(_, v)| v.contains("SECRET")), "the picture URL reached a span: {rec:?}");
     }
 }

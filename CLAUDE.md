@@ -35,8 +35,10 @@ src/
   lock.rs          — LockManager / LockGuard: named locks (Postgres advisory, or in-process)
   telemetry.rs     — always on: client_span / record_outcome / record_error, query redaction, and the
                      metrics facade (count, up_down, register_gauges) the feature-gated modules call
-  http_client.rs   — send() / SendTraced: reqwest 0.12 in a client span, + traceparent with `otel`
-  otel/            — feature `otel`: init() (traces + metrics + per-layer filters), propagation;
+  http_client.rs   — send() / SendTraced / TraceOptions: reqwest 0.12 in a client span (a level, a
+                     recorded path), + traceparent with `otel`
+  graphql_otel.rs  — OtelExtension (async-graphql), re-exported by `otel` (otel-graphql) and `controller`
+  otel/            — feature `otel`: init() (traces + metrics + per-layer filters, QuietLayer), propagation;
     metrics.rs       instruments, the gauge CATALOG, and the span → metrics layer
     procfs.rs        /proc/self and cgroup v2 readers (CPU, memory, I/O, PSI pressure)
     http_span.rs     the server span both framework layers build
@@ -59,6 +61,38 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 ---
 
 ## Migrating consumers
+
+### v0.37.2 — quiet healthchecks, per-call span levels, session ids out of traces
+
+**Drop-in from v0.37.1:** bump the tag; nothing to change.
+
+New, opt-in:
+- **A client span's level, per call:** `.send_traced_at(tracing::Level::DEBUG)` and `.send_traced_opaque_at(level)`
+  (functions `http_client::send_at` / `send_opaque_at`). For a hot polling loop: at `otel.level=info` its spans are not
+  exported, `http.client.request.duration` still counts them, and the `traceparent` sent is the caller's, so the far
+  end still continues the caller's trace. `.send_traced()` / `.send_traced_opaque()` are unchanged.
+- **`http_client::TraceOptions`** with `.send_traced_with(opts)` / `send_with`: a level, `.opaque()`, or
+  `.path("/api/x/{id}")` — record that template on `url.full` in place of a path whose segment is a credential.
+- **`hs_utils::otel::OtelExtension`** (feature `otel-graphql`, which `otel-axum` now turns on): the GraphQL operation
+  span without `controller`. `controller::graphql::OtelExtension` still works and is the same type.
+- `mcp_resource_server::HttpTransport::request_as` (defaulted to `request`, so an outside transport is unaffected).
+
+**The compiler will not tell you these:**
+
+- **`/healthcheck` is a `DEBUG` server span** in both `actix_trace()` and `axum_trace_layer()` (exact path, any
+  method). At `otel.level=info` nothing of it is exported: not its span, not a child span, not a backend call's
+  client span. The `traceparent` such a call sends says "not sampled", so **the service it calls drops its side of
+  that trace too**, whatever its route. At `otel.level=debug` it is an ordinary trace. `http.server.request.duration`
+  and `http.server.active_requests` still count it (the metrics layer now sees this crate's request and client spans
+  at any level). Its events still reach stdout at the log level.
+- **The MCP session store no longer publishes session ids.** `DbSessionStore`'s calls record
+  `url.full = …/api/mcpSession/{id}`, its log lines carry no id, and an error response's body is no longer logged
+  (only its length). A dashboard or query on the concrete URL will stop matching.
+- **Errors that carried a credential in a URL no longer do.** The consent bridge's Hydra calls drop the URL (with its
+  `login_challenge` / `consent_challenge` / `logout_challenge`) from their errors, so its `warn!` lines lose the URL.
+  The avatar hook's picture download records only the picture URL's origin, in its span and in its error.
+- **`otel-axum` now compiles async-graphql** (default features off; `controller` still turns them on, as before).
+  A first build of an axum service without `controller` takes longer.
 
 ### v0.37.1 — URLs and paths that are credentials
 
@@ -302,9 +336,21 @@ The bounds require `actix-service` and `actix-http` as direct dependencies becau
   it calls; a bare `.send()` starts an unconnected root on the other side. `clippy.toml` disallows
   `RequestBuilder::send` here, so `cargo clippy` flags a regression; consumers should carry the same file.
 - **A URL that is its own credential** (a webhook, a user-supplied target): `.send_traced_opaque()`, which records
-  the origin only. **A path segment that is a credential** on the server side (`/hooks/{token}`):
-  `otel::set_path_redactor` at startup. The defaults record paths, because ids in paths are what make a slow call
-  findable, so these are the call site's to say.
+  the origin only. **A path segment that is a credential** on an outbound call (a session id the far end treats as
+  a bearer): `.send_traced_with(TraceOptions::new().path("/api/x/{id}"))`, which records the template. On the server
+  side (`/hooks/{token}`): `otel::set_path_redactor` at startup. The defaults record paths, because ids in paths are
+  what make a slow call findable, so these are the call site's to say. **And strip the URL from the error** before
+  logging or wrapping it (`.map_err(reqwest::Error::without_url)`): a reqwest error's text is the full URL, query
+  values and all, which is exactly what the span redacts.
+- **A hot loop** (polling): `.send_traced_at(Level::DEBUG)` (or `TraceOptions::level`). Not exported at
+  `otel.level=info`, still counted in `http.client.request.duration`; `send_with` sends the caller's `traceparent`
+  when the export cannot see the call's own span.
+- **Healthchecks are quiet.** `http_span::server_span` makes `/healthcheck` a `DEBUG` span. A span the export filter
+  drops would leave its children parentless, i.e. new roots, so `otel::quiet_unless_exported` marks it and
+  `otel::QuietLayer` (installed by `init`, before the export layer) makes an unsampled OpenTelemetry context current
+  while it is entered: the parent-based sampler drops everything beneath it, and the `traceparent` it sends on says
+  "not sampled". The metrics layer's filter (`otel::metrics_filter`) takes this crate's request and client spans at
+  any level, so they are still counted. `otel::test_export::install` builds the same stack in memory for tests.
 - **Anything else** (redis, SMTP, a queue): `telemetry::client_span(system, operation, peer)`, then
   `.instrument(span.clone())` on the future and `record_outcome` / `record_error` on the result. Inside this crate,
   `telemetry::traced(span, fut)` does both for a `Result` future without attaching the error text.

@@ -389,7 +389,7 @@ mod tests {
         g.release().await;
         let again = m.acquire("a", Duration::from_millis(10)).await.expect("released");
         drop(again);
-        m.acquire("a", Duration::from_millis(10)).await.expect("dropping releases too");
+        drop(m.acquire("a", Duration::from_millis(10)).await.expect("dropping releases too"));
         drop(other);
     }
 
