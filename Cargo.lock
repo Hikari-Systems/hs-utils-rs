@@ -1462,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "hs-utils"
-version = "0.37.0"
+version = "0.37.1"
 dependencies = [
  "actix-http",
  "actix-service",

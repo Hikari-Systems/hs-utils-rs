@@ -22,7 +22,22 @@ use crate::telemetry::{http_client_span, record_error, record_http_client_status
 
 /// Send `request` inside a client span. Behaves exactly like
 /// `RequestBuilder::send` otherwise: same result, same errors.
+///
+/// The span records the URL's path (query values redacted). When the path is
+/// itself a credential — a Slack or Discord webhook, a user-supplied "post to
+/// this URL" target, an MCP server URL with a key in it — use [`send_opaque`].
 pub async fn send(request: RequestBuilder) -> reqwest::Result<Response> {
+    send_inner(request, false).await
+}
+
+/// As [`send`], but the span records only the origin (`scheme://host:port`):
+/// for a URL whose path or query is, or may be, a credential. Still carries
+/// `traceparent` — that is a header, and says nothing about the URL.
+pub async fn send_opaque(request: RequestBuilder) -> reqwest::Result<Response> {
+    send_inner(request, true).await
+}
+
+async fn send_inner(request: RequestBuilder, opaque: bool) -> reqwest::Result<Response> {
     let (client, built) = request.build_split();
     // `mut` is only needed when `otel` injects the trace header.
     #[allow(unused_mut)]
@@ -35,6 +50,7 @@ pub async fn send(request: RequestBuilder) -> reqwest::Result<Response> {
         port: url.port(),
         path: url.path(),
         query: url.query(),
+        opaque,
     });
     #[cfg(feature = "otel")]
     crate::otel::inject_span_context(&span, built.headers_mut());
@@ -57,11 +73,16 @@ pub async fn send(request: RequestBuilder) -> reqwest::Result<Response> {
 pub trait SendTraced {
     /// See [`send`].
     fn send_traced(self) -> impl std::future::Future<Output = reqwest::Result<Response>> + Send;
+    /// See [`send_opaque`]: for a URL that is its own credential.
+    fn send_traced_opaque(self) -> impl std::future::Future<Output = reqwest::Result<Response>> + Send;
 }
 
 impl SendTraced for RequestBuilder {
     fn send_traced(self) -> impl std::future::Future<Output = reqwest::Result<Response>> + Send {
         send(self)
+    }
+    fn send_traced_opaque(self) -> impl std::future::Future<Output = reqwest::Result<Response>> + Send {
+        send_opaque(self)
     }
 }
 

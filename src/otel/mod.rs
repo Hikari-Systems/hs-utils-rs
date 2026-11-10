@@ -426,10 +426,10 @@ pub fn inject_span_context(span: &tracing::Span, headers: &mut http::HeaderMap) 
 /// Send a reqwest 0.12 request in a client span with `traceparent`; see
 /// [`crate::http_client::send`].
 #[cfg(feature = "http-client")]
-pub use crate::http_client::send;
+pub use crate::http_client::{send, send_opaque};
 
 /// Client spans for other calls (SMTP, a queue); see [`crate::telemetry`].
-pub use crate::telemetry::{client_span, record_error, record_outcome};
+pub use crate::telemetry::{client_span, record_error, record_outcome, set_path_redactor};
 
 /// Extract a remote trace context from inbound request headers.
 pub fn extract_context(headers: &http::HeaderMap) -> opentelemetry::Context {

@@ -33,7 +33,10 @@ pub(crate) fn server_span(req: Inbound<'_>, parent: opentelemetry::Context) -> t
     // `url.path` is attacker-supplied and unbounded — the same "free inbound
     // bytes turned into billable outbound ones" argument that bounds the user
     // agent. A 4 KB path produced a 4 KB attribute.
-    let path = truncate(req.path, MAX_ATTR_LEN);
+    // Through the service's redactor first, if it installed one: a path can
+    // carry a credential (`/hooks/{token}/…`) that the template hides from the
+    // span name but the concrete path would publish.
+    let path = truncate(&crate::telemetry::redact_path(req.path), MAX_ATTR_LEN);
     // The name must stay `telemetry::SERVER_SPAN`; the metrics layer keys on it.
     let span = tracing::info_span!(
         "http.server",

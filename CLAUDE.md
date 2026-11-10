@@ -60,6 +60,20 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 
 ## Migrating consumers
 
+### v0.37.1 — URLs and paths that are credentials
+
+New, nothing changed:
+- **`.send_traced_opaque()` / `http_client::send_opaque`** records only `scheme://host:port`. Use it for a URL whose
+  path or query is a credential: Slack or Discord webhooks, a user-supplied "post to this URL" target, an MCP server
+  URL with a key in it. It still sends `traceparent`.
+- **`otel::set_path_redactor(fn(&str) -> String)`**, called once before serving, runs the concrete `url.path` the
+  server layers record through the service's redactor. Use it when a path segment is a credential, such as
+  `/hooks/{token}/…`. The span name is already the route template, so only the attribute needs it.
+
+**The compiler will not tell you this:** a service that hand-redacted paths in its own `TraceLayer` loses that when
+it moves to `axum_trace_layer()` or `actix_trace()`. Install the same function with `set_path_redactor` as part of
+the move.
+
 ### v0.37.0 — otel metrics, actix-web tracing, client spans
 
 **Not breaking** for a consumer that names `OtelConfig` or `DbConfig` only through serde. A struct literal of either
@@ -287,6 +301,10 @@ The bounds require `actix-service` and `actix-http` as direct dependencies becau
   with `otel` writes `traceparent`. That header is what makes a controller's trace continue into the data service
   it calls; a bare `.send()` starts an unconnected root on the other side. `clippy.toml` disallows
   `RequestBuilder::send` here, so `cargo clippy` flags a regression; consumers should carry the same file.
+- **A URL that is its own credential** (a webhook, a user-supplied target): `.send_traced_opaque()`, which records
+  the origin only. **A path segment that is a credential** on the server side (`/hooks/{token}`):
+  `otel::set_path_redactor` at startup. The defaults record paths, because ids in paths are what make a slow call
+  findable, so these are the call site's to say.
 - **Anything else** (redis, SMTP, a queue): `telemetry::client_span(system, operation, peer)`, then
   `.instrument(span.clone())` on the future and `record_outcome` / `record_error` on the result. Inside this crate,
   `telemetry::traced(span, fut)` does both for a `Result` future without attaching the error text.

@@ -187,6 +187,35 @@ pub(crate) async fn traced<T, E>(
     out
 }
 
+// ── path redaction ──────────────────────────────────────────────────────────
+
+static PATH_REDACTOR: std::sync::OnceLock<fn(&str) -> String> = std::sync::OnceLock::new();
+
+/// Install a process-wide redactor for the concrete request path the server
+/// layers record as `url.path` — for a service whose paths carry a credential,
+/// such as `/hooks/{token}/…`. The span NAME is already the route template, so
+/// only the attribute needs it. Call it once, before serving; a second call is
+/// ignored (and returns `false`), so the first redactor cannot be swapped out.
+///
+/// ```rust,ignore
+/// hs_utils::otel::set_path_redactor(routes::redact_hook_token);
+/// ```
+pub fn set_path_redactor(redact: fn(&str) -> String) -> bool {
+    let set = PATH_REDACTOR.set(redact).is_ok();
+    if !set {
+        tracing::warn!("otel path redactor already installed; the second one is ignored");
+    }
+    set
+}
+
+/// `path` as the server span may record it.
+pub(crate) fn redact_path(path: &str) -> String {
+    match PATH_REDACTOR.get() {
+        Some(redact) => redact(path),
+        None => path.to_string(),
+    }
+}
+
 /// The parts of an outbound URL a span may carry.
 pub(crate) struct Outbound<'a> {
     pub method: &'a str,
@@ -195,6 +224,8 @@ pub(crate) struct Outbound<'a> {
     pub port: Option<u16>,
     pub path: &'a str,
     pub query: Option<&'a str>,
+    /// Record the origin only: the URL's path is (or may be) a credential.
+    pub opaque: bool,
 }
 
 /// A client span for one outbound HTTP request, named `{METHOD} {host}`.
@@ -205,12 +236,13 @@ pub(crate) struct Outbound<'a> {
 /// URL with a session token, a Stripe idempotency key).
 pub(crate) fn http_client_span(out: Outbound<'_>) -> tracing::Span {
     let port = out.port.map(|p| format!(":{p}")).unwrap_or_default();
-    let query = redact_query(out.query);
-    let sep = if query.is_empty() { "" } else { "?" };
-    let full = truncate(
-        &format!("{}://{}{port}{}{sep}{query}", out.scheme, out.host, out.path),
-        MAX_ATTR_LEN,
-    );
+    let full = if out.opaque {
+        truncate(&format!("{}://{}{port}", out.scheme, out.host), MAX_ATTR_LEN)
+    } else {
+        let query = redact_query(out.query);
+        let sep = if query.is_empty() { "" } else { "?" };
+        truncate(&format!("{}://{}{port}{}{sep}{query}", out.scheme, out.host, out.path), MAX_ATTR_LEN)
+    };
     tracing::info_span!(
         "http.client",
         otel.name = %format!("{} {}", out.method, out.host),
@@ -300,12 +332,34 @@ mod tests {
             port: Some(4434),
             path: "/admin/identities/abc",
             query: Some("token=ory_st_SECRET&page=2"),
+            opaque: false,
         });
         let rec = cap.lock().unwrap().clone();
         let url = rec.iter().find(|(k, _)| k == "url.full").map(|(_, v)| v.clone()).unwrap();
         assert_eq!(url, "https://kratos-admin:4434/admin/identities/abc?token=<redacted>&page=<redacted>");
         let name = rec.iter().find(|(k, _)| k == "otel.name").map(|(_, v)| v.clone()).unwrap();
         assert_eq!(name, "GET kratos-admin", "the path (and its id) must stay out of the name");
+    }
+
+    /// A webhook URL is its own credential (`hooks.slack.com/services/T/B/<secret>`):
+    /// an opaque call records the origin and nothing after it.
+    #[test]
+    fn an_opaque_url_records_only_its_origin() {
+        let cap = crate::telemetry::test_capture::capture();
+        let _g = crate::telemetry::test_capture::install(&cap);
+        let _span = http_client_span(Outbound {
+            method: "POST",
+            scheme: "https",
+            host: "hooks.slack.com",
+            port: None,
+            path: "/services/T000/B000/XXXXSECRETXXXX",
+            query: Some("x=1"),
+            opaque: true,
+        });
+        let rec = cap.lock().unwrap().clone();
+        let url = rec.iter().find(|(k, _)| k == "url.full").map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(url, "https://hooks.slack.com");
+        assert!(!rec.iter().any(|(_, v)| v.contains("SECRET")), "{rec:?}");
     }
 
     #[test]
