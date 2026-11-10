@@ -47,6 +47,7 @@ use serde::Serialize;
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
+use tracing::Instrument;
 
 /// Default local fan-out channel depth. A subscriber that falls this far behind
 /// is dropped (`Lagged`) and skips the gap — appropriate for "nudge" events
@@ -118,27 +119,72 @@ where
     fn publish(&self, event: E) {
         let pool = self.pool.clone();
         let channel = self.channel.clone();
-        tokio::spawn(async move {
-            let payload = match serde_json::to_string(&event) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("pubsub publish: serialise failed: {e:#}");
-                    return;
-                }
-            };
-            if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
-                .bind(&channel)
-                .bind(&payload)
-                .execute(&pool)
-                .await
-            {
-                tracing::warn!("pubsub publish (pg_notify) failed: {e:#}");
+        // Made here, so the spawned NOTIFY is a child of whatever published.
+        let span = publish_span("postgresql", "NOTIFY", pool.connect_options().get_host(), &channel);
+        tokio::spawn(
+            async move {
+                let payload = match serde_json::to_string(&event) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("pubsub publish: serialise failed: {e:#}");
+                        published(&channel, "postgres", "error");
+                        return;
+                    }
+                };
+                let outcome = match sqlx::query("SELECT pg_notify($1, $2)")
+                    .bind(&channel)
+                    .bind(&payload)
+                    .execute(&pool)
+                    .await
+                {
+                    Ok(_) => "ok",
+                    Err(e) => {
+                        tracing::warn!("pubsub publish (pg_notify) failed: {e:#}");
+                        "error"
+                    }
+                };
+                published(&channel, "postgres", outcome);
             }
-        });
+            .instrument(span),
+        );
     }
     fn subscribe(&self) -> broadcast::Receiver<E> {
         self.tx.subscribe()
     }
+}
+
+// ── telemetry ──────────────────────────────────────────────────────────────
+//
+// `hs.pubsub.*` counters, labelled by `channel` (a name from code) and
+// `backend`. The span is the publish's; delivery happens on the listener task,
+// which no request owns, so it is counted rather than traced.
+
+/// The client span of one publish, made in the publisher's context so the
+/// spawned send is its child.
+fn publish_span(system: &str, op: &str, peer: &str, channel: &str) -> tracing::Span {
+    let span = crate::telemetry::client_span(system, op, peer);
+    span.record("client.target", crate::telemetry::truncate(channel, crate::telemetry::MAX_ATTR_LEN));
+    span
+}
+
+/// Count a publish, and close its span's outcome.
+fn published(channel: &str, backend: &str, outcome: &'static str) {
+    crate::telemetry::record_outcome(&tracing::Span::current(), outcome);
+    crate::telemetry::count("hs.pubsub.published", 1, &[("channel", channel), ("backend", backend), ("outcome", outcome)]);
+}
+
+/// Hand an event from the backend to local subscribers. `delivered` counts
+/// events received (not copies): `outcome=no_subscribers` when no one on this
+/// replica was listening.
+fn delivered<E>(tx: &broadcast::Sender<E>, event: E, channel: &str, backend: &str) {
+    let outcome = if tx.send(event).is_ok() { "delivered" } else { "no_subscribers" };
+    crate::telemetry::count("hs.pubsub.received", 1, &[("channel", channel), ("backend", backend), ("outcome", outcome)]);
+}
+
+/// The listener lost (or never got) its connection and is about to retry.
+/// A steady rate of these is a bus that delivers nothing.
+fn reconnecting(channel: &str, backend: &str) {
+    crate::telemetry::count("hs.pubsub.listener_reconnects", 1, &[("channel", channel), ("backend", backend)]);
 }
 
 /// Long-lived `LISTEN` task: (re)connect, listen, rebroadcast each notification
@@ -161,9 +207,7 @@ where
                         match listener.recv().await {
                             Ok(notification) => {
                                 match serde_json::from_str::<E>(notification.payload()) {
-                                    Ok(event) => {
-                                        let _ = tx.send(event);
-                                    }
+                                    Ok(event) => delivered(&tx, event, &channel, "postgres"),
                                     Err(e) => tracing::debug!(
                                         "pubsub: ignoring unparseable payload on '{channel}': {e}"
                                     ),
@@ -180,6 +224,7 @@ where
             },
             Err(e) => tracing::warn!("pubsub connect failed: {e:#}"),
         }
+        reconnecting(&channel, "postgres");
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX);
     }
@@ -216,28 +261,38 @@ where
     fn publish(&self, event: E) {
         let conn = self.conn.clone();
         let channel = self.channel.clone();
-        tokio::spawn(async move {
-            let payload = match serde_json::to_string(&event) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("pubsub publish: serialise failed: {e:#}");
-                    return;
+        let span = publish_span("redis", "PUBLISH", &conn.peer(), &channel);
+        tokio::spawn(
+            async move {
+                let payload = match serde_json::to_string(&event) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("pubsub publish: serialise failed: {e:#}");
+                        published(&channel, "redis", "error");
+                        return;
+                    }
+                };
+                let res = async {
+                    let mut c = conn.conn().await?;
+                    redis::cmd("PUBLISH")
+                        .arg(&channel)
+                        .arg(&payload)
+                        .query_async::<i64>(&mut c)
+                        .await
+                        .map_err(anyhow::Error::from)
                 }
-            };
-            let res = async {
-                let mut c = conn.conn().await?;
-                redis::cmd("PUBLISH")
-                    .arg(&channel)
-                    .arg(&payload)
-                    .query_async::<i64>(&mut c)
-                    .await
-                    .map_err(anyhow::Error::from)
+                .await;
+                let outcome = match res {
+                    Ok(_) => "ok",
+                    Err(e) => {
+                        tracing::warn!("pubsub publish (redis PUBLISH) failed: {e:#}");
+                        "error"
+                    }
+                };
+                published(&channel, "redis", outcome);
             }
-            .await;
-            if let Err(e) = res {
-                tracing::warn!("pubsub publish (redis PUBLISH) failed: {e:#}");
-            }
-        });
+            .instrument(span),
+        );
     }
     fn subscribe(&self) -> broadcast::Receiver<E> {
         self.tx.subscribe()
@@ -269,9 +324,7 @@ async fn redis_subscribe_loop<E>(
                     while let Some(msg) = stream.next().await {
                         let Ok(payload) = msg.get_payload::<String>() else { continue };
                         match serde_json::from_str::<E>(&payload) {
-                            Ok(event) => {
-                                let _ = tx.send(event);
-                            }
+                            Ok(event) => delivered(&tx, event, &channel, "redis"),
                             Err(e) => tracing::debug!("pubsub: ignoring unparseable payload on '{channel}': {e}"),
                         }
                     }
@@ -281,6 +334,7 @@ async fn redis_subscribe_loop<E>(
             },
             Err(e) => tracing::warn!("pubsub redis connect failed: {e:#}"),
         }
+        reconnecting(&channel, "redis");
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX);
     }
@@ -309,12 +363,39 @@ mod sse {
     where
         E: Serialize + Clone + Send + 'static,
     {
-        let stream = BroadcastStream::new(rx).filter_map(|res| {
-            let event = res.ok()?;
+        let open = Open::new();
+        let stream = BroadcastStream::new(rx).filter_map(move |res| {
+            let _held = &open; // counted open until the stream is dropped
+            let event = match res {
+                Ok(e) => e,
+                // This client fell behind and missed `n` events: the bus's
+                // `capacity` is too small for it, or it is too slow.
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    crate::telemetry::count("hs.sse.lagged_events", n, &[]);
+                    return None;
+                }
+            };
             let data = serde_json::to_string(&event).ok()?;
             Some(Ok(Event::default().data(data)))
         });
         Sse::new(stream).keep_alive(KeepAlive::default())
+    }
+
+    /// `hs.sse.connections`: +1 while an SSE stream exists, −1 when axum drops
+    /// it (the client disconnected, or the server is shutting down).
+    struct Open;
+
+    impl Open {
+        fn new() -> Self {
+            crate::telemetry::up_down("hs.sse.connections", 1, &[]);
+            Open
+        }
+    }
+
+    impl Drop for Open {
+        fn drop(&mut self) {
+            crate::telemetry::up_down("hs.sse.connections", -1, &[]);
+        }
     }
 }
 

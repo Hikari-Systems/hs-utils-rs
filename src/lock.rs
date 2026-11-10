@@ -130,6 +130,47 @@ impl LockManager {
 
     /// Takes the lock `name`, waiting up to `wait` for its holder to finish.
     pub async fn acquire(&self, name: &str, wait: Duration) -> Result<LockGuard, LockError> {
+        use tracing::Instrument;
+        // The span's duration is the wait, so `hs.client.operation.duration`
+        // for `lock.acquire` is the lock-wait histogram, split by outcome.
+        // `busy` is an answer, not a failure: the span is not marked errored.
+        let span = crate::telemetry::client_span(self.system(), "lock.acquire", &self.peer());
+        span.record("client.target", crate::telemetry::truncate(name, crate::telemetry::MAX_ATTR_LEN));
+        let out = self.acquire_untraced(name, wait).instrument(span.clone()).await;
+        crate::telemetry::record_outcome(
+            &span,
+            match &out {
+                Ok(_) => "ok",
+                Err(LockError::Busy) => "busy",
+                Err(_) => "error",
+            },
+        );
+        out
+    }
+
+    /// The span's `client.system`.
+    fn system(&self) -> &'static str {
+        match &*self.inner {
+            Backend::Local(_) => "in-process",
+            #[cfg(feature = "lock-postgres")]
+            Backend::Postgres(_) => "postgresql",
+            #[cfg(feature = "lock-redis")]
+            Backend::Redis(_) => "redis",
+        }
+    }
+
+    /// The span's `server.address`: a host, never a connection string.
+    fn peer(&self) -> String {
+        match &*self.inner {
+            Backend::Local(_) => String::new(),
+            #[cfg(feature = "lock-postgres")]
+            Backend::Postgres(pool) => pool.connect_options().get_host().to_string(),
+            #[cfg(feature = "lock-redis")]
+            Backend::Redis(conn) => conn.peer(),
+        }
+    }
+
+    async fn acquire_untraced(&self, name: &str, wait: Duration) -> Result<LockGuard, LockError> {
         match &*self.inner {
             Backend::Local(map) => {
                 let m = {
@@ -260,7 +301,22 @@ impl std::fmt::Debug for LockGuard {
 
 impl LockGuard {
     /// Releases the lock (and, for Postgres, returns its connection to the pool).
-    pub async fn release(mut self) {
+    pub async fn release(self) {
+        use tracing::Instrument;
+        let system = match &self.inner {
+            // Nothing to call: an in-process release is a drop.
+            Guard::Local(_) => return self.release_untraced().await,
+            #[cfg(feature = "lock-postgres")]
+            Guard::Postgres { .. } => "postgresql",
+            #[cfg(feature = "lock-redis")]
+            Guard::Redis { .. } => "redis",
+        };
+        #[allow(unreachable_code)]
+        let span = crate::telemetry::client_span(system, "lock.release", "");
+        self.release_untraced().instrument(span).await
+    }
+
+    async fn release_untraced(mut self) {
         match &mut self.inner {
             Guard::Local(g) => drop(g.take()),
             #[cfg(feature = "lock-postgres")]

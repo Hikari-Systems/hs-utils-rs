@@ -33,6 +33,15 @@ src/
   server.rs        — run() wrapping HttpServer
   session_store.rs — build_session_store(): the session store, plus locks() / event_bus() on its database
   lock.rs          — LockManager / LockGuard: named locks (Postgres advisory, or in-process)
+  telemetry.rs     — always on: client_span / record_outcome / record_error, query redaction, and the
+                     metrics facade (count, up_down, register_gauges) the feature-gated modules call
+  http_client.rs   — send() / SendTraced: reqwest 0.12 in a client span, + traceparent with `otel`
+  otel/            — feature `otel`: init() (traces + metrics + per-layer filters), propagation;
+    metrics.rs       instruments, the gauge CATALOG, and the span → metrics layer
+    procfs.rs        /proc/self and cgroup v2 readers (CPU, memory, I/O, PSI pressure)
+    http_span.rs     the server span both framework layers build
+    axum_layer.rs    axum_trace_layer()  (otel-axum)
+    actix_layer.rs   actix_trace()       (otel-actix)
 ```
 
 ---
@@ -50,6 +59,44 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 ---
 
 ## Migrating consumers
+
+### v0.37.0 — otel metrics, actix-web tracing, client spans
+
+**Not breaking** for a consumer that names `OtelConfig` or `DbConfig` only through serde. A struct literal of either
+without `..Default::default()` stops compiling (new fields); the compiler shows each one.
+
+New: feature `otel-actix` (`otel::actix_trace()`, the actix twin of `axum_trace_layer`), `http-client`
+(`http_client::send` / `SendTraced`, turned on by every feature that calls out), `telemetry::client_span` for a
+service's own calls (SMTP), `controller::graphql::OtelExtension`, `db.slowqueryms`, `WebSessionStore::count_active`
+(defaulted, so an outside implementation is unaffected).
+
+**The compiler will not tell you these:**
+
+- **A service with `otel.enabled` now exports metrics too.** On by default, every `otel.metricsIntervalSecs` (60 s).
+  Set `otel__metricsEnabled: "false"` to bump the tag without them. No `x-honeycomb-dataset` header is sent unless
+  `otel.metricsDataset` is set: Honeycomb routes native OTLP metrics by itself.
+- **hs-utils' own outbound HTTP now carries `traceparent`** (Kratos, Hydra, JWKS, Stripe, payment-data, image-service,
+  the DCR upstream). A data service that already adopts an inbound `traceparent` starts parenting those requests
+  under the caller's trace. Nothing to change.
+- **The session store's database gets two `count(*)` queries a minute per replica** (indexed on `expires_at`), and a
+  redis store one `SCAN` of its db index, for `hs.web_session.active`. Only with `otel` compiled in.
+- **`build_pool` / `build_lazy_pool` keep a clone of each pool for its gauges**, for the life of the process, with
+  `otel` compiled in. A service that drops a pool and builds a new one keeps the old one open.
+- **The export filter is now separate from stdout's.** Unset `otel.level` exports what the log level allows, as
+  before, except that the exporter's own crates (`opentelemetry*`, `reqwest`, `hyper`, `h2`, `rustls`) are never
+  exported. Their errors still reach stdout.
+- **Each server span records `http.route` and gets its name set just after it's created.** The axum span's name and
+  fields are otherwise unchanged. A test that captures only `on_new_span` fields will not see `otel.name`; capture
+  `on_record` too, as `telemetry::test_capture` does.
+
+**Adopting it.**
+- A data service: features `["db", "web", "otel-actix"]`, an `otel: OtelConfig` field on its config,
+  `let _otel = hs_utils::otel::init(&cfg.log.level, &cfg.otel)?;` in place of `logging::init` (inside
+  `#[actix_web::main]`), and `.wrap(hs_utils::otel::actix_trace())` in place of `.wrap(middleware::timing())`.
+- A controller: `otel-axum`, `.extension(OtelExtension)` on its schema, and `.send_traced()` on its calls to data
+  services.
+- With a Collector on the host, set `otel__endpoint: "http://<host>:4318"` and `otel__apiKeyRequired: "false"`; the
+  Collector holds the key.
 
 ### v0.36.0 — jsonwebtoken 10, rmcp 2
 
@@ -230,6 +277,27 @@ Port is stored as `String` in `DbConfig` because `prepare_config` normalises eve
 `server::run` mirrors `HttpServer::new`'s generic bounds exactly. The function is intentionally thin — its value is as a hook point for future cross-cutting concerns (lifecycle notifications, graceful shutdown handling), not as an abstraction over actix-web.
 
 The bounds require `actix-service` and `actix-http` as direct dependencies because `IntoServiceFactory` and the raw `Request` type are not re-exported through `actix_web::dev` in actix-web 4.
+
+### `http_client.rs` and `telemetry.rs`: instrumented calls
+
+**Every outbound call goes through a client span.** In this crate and in its consumers:
+
+- **HTTP (reqwest 0.12):** `use hs_utils::http_client::SendTraced as _;` then `.send_traced()` where you would write
+  `.send()`. It records a `{METHOD} {host}` span with the status and a redacted `url.full` (query values never), and
+  with `otel` writes `traceparent`. That header is what makes a controller's trace continue into the data service
+  it calls; a bare `.send()` starts an unconnected root on the other side. `clippy.toml` disallows
+  `RequestBuilder::send` here, so `cargo clippy` flags a regression; consumers should carry the same file.
+- **Anything else** (redis, SMTP, a queue): `telemetry::client_span(system, operation, peer)`, then
+  `.instrument(span.clone())` on the future and `record_outcome` / `record_error` on the result. Inside this crate,
+  `telemetry::traced(span, fut)` does both for a `Result` future without attaching the error text.
+- **Name the operation, never the data.** `system` and `operation` are the span name and metric labels; a key, a
+  recipient, an id or SQL there leaks it to the trace store and makes one series per value. `client.target` takes a
+  name from code (a lock or channel name), and only as a span attribute.
+- **Metrics from code that doesn't know about `otel`** go through `telemetry::count` / `up_down` /
+  `register_gauges`, which do nothing without `otel` (or before `init`). A new gauge name must be added to `CATALOG`
+  in `otel/metrics.rs`, or it is dropped.
+- **A gauge source runs on the exporter's thread at collection time:** memory reads and tiny files only. Anything
+  that needs a query refreshes an atomic from its own task (see `session_store::session_gauges`).
 
 ### `middleware.rs`
 

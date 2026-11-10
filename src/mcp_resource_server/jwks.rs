@@ -11,6 +11,7 @@ use jsonwebtoken::DecodingKey;
 use serde_json::Value;
 
 use super::stores::JsonWebKeySet;
+use crate::http_client::SendTraced as _;
 
 const JWKS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -19,7 +20,7 @@ async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<Value> {
         .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
         .timeout(JWKS_FETCH_TIMEOUT)
-        .send()
+        .send_traced()
         .await
         .with_context(|| format!("fetch {url}"))?;
     if !resp.status().is_success() {

@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
 use crate::config::DataServiceConfig;
+use crate::http_client::SendTraced as _;
 
 /// Post-flow hook configuration.
 #[derive(Clone, Debug)]
@@ -78,7 +79,7 @@ impl AvatarHook {
             .http
             .get(self.kratos_admin(&format!("/admin/identities/{}", urlenc(id))))
             .header(reqwest::header::ACCEPT, "application/json")
-            .send()
+            .send_traced()
             .await
             .context("Kratos getIdentity failed")?;
         if !resp.status().is_success() {
@@ -117,7 +118,7 @@ impl AvatarHook {
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&Value::Object(body))
-            .send()
+            .send_traced()
             .await
             .context("Kratos updateIdentity failed")?;
         if !resp.status().is_success() {
@@ -134,7 +135,7 @@ impl AvatarHook {
         let resp = self
             .http
             .get(image_url)
-            .send()
+            .send_traced()
             .await
             .context("avatar download failed")?;
         if !resp.status().is_success() {
@@ -183,7 +184,7 @@ impl AvatarHook {
         if !self.cfg.image_service.api_key.is_empty() {
             req = req.header("X-Api-Key", &self.cfg.image_service.api_key);
         }
-        let resp = req.send().await.context("image-service upload failed")?;
+        let resp = req.send_traced().await.context("image-service upload failed")?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();

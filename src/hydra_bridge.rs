@@ -31,6 +31,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tracing::warn;
+use crate::http_client::SendTraced as _;
 
 /// Bridge configuration. All URLs are service-internal (Hydra/Kratos admin +
 /// Kratos public); `accounts_host`/`auth_host` are the public auth hosts used
@@ -94,7 +95,7 @@ impl HydraBridge {
             .http
             .get(self.hydra("/admin/oauth2/auth/requests/login"))
             .query(&[("login_challenge", challenge)])
-            .send()
+            .send_traced()
             .await
             .context("Hydra getOAuth2LoginRequest failed")?;
         ensure_ok(resp.status(), "getOAuth2LoginRequest")?;
@@ -111,7 +112,7 @@ impl HydraBridge {
             .put(self.hydra("/admin/oauth2/auth/requests/login/accept"))
             .query(&[("login_challenge", challenge)])
             .json(body)
-            .send()
+            .send_traced()
             .await
             .context("Hydra acceptOAuth2LoginRequest failed")?;
         ensure_ok(resp.status(), "acceptOAuth2LoginRequest")?;
@@ -123,7 +124,7 @@ impl HydraBridge {
             .http
             .get(self.hydra("/admin/oauth2/auth/requests/consent"))
             .query(&[("consent_challenge", challenge)])
-            .send()
+            .send_traced()
             .await
             .context("Hydra getOAuth2ConsentRequest failed")?;
         ensure_ok(resp.status(), "getOAuth2ConsentRequest")?;
@@ -140,7 +141,7 @@ impl HydraBridge {
             .put(self.hydra("/admin/oauth2/auth/requests/consent/accept"))
             .query(&[("consent_challenge", challenge)])
             .json(body)
-            .send()
+            .send_traced()
             .await
             .context("Hydra acceptOAuth2ConsentRequest failed")?;
         ensure_ok(resp.status(), "acceptOAuth2ConsentRequest")?;
@@ -157,7 +158,7 @@ impl HydraBridge {
             .put(self.hydra("/admin/oauth2/auth/requests/consent/reject"))
             .query(&[("consent_challenge", challenge)])
             .json(body)
-            .send()
+            .send_traced()
             .await
             .context("Hydra rejectOAuth2ConsentRequest failed")?;
         ensure_ok(resp.status(), "rejectOAuth2ConsentRequest")?;
@@ -169,7 +170,7 @@ impl HydraBridge {
             .http
             .put(self.hydra("/admin/oauth2/auth/requests/logout/accept"))
             .query(&[("logout_challenge", challenge)])
-            .send()
+            .send_traced()
             .await
             .context("Hydra acceptOAuth2LogoutRequest failed")?;
         ensure_ok(resp.status(), "acceptOAuth2LogoutRequest")?;
@@ -190,7 +191,7 @@ impl HydraBridge {
             .http
             .get(self.kratos_public("/sessions/whoami"))
             .header("cookie", cookie)
-            .send()
+            .send_traced()
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -203,7 +204,7 @@ impl HydraBridge {
         let resp = self
             .http
             .get(self.kratos_admin(&format!("/admin/identities/{id}")))
-            .send()
+            .send_traced()
             .await
             .context("Kratos getIdentity failed")?;
         ensure_ok(resp.status(), "getIdentity")?;

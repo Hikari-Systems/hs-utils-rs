@@ -26,6 +26,7 @@ use serde_json::{json, Map, Value};
 
 use super::config::McpAuthConfig;
 use super::stores::{AsmCache, ClientStore};
+use crate::http_client::SendTraced as _;
 
 const ASM_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 
@@ -204,7 +205,7 @@ async fn as_metadata_handler(State(state): State<MetadataState>) -> Response {
         .http
         .get(&upstream)
         .header(reqwest::header::ACCEPT, "application/json")
-        .send()
+        .send_traced()
         .await
     {
         Ok(resp) if resp.status().is_success() => match resp.json().await {

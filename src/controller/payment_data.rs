@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use super::config::CoreConfig;
 use super::dates::{iso_utc, parse_dt};
 use super::services::CoreServices;
+use crate::http_client::SendTraced as _;
 
 /// One user payment-state row from the payment-data-service.
 #[derive(Debug, Clone, Default)]
@@ -167,7 +168,7 @@ pub async fn get_payment_states_by_user_id_and_sku(
         .get(&url)
         .header("X-API-Key", api_key(core))
         .header("Content-type", "application/json")
-        .send()
+        .send_traced()
         .await?;
     if resp.status().as_u16() == 204 {
         return Ok(Vec::new());
@@ -203,7 +204,7 @@ pub async fn add_user_payment_state(
         .header("X-API-Key", api_key(core))
         .header("Content-type", "application/json")
         .json(&body)
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(anyhow!("Error adding user payment state: {}", resp.status()));
@@ -244,7 +245,7 @@ pub async fn update_user_payment_state(
         .header("X-API-Key", api_key(core))
         .header("Content-type", "application/json")
         .json(&body)
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(anyhow!("Error updating user payment state: {}", resp.status()));
@@ -268,7 +269,7 @@ pub async fn add_payment_event(
         .header("X-API-Key", api_key(core))
         .header("Content-type", "application/json")
         .json(&body)
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(anyhow!("Error adding payment event: {}", resp.status()));

@@ -1,0 +1,7 @@
+# Outbound HTTP goes through `http_client::send` / `.send_traced()`, so every
+# call gets a client span and (with `otel`) a `traceparent` — the header that
+# lets the service on the other end continue this trace. A bare `.send()` is a
+# call no trace can see and a downstream root that should have been a child.
+disallowed-methods = [
+    { path = "reqwest::RequestBuilder::send", reason = "use `.send_traced()` (hs_utils::http_client::SendTraced) so the call is traced and carries traceparent" },
+]

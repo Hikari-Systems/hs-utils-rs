@@ -70,6 +70,7 @@ use serde_json::Value;
 use tracing::Instrument as _;
 
 use crate::mcp_resource_server::kratos_resolver::KratosUserResolver;
+use crate::http_client::SendTraced as _;
 
 /// Default session TTL (24h) used by [`WebLogin::new`]'s in-memory store.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
@@ -207,6 +208,16 @@ pub trait WebSessionStore: Send + Sync {
     async fn load(&self, sid: &str) -> anyhow::Result<Option<Session>>;
     async fn store(&self, sid: &str, session: &Session) -> anyhow::Result<()>;
     async fn remove(&self, sid: &str) -> anyhow::Result<()>;
+
+    /// How many unexpired sessions the store holds — or, with
+    /// `written_within`, how many were written (logged in, or refreshed by a
+    /// request that wrote back) that recently. For the `hs.web_session.active`
+    /// gauge; `Ok(None)` when this store cannot answer that cheaply, which is
+    /// the default, so an implementation outside this crate need not change.
+    async fn count_active(&self, written_within: Option<Duration>) -> anyhow::Result<Option<u64>> {
+        let _ = written_within;
+        Ok(None)
+    }
 }
 
 /// In-process [`WebSessionStore`] (a `HashMap` with lazy TTL eviction). The
@@ -255,6 +266,15 @@ impl WebSessionStore for InMemorySessionStore {
             .unwrap()
             .insert(sid.to_string(), (session.clone(), Instant::now() + self.ttl));
         Ok(())
+    }
+
+    async fn count_active(&self, written_within: Option<Duration>) -> anyhow::Result<Option<u64>> {
+        // Every write sets expiry = write time + ttl, so "written within w" is
+        // "expires later than now + ttl − w".
+        let now = Instant::now();
+        let after = now + written_within.map_or(Duration::ZERO, |w| self.ttl.saturating_sub(w));
+        let n = self.map.lock().unwrap().values().filter(|(_, exp)| *exp > after).count();
+        Ok(Some(n as u64))
     }
 
     async fn remove(&self, sid: &str) -> anyhow::Result<()> {
@@ -469,7 +489,7 @@ pub async fn do_token_exchange(
             ("redirect_uri", redirect_uri),
             ("code", code),
         ])
-        .send()
+        .send_traced()
         .await?
         .error_for_status()?;
     Ok(resp.json::<TokenResponse>().await?)
@@ -489,7 +509,7 @@ pub async fn do_token_refresh(
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
         ])
-        .send()
+        .send_traced()
         .await?
         .error_for_status()?;
     Ok(resp.json::<TokenResponse>().await?)
@@ -506,7 +526,7 @@ pub async fn get_oauth_profile_by_token(
     let resp = http
         .get(profile_url)
         .bearer_auth(access_token)
-        .send()
+        .send_traced()
         .await?
         .error_for_status()?;
     Ok(resp.json::<Value>().await?)

@@ -168,6 +168,13 @@ impl std::fmt::Debug for SessionSetup {
 /// it was not compiled in, since a binary that cannot honour its config should
 /// say so at startup rather than serve traffic with the wrong store.
 pub async fn build_session_store(cfg: &SessionConfig) -> Result<SessionSetup> {
+    let setup = build_session_store_inner(cfg).await?;
+    #[cfg(feature = "otel")]
+    session_gauges::start(setup.store.clone(), setup.kind);
+    Ok(setup)
+}
+
+async fn build_session_store_inner(cfg: &SessionConfig) -> Result<SessionSetup> {
     let ttl = Duration::from_secs(cfg.ttl_secs.unwrap_or(DEFAULT_TTL_SECS) as u64);
 
     match cfg.store.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -247,6 +254,64 @@ async fn infer(cfg: &SessionConfig, ttl: Duration) -> Result<SessionSetup> {
          \"redis\" (or to \"memory\" to say this is deliberate and silence this)."
     );
     Ok(memory(ttl))
+}
+
+/// `hs.web_session.active{window=ttl|5m, session.store}`: refreshed by a task
+/// once a minute and read by the gauge at collection, since the count is a
+/// query and gauge callbacks are synchronous.
+///
+/// The count is store-wide, so every replica reports the same number: chart it
+/// with `MAX`, not `SUM`. A store that cannot answer (`count_active` → `None`),
+/// or a count that failed, reports nothing for that window rather than a zero
+/// that would read as "nobody is logged in".
+#[cfg(feature = "otel")]
+mod session_gauges {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::session_store::SessionStoreKind;
+    use crate::telemetry::Sample;
+    use crate::web_login::WebSessionStore;
+
+    const EVERY: Duration = Duration::from_secs(60);
+    const RECENT: Duration = Duration::from_secs(300);
+    /// "No reading": a count is never negative.
+    const NONE: i64 = -1;
+
+    pub(super) fn start(store: Arc<dyn WebSessionStore>, kind: SessionStoreKind) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let all = Arc::new(AtomicI64::new(NONE));
+        let recent = Arc::new(AtomicI64::new(NONE));
+        let (a, r) = (all.clone(), recent.clone());
+        crate::telemetry::register_gauges(Box::new(move |out| {
+            for (window, v) in [("ttl", &a), ("5m", &r)] {
+                let v = v.load(Ordering::Relaxed);
+                if v >= 0 {
+                    out.push(Sample {
+                        name: "hs.web_session.active",
+                        value: v as f64,
+                        attrs: vec![("window", window.to_string()), ("session.store", kind.as_str().to_string())],
+                    });
+                }
+            }
+        }));
+        rt.spawn(async move {
+            let set = |slot: &AtomicI64, r: anyhow::Result<Option<u64>>| match r {
+                Ok(Some(n)) => slot.store(i64::try_from(n).unwrap_or(i64::MAX), Ordering::Relaxed),
+                Ok(None) => slot.store(NONE, Ordering::Relaxed),
+                Err(e) => {
+                    slot.store(NONE, Ordering::Relaxed);
+                    tracing::debug!("session count for metrics failed: {e:#}");
+                }
+            };
+            loop {
+                set(&all, store.count_active(None).await);
+                set(&recent, store.count_active(Some(RECENT)).await);
+                tokio::time::sleep(EVERY).await;
+            }
+        });
+    }
 }
 
 fn memory(ttl: Duration) -> SessionSetup {

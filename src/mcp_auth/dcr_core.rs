@@ -9,6 +9,7 @@
 use serde_json::{json, Value};
 
 use super::config::HydraDcrProxyConfig;
+use crate::http_client::SendTraced as _;
 
 /// Wire-level response returned by `forward_register`. Framework adapters
 /// (actix, axum) translate this into their respective response types.
@@ -113,7 +114,7 @@ pub async fn forward_register(cfg: &HydraDcrProxyConfig, body: &[u8]) -> DcrResp
         .post(&cfg.upstream)
         .header("content-type", "application/json")
         .body(merged_body)
-        .send()
+        .send_traced()
         .await
     {
         Ok(r) => r,
@@ -197,7 +198,7 @@ async fn mark_skip_consent(cfg: &HydraDcrProxyConfig, client_id: &str) {
         .patch(&url)
         .header("content-type", "application/json")
         .body(patch.to_string())
-        .send()
+        .send_traced()
         .await
     {
         Ok(r) if r.status().is_success() => {

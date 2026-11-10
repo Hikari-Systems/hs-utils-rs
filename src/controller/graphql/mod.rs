@@ -5,11 +5,13 @@
 
 pub mod context;
 pub mod identity;
+pub mod otel_ext;
 pub mod terms;
 pub mod types;
 
 pub use context::{core_parts, gql_err, GqlContext};
 pub use identity::IdentityQuery;
+pub use otel_ext::OtelExtension;
 pub use terms::{TermsMutation, TermsQuery};
 pub use types::{
     CustomerPortalSession, Image, Plan, SubscriptionConfig, SubscriptionIntent, SubscriptionPlan,

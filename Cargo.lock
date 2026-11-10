@@ -1462,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "hs-utils"
-version = "0.36.2"
+version = "0.37.0"
 dependencies = [
  "actix-http",
  "actix-service",
@@ -1478,6 +1478,7 @@ dependencies = [
  "hmac 0.13.0",
  "http 1.4.0",
  "jsonwebtoken",
+ "log",
  "moka",
  "opentelemetry",
  "opentelemetry-otlp",

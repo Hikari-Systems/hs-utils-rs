@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 
 use crate::mcp_resource_server::kratos_resolver::ReqwestKratosFetcher;
+use crate::http_client::SendTraced as _;
 
 /// Owner/public profile resolved from a Kratos identity.
 #[derive(Debug, Clone)]
@@ -116,7 +117,7 @@ impl KratosAdmin {
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&Value::Object(body))
-            .send()
+            .send_traced()
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();

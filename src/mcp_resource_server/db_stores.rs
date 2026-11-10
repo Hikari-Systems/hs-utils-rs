@@ -27,6 +27,7 @@ use super::stores::{
     AsmCache, ClientRegistration, ClientStore, DcrRateLimitStore, JsonWebKeySet,
     JwksCacheEntry, JwksCacheStore,
 };
+use crate::http_client::SendTraced as _;
 
 pub const DEFAULT_MCP_DATA_SERVICE_URL: &str = "http://mcp-data-service:3000";
 
@@ -72,7 +73,7 @@ impl HttpTransport for ReqwestTransport {
         if let Some(b) = body {
             req = req.header("Content-Type", "application/json").json(&b);
         }
-        match req.send().await {
+        match req.send_traced().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let bytes = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();

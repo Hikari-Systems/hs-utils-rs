@@ -421,6 +421,25 @@ enum Backend {
 }
 
 impl RedisConn {
+    /// What a client span names as `server.address`: the node's host, or the
+    /// Sentinel master's name (the host behind it changes on failover). Never
+    /// the URL, which can carry the password.
+    pub(crate) fn peer(&self) -> String {
+        match &self.backend {
+            Backend::Sentinel { master_name, .. } => master_name.clone(),
+            Backend::Direct(client) => match &client.get_connection_info().addr {
+                redis::ConnectionAddr::Tcp(host, _) => host.clone(),
+                redis::ConnectionAddr::TcpTls { host, .. } => host.clone(),
+                redis::ConnectionAddr::Unix(_) => "unix".to_string(),
+            },
+        }
+    }
+
+    /// A client span for one redis command on this connection.
+    pub(crate) fn span(&self, command: &str) -> tracing::Span {
+        crate::telemetry::client_span("redis", command, &self.peer())
+    }
+
     /// A client for the current master. Sentinel re-resolves it each call so a
     /// failover is picked up without restarting; the direct path is the one
     /// node it was given.
@@ -621,9 +640,8 @@ impl RedisSessionStore {
 // live session on the strength of a write that never landed. The returned error
 // carries a fixed context string and the backend's own error as its source;
 // neither names the sid, per the invariant above.
-#[async_trait]
-impl WebSessionStore for RedisSessionStore {
-    async fn load(&self, sid: &str) -> Result<Option<Session>> {
+impl RedisSessionStore {
+    async fn load_untraced(&self, sid: &str) -> Result<Option<Session>> {
         let key = self.key(sid);
         let mut conn = match self.conn().await {
             Ok(c) => c,
@@ -666,7 +684,7 @@ impl WebSessionStore for RedisSessionStore {
         }
     }
 
-    async fn store(&self, sid: &str, session: &Session) -> Result<()> {
+    async fn store_untraced(&self, sid: &str, session: &Session) -> Result<()> {
         let key = self.key(sid);
         let json = match serde_json::to_string(session) {
             Ok(j) => j,
@@ -707,7 +725,7 @@ impl WebSessionStore for RedisSessionStore {
         Ok(())
     }
 
-    async fn remove(&self, sid: &str) -> Result<()> {
+    async fn remove_untraced(&self, sid: &str) -> Result<()> {
         let key = self.key(sid);
         // **This branch logged nothing at all**, so a logout during a redis
         // outage was entirely invisible: no line, and — before the trait was
@@ -739,6 +757,57 @@ impl WebSessionStore for RedisSessionStore {
             return Err(anyhow::Error::new(e).context("web_login redis remove"));
         }
         Ok(())
+    }
+}
+
+// Each operation in a client span (`redis GET` / `SET` / `DEL`), errored when it
+// fails. The sid is not on the span — the key embeds it — and the cause is
+// logged, scrubbed, inside.
+#[async_trait]
+impl WebSessionStore for RedisSessionStore {
+    async fn load(&self, sid: &str) -> Result<Option<Session>> {
+        crate::telemetry::traced(self.conn.span("GET"), self.load_untraced(sid)).await
+    }
+
+    async fn store(&self, sid: &str, session: &Session) -> Result<()> {
+        crate::telemetry::traced(self.conn.span("SET"), self.store_untraced(sid, session)).await
+    }
+
+    async fn remove(&self, sid: &str) -> Result<()> {
+        crate::telemetry::traced(self.conn.span("DEL"), self.remove_untraced(sid)).await
+    }
+
+    /// `SCAN MATCH <prefix>*` over the database, run by the metrics task once
+    /// a minute. Redis keeps no write time, so `written_within` is not
+    /// answerable cheaply: `Ok(None)` for it. The cost is one pass over the
+    /// db's keyspace in 1000-key steps; this store's db index is its own, so
+    /// that is the sessions plus whatever else shares the index.
+    async fn count_active(&self, written_within: Option<Duration>) -> Result<Option<u64>> {
+        if written_within.is_some() {
+            return Ok(None);
+        }
+        let span = self.conn.span("SCAN");
+        crate::telemetry::traced(span, async {
+            let mut conn = self.conn.conn().await?;
+            let pattern = format!("{}*", self.prefix);
+            let (mut cursor, mut n) = (0u64, 0u64);
+            loop {
+                let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(1000)
+                    .query_async(&mut conn)
+                    .await?;
+                n += keys.len() as u64;
+                if next == 0 {
+                    return Ok(Some(n));
+                }
+                cursor = next;
+            }
+        })
+        .await
     }
 }
 

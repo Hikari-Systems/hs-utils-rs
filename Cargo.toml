@@ -1,11 +1,11 @@
 [package]
 name = "hs-utils"
-version = "0.36.2"
+version = "0.37.0"
 edition = "2021"
 license = "Apache-2.0"
 
 [features]
-db = ["dep:sqlx"]
+db = ["dep:sqlx", "dep:log"]
 # Generic realtime pub/sub backplane (EventBus<E> + Postgres LISTEN/NOTIFY +
 # in-memory fallback). Needs a Postgres pool (db) and the Tokio runtime for the
 # background LISTEN task.
@@ -24,10 +24,13 @@ lock-postgres = ["lock", "web-login-postgres"]
 lock-redis = ["lock", "web-login-redis", "dep:uuid", "tokio/rt"]
 # Adds the axum Server-Sent Events helper (`pubsub::sse_stream`).
 pubsub-axum = ["pubsub", "dep:axum", "dep:tokio-stream"]
+# `http_client::send`: reqwest 0.12 with a client span (and, with `otel`, an
+# outbound `traceparent`). Every feature here that calls out over HTTP uses it.
+http-client = ["dep:reqwest"]
 web = ["dep:actix-web", "dep:actix-service", "dep:actix-http", "dep:futures-util"]
 # Framework-free RFC 7591 DCR proxy primitives. Pick an adapter feature below
 # to wire it into your HTTP framework of choice.
-mcp-auth = ["dep:reqwest"]
+mcp-auth = ["http-client"]
 mcp-auth-actix = ["mcp-auth", "web"]
 mcp-auth-axum = ["mcp-auth", "dep:axum"]
 # Full MCP resource-server stack: JWT verification, JWKS cache,
@@ -72,11 +75,16 @@ controller = ["web-login", "dep:async-graphql", "dep:async-graphql-axum", "dep:c
 # controller toolkit. Stripe is a hand-rolled reqwest client (no `stripe` crate);
 # hmac/sha2/hex back the webhook signature check.
 controller-payments = ["controller", "dep:hmac", "dep:sha2", "dep:hex"]
-# OpenTelemetry tracing (OTLP/http-protobuf → Honeycomb) bridged into the
-# existing `tracing` macros, plus W3C traceparent propagation helpers. Inert
+# OpenTelemetry tracing AND metrics (OTLP/http-protobuf → Honeycomb or a local
+# Collector) bridged into the existing `tracing` macros, plus W3C traceparent
+# propagation helpers. Metrics: request durations and in-flight counts (from the
+# server/client spans), DB pool, sessions, pub/sub, and process / cgroup / tokio
+# resource use (CPU, memory, I/O, pressure stall — the container's iowait). Inert
 # until `otel.enabled` is set in config, so enabling the feature alone cannot
 # change runtime behaviour.
 otel = [
+    "dep:tokio",
+    "tokio/rt",
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
@@ -88,6 +96,9 @@ otel = [
 # Adds `otel::axum_trace_layer()` — a tower-http TraceLayer emitting HTTP
 # semantic-convention attributes and adopting the inbound traceparent.
 otel-axum = ["otel", "dep:axum", "dep:tower-http"]
+# Adds `otel::actix_trace()` — actix-web middleware producing the same server
+# span as the axum layer (route-template names, redacted query, traceparent).
+otel-actix = ["otel", "web"]
 # Kratos post-flow webhook that ingests a provider avatar into image-service
 # (`POST /api/hooks/post-flow`). Needs axum, and reqwest/multipart to upload the
 # image. Nothing else.
@@ -102,7 +113,7 @@ otel-axum = ["otel", "dep:axum", "dep:tower-http"]
 # The cost was real: a service wanting Kratos avatar ingest had to compile an
 # entire Hydra login/consent provider it does not use (e.g. a service with no
 # `hydra` block that logs in through `web_login`).
-avatar-hook = ["dep:axum", "dep:reqwest", "reqwest/multipart"]
+avatar-hook = ["dep:axum", "http-client", "reqwest/multipart"]
 # Ory Hydra login/consent/logout provider bridge (axum). A reusable port of the
 # login-controller bridge: resolves the Kratos identity and accepts/rejects
 # Hydra login/consent/logout challenges via Hydra's admin API. Mount its router
@@ -112,12 +123,14 @@ avatar-hook = ["dep:axum", "dep:reqwest", "reqwest/multipart"]
 # surfaces as a claim the `pictureId` this hook writes), and keeping the
 # implication means anything already enabling `consent-bridge` still finds
 # `avatar_hook` where it expects it.
-consent-bridge = ["dep:axum", "dep:reqwest", "avatar-hook"]
+consent-bridge = ["dep:axum", "http-client", "avatar-hook"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# sqlx takes its statement-logging levels as `log::LevelFilter`.
+log = { version = "0.4", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "json"], optional = true }
@@ -152,7 +165,7 @@ hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 hex = { version = "0.4", optional = true }
 opentelemetry = { version = "0.32", optional = true }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "rt-tokio"], optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "rt-tokio"], optional = true }
 # Feature notes, each one load-bearing:
 #  * reqwest-BLOCKING-client — the SDK's batch span processor runs on a dedicated
 #    OS thread with no Tokio reactor, so the async client panics there ("there is
@@ -162,7 +175,7 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["t
 #  * internal-logs — routes the SDK's own export errors into `tracing`. Without it
 #    that failure, and the TLS one below, are completely silent.
 # TLS is NOT configured through an otlp feature here — see the `reqwest13` dep.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "internal-logs"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "internal-logs"], optional = true }
 tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"], optional = true }
 # opentelemetry-otlp pulls its OWN reqwest 0.13, which does NOT feature-unify with
 # the reqwest 0.12 the rest of this crate uses. Left alone that copy has no TLS
@@ -186,9 +199,12 @@ tower-http = { version = "0.6", default-features = false, features = ["trace"], 
 http = { version = "1", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util"] }
 # `ServiceExt::oneshot`, so the otel-axum tests can drive the REAL TraceLayer
 # instead of testing its helpers in isolation — a correct `redact_query` proves
 # nothing if `make_span` stops calling it. Already in the tree transitively via
 # axum/tower-http, so this adds no download.
 tower = { version = "0.5", features = ["util"] }
+# `InMemoryMetricExporter`, so the metrics tests read back what the real
+# provider produced rather than asserting on the instruments' construction.
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "testing"] }

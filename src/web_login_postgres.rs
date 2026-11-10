@@ -308,6 +308,22 @@ impl WebSessionStore for PgSessionStore {
         Ok(())
     }
 
+    /// One indexed count (`web_sessions_expires_at_idx`), run by the metrics
+    /// task once a minute — not per request. Every write sets
+    /// `expires_at = now() + ttl`, so "written within w" is
+    /// `expires_at > now() + (ttl − w)`.
+    async fn count_active(&self, written_within: Option<std::time::Duration>) -> Result<Option<u64>> {
+        let skip_secs = written_within.map_or(0, |w| (self.ttl_secs - w.as_secs() as i64).max(0));
+        let n: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {} WHERE expires_at > now() + ($1 * interval '1 second')",
+            self.table
+        ))
+        .bind(skip_secs)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Some(n.max(0) as u64))
+    }
+
     async fn remove(&self, sid: &str) -> Result<()> {
         let res = sqlx::query(&self.sql_remove)
             .bind(sid)

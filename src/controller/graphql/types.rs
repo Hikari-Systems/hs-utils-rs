@@ -10,6 +10,7 @@ use super::context::{core_parts, gql_err};
 use crate::controller::dates::iso_utc;
 use crate::controller::payment_data::{self, UserPaymentState};
 use crate::controller::services::CoreServices;
+use crate::http_client::SendTraced as _;
 
 // ── Image ─────────────────────────────────────────────────────────────────
 
@@ -29,7 +30,7 @@ async fn image_url(core: &CoreServices, image_id: &str, size: &str) -> Option<St
         .http
         .get(&url)
         .header("X-Api-Key", &core.cfg.image_service.api_key)
-        .send()
+        .send_traced()
         .await
         .ok()?;
     let json: Value = resp.json().await.ok()?;

@@ -1,0 +1,94 @@
+# OpenTelemetry Collector (contrib) for one spot-fleet EC2 host.
+#
+# Every hs service on the host exports here (otel.endpoint = http://<host>:4318,
+# otel.apiKeyRequired = false); this adds host and per-container metrics, tags
+# everything with the EC2 instance, and is the only process holding the
+# Honeycomb key. See README.md beside this file for how to run it.
+#
+# What each layer answers:
+#   services (hs-utils)  request latency, sessions, pool use, process CPU/memory,
+#                        container CPU throttling and pressure (its own iowait)
+#   hostmetrics          host CPU by state — `system.cpu.time{state=wait}` is
+#                        host iowait — memory, load, disks, filesystems, network
+#   docker_stats         per-container CPU, memory and block I/O, for containers
+#                        that are not hs services (redis, Kratos, Hydra …)
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+  hostmetrics:
+    # The host's /proc and /sys, mounted read-only at /hostfs.
+    root_path: /hostfs
+    collection_interval: 60s
+    scrapers:
+      cpu:
+        metrics:
+          # Off by default upstream; it is the per-state share (user, system,
+          # wait, steal …) without having to take a rate of system.cpu.time.
+          system.cpu.utilization:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      load: {}
+      disk: {}
+      filesystem:
+        exclude_mount_points:
+          mount_points: [/dev/*, /proc/*, /sys/*, /run/*, /var/lib/docker/*]
+          match_type: regexp
+      network: {}
+      paging: {}
+      processes: {}
+
+  docker_stats:
+    endpoint: unix:///var/run/docker.sock
+    collection_interval: 60s
+
+processors:
+  # First, so an export backlog sheds data instead of OOM-killing the Collector.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # host.id, cloud.availability_zone, host.type … on every span and metric, so
+  # "is it one instance?" is a group-by rather than a guess.
+  resourcedetection:
+    detectors: [env, ec2, system]
+    timeout: 5s
+    override: false
+
+  batch:
+    timeout: 5s
+
+  # Keep every errored or slow trace and a sample of the rest. Leave off until
+  # volume makes it worth it; when on, set the services' otel.sampleRatio to
+  # 1.0 so the decision is made here, with the whole trace in view.
+  # tail_sampling:
+  #   decision_wait: 10s
+  #   policies:
+  #     - { name: errors, type: status_code, status_code: { status_codes: [ERROR] } }
+  #     - { name: slow,   type: latency,     latency: { threshold_ms: 1000 } }
+  #     - { name: sample, type: probabilistic, probabilistic: { sampling_percentage: 10 } }
+
+exporters:
+  otlphttp/honeycomb:
+    endpoint: https://api.honeycomb.io
+    headers:
+      # From the fleet secret (put_fleet_secret_entry HONEYCOMB_API_KEY).
+      x-honeycomb-team: ${env:HONEYCOMB_API_KEY}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/honeycomb]
+    metrics:
+      receivers: [otlp, hostmetrics, docker_stats]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/honeycomb]

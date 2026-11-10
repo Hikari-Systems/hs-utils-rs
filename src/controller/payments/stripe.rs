@@ -10,6 +10,7 @@ use serde::Deserialize;
 use sha2::Sha256;
 
 use crate::controller::services::CoreServices;
+use crate::http_client::SendTraced as _;
 
 const API_BASE: &str = "https://api.stripe.com/v1";
 
@@ -176,7 +177,7 @@ pub async fn retrieve_price(core: &CoreServices, price_id: &str) -> Result<Strip
         .http
         .get(format!("{API_BASE}/prices/{price_id}"))
         .bearer_auth(secret(core))
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(err_for(resp, "prices.retrieve").await);
@@ -189,7 +190,7 @@ pub async fn retrieve_subscription(core: &CoreServices, id: &str) -> Result<Stri
         .http
         .get(format!("{API_BASE}/subscriptions/{id}"))
         .bearer_auth(secret(core))
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(err_for(resp, "subscriptions.retrieve").await);
@@ -207,7 +208,7 @@ pub async fn retrieve_subscription_value(
         .http
         .get(format!("{API_BASE}/subscriptions/{id}"))
         .bearer_auth(secret(core))
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(err_for(resp, "subscriptions.retrieve").await);
@@ -226,7 +227,7 @@ pub async fn list_subscriptions(
         .get(format!("{API_BASE}/subscriptions"))
         .query(&[("customer", customer), ("status", status)])
         .bearer_auth(secret(core))
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(err_for(resp, "subscriptions.list").await);
@@ -240,7 +241,7 @@ pub async fn cancel_subscription(core: &CoreServices, id: &str) -> Result<()> {
         .http
         .delete(format!("{API_BASE}/subscriptions/{id}"))
         .bearer_auth(secret(core))
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(err_for(resp, "subscriptions.cancel").await);
@@ -255,7 +256,7 @@ pub async fn create_customer(core: &CoreServices, user_id: &str) -> Result<Strin
         .post(format!("{API_BASE}/customers"))
         .bearer_auth(secret(core))
         .form(&form)
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(err_for(resp, "customers.create").await);
@@ -289,7 +290,7 @@ pub async fn create_subscription_with_trial(
         .post(format!("{API_BASE}/subscriptions"))
         .bearer_auth(secret(core))
         .form(&form)
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(err_for(resp, "subscriptions.create").await);
@@ -311,7 +312,7 @@ pub async fn create_billing_portal_session(
         .post(format!("{API_BASE}/billing_portal/sessions"))
         .bearer_auth(secret(core))
         .form(&form)
-        .send()
+        .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(err_for(resp, "billingPortal.sessions.create").await);

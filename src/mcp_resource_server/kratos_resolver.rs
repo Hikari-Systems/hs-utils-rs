@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::claims::{read_kratos_claims, OauthProfile};
+use crate::http_client::SendTraced as _;
 
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const CACHE_MAX_ENTRIES: u64 = 10_000;
@@ -100,7 +101,7 @@ impl ReqwestKratosFetcher {
             .client
             .get(&url)
             .header(reqwest::header::ACCEPT, "application/json")
-            .send()
+            .send_traced()
             .await
         {
             Ok(r) => r,
@@ -161,7 +162,7 @@ impl KratosIdentityFetcher for ReqwestKratosFetcher {
                 .client
                 .get(&url)
                 .header(reqwest::header::ACCEPT, "application/json")
-                .send()
+                .send_traced()
                 .await
             {
                 Ok(r) => r,

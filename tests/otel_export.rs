@@ -19,12 +19,19 @@ use std::time::Duration;
 
 use hs_utils::otel::{self, OtelConfig};
 
-/// Reads one HTTP request off `stream` and replies `200 OK`, returning the
-/// request line plus headers. Enough of a server for the exporter to talk to.
-fn serve_one(listener: TcpListener, tx: mpsc::Sender<String>) {
-    let Ok((mut stream, _)) = listener.accept() else {
-        return;
-    };
+/// Reads one HTTP request per connection and replies `200 OK`, sending each
+/// request line plus headers back. Enough of a server for the exporters (one
+/// connection each: the traces and the metrics exporter do not share a client).
+fn serve(listener: TcpListener, tx: mpsc::Sender<String>) {
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { return };
+        if serve_one(stream, &tx).is_err() {
+            return;
+        }
+    }
+}
+
+fn serve_one(mut stream: std::net::TcpStream, tx: &mpsc::Sender<String>) -> Result<(), mpsc::SendError<String>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     // Read until the headers are complete; we do not need the protobuf body,
@@ -46,9 +53,9 @@ fn serve_one(listener: TcpListener, tx: mpsc::Sender<String>) {
         .next()
         .unwrap_or_default()
         .to_string();
-    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     let _ = stream.flush();
-    let _ = tx.send(head);
+    tx.send(head)
 }
 
 #[test]
@@ -56,7 +63,7 @@ fn exports_spans_over_otlp_http() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub collector");
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || serve_one(listener, tx));
+    std::thread::spawn(move || serve(listener, tx));
 
     let cfg = OtelConfig {
         enabled: true,
@@ -65,6 +72,9 @@ fn exports_spans_over_otlp_http() {
         service_name: "otel-export-test".to_string(),
         environment: "test".to_string(),
         sample_ratio: 1.0,
+        // Every key added since is defaulted, which is how a consumer's
+        // literal must be written too (see CLAUDE.md, v0.37.0).
+        ..Default::default()
     };
 
     let mut guard = otel::init("info", &cfg).expect("otel init");
@@ -75,17 +85,31 @@ fn exports_spans_over_otlp_http() {
     // export has either happened or failed.
     guard.shutdown();
 
-    let head = rx
-        .recv_timeout(Duration::from_secs(20))
-        .expect("collector received no OTLP request — the exporter shipped nothing");
+    // Both exporters, in whichever order they flushed. Each one failing is
+    // silent at runtime, so each is asserted on its own.
+    let mut heads = Vec::new();
+    while heads.len() < 2 {
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(h) => heads.push(h),
+            Err(_) => break,
+        }
+    }
+    let find = |path: &str| heads.iter().find(|h| h.starts_with(&format!("POST {path} "))).cloned();
 
+    let traces = find("/v1/traces")
+        .unwrap_or_else(|| panic!("no POST to /v1/traces — the span exporter shipped nothing; got {heads:#?}"));
     assert!(
-        head.starts_with("POST /v1/traces "),
-        "expected a POST to /v1/traces, got:\n{head}"
+        traces.to_ascii_lowercase().contains("x-honeycomb-team: test-key"),
+        "ingest key was not sent as x-honeycomb-team:\n{traces}"
     );
+
+    let metrics = find("/v1/metrics")
+        .unwrap_or_else(|| panic!("no POST to /v1/metrics — the metric exporter shipped nothing; got {heads:#?}"));
+    let lower = metrics.to_ascii_lowercase();
+    assert!(lower.contains("x-honeycomb-team: test-key"), "metrics sent without the key:\n{metrics}");
     assert!(
-        head.to_ascii_lowercase().contains("x-honeycomb-team: test-key"),
-        "ingest key was not sent as x-honeycomb-team:\n{head}"
+        !lower.contains("x-honeycomb-dataset"),
+        "native OTLP metrics route themselves; the dataset header is opt-in:\n{metrics}"
     );
 }
 
@@ -99,4 +123,25 @@ fn disabled_config_defaults_to_off() {
     assert!(!cfg.enabled, "otel must be off unless explicitly enabled");
     assert_eq!(cfg.sample_ratio, 1.0);
     assert_eq!(cfg.endpoint, "https://api.honeycomb.io");
+    // The v0.37.0 keys: each unset one behaves as before.
+    assert!(cfg.level.is_empty(), "empty level means: export at the log level, as before");
+    assert!(cfg.api_key_required, "an empty key must still disable export by default");
+    assert!(cfg.metrics_dataset.is_empty());
+}
+
+/// The new keys arrive through the usual all-strings config tree.
+#[test]
+fn new_keys_deserialise_from_strings() {
+    let cfg: OtelConfig = serde_json::from_value(serde_json::json!({
+        "enabled": "true",
+        "level": "info,sqlx::query=debug",
+        "metricsEnabled": "false",
+        "metricsIntervalSecs": "15",
+        "processMetrics": "false",
+        "apiKeyRequired": "false"
+    }))
+    .unwrap();
+    assert_eq!(cfg.level, "info,sqlx::query=debug");
+    assert!(!cfg.metrics_enabled && !cfg.process_metrics && !cfg.api_key_required);
+    assert_eq!(cfg.metrics_interval_secs, 15);
 }

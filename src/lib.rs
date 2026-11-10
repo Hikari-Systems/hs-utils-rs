@@ -2,6 +2,13 @@ pub mod config;
 pub mod healthcheck;
 pub mod logging;
 
+// Span builders for outbound calls (HTTP, redis, Postgres locks and pub/sub, or a
+// service's own SMTP). Plain `tracing`, so always on; `otel` exports them.
+pub mod telemetry;
+
+#[cfg(feature = "http-client")]
+pub mod http_client;
+
 #[cfg(feature = "otel")]
 pub mod otel;
 

@@ -715,6 +715,13 @@ pub struct DbConfig {
     /// reaping), so the pool only ever grows toward `maxpool`.
     #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
     pub idletimeoutsecs: Option<u32>,
+    /// A statement slower than this many milliseconds is logged at WARN (target
+    /// `sqlx::query`, with the SQL text but never its bind values), so with
+    /// `otel` on it lands as a warning on the request's trace. Unset → sqlx's
+    /// own 1000 ms; 250 is a good value for an OLTP service. `0` turns the
+    /// slow-statement warning off. Every statement is still logged at DEBUG.
+    #[serde(default, deserialize_with = "deser_opt_u32_or_str")]
+    pub slowqueryms: Option<u32>,
     #[allow(dead_code)]
     #[serde(default, deserialize_with = "deser_opt_bool_or_str")]
     pub debug: Option<bool>,
