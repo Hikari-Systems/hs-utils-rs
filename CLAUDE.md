@@ -62,6 +62,16 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 
 ## Migrating consumers
 
+### v0.38.1 — `session_recording.id` on server spans
+
+**No compile break.** The axum and actix server spans record `session_recording.id` when the request carries
+`x-session-recording-id` (`otel::SESSION_RECORDING_HEADER`) holding a UUID; any other value is dropped. A UI
+whose pages are session-recorded sends its recording's id in that header (and a W3C `traceparent`, which the
+layers already adopt), so a recording and the traces it caused can be joined.
+
+**Not shown by the compiler:** a consumer whose UI calls it cross-origin must add the header to its CORS
+allow-list; same-origin calls need nothing.
+
 ### v0.38.0 — Stripe Tax: `stripe.automaticTax` and a billing address on `createSubscriptionIntent`
 
 **Compile break only for a struct literal:** `StripeConfig` gained `automatic_tax: bool`. A consumer that builds

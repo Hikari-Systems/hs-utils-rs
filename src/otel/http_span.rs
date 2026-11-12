@@ -25,6 +25,30 @@ pub(crate) struct Inbound<'a> {
     /// `HTTP/1.1` etc. — the `Debug` form of either `http` crate's `Version`.
     pub version: String,
     pub user_agent: Option<&'a str>,
+    /// The [`SESSION_RECORDING_HEADER`] value, if the request carried one.
+    pub session_recording: Option<&'a str>,
+}
+
+/// The header a browser page that is being session-recorded sends its
+/// recording's session id in, so the server span can carry it as
+/// `session_recording.id` and every request of one recorded session can be
+/// found in the traces. Not a credential: the id only opens a recording to
+/// its owner, signed in to the recording service.
+pub const SESSION_RECORDING_HEADER: &str = "x-session-recording-id";
+
+/// The header value if it is a session id, else `None`. Recording ids are
+/// UUIDs; anything else is dropped rather than recorded, since the header is
+/// caller-supplied and an attribute is billable bytes.
+pub(crate) fn session_recording_id(value: Option<&str>) -> Option<&str> {
+    let v = value?.trim();
+    let groups = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = v.split('-').collect();
+    let ok = parts.len() == groups.len()
+        && parts
+            .iter()
+            .zip(groups)
+            .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()));
+    ok.then_some(v)
 }
 
 /// The path a container's Docker healthcheck polls, every few seconds, on
@@ -70,11 +94,15 @@ pub(crate) fn server_span(req: Inbound<'_>, parent: opentelemetry::Context) -> t
                 network.protocol.version = %req.version,
                 user_agent.original = %user_agent,
                 http.response.status_code = tracing::field::Empty,
+                session_recording.id = tracing::field::Empty,
             )
         };
     }
     let span = if quiet { span_at!(debug_span) } else { span_at!(info_span) };
     record_route(&span, req.method, req.route);
+    if let Some(id) = session_recording_id(req.session_recording) {
+        span.record("session_recording.id", id);
+    }
     // Fails only when the subscriber has no OpenTelemetry layer (tracing
     // disabled) — in that case there is no parent to adopt and the local span
     // is still perfectly good, so this is not worth logging per request.

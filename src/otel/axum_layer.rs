@@ -45,6 +45,10 @@ fn make_span(req: &http::Request<axum::body::Body>) -> tracing::Span {
                 .headers()
                 .get(http::header::USER_AGENT)
                 .and_then(|v| v.to_str().ok()),
+            session_recording: req
+                .headers()
+                .get(super::http_span::SESSION_RECORDING_HEADER)
+                .and_then(|v| v.to_str().ok()),
         },
         super::extract_context(req.headers()),
     )
@@ -176,6 +180,40 @@ mod tests {
             .find(|(k, _)| k == "user_agent.original")
             .expect("user_agent.original should be recorded");
         assert!(ua.1.len() <= MAX_ATTR_LEN + 8, "user agent unbounded: {} bytes", ua.1.len());
+    }
+
+    /// A request from a session-recorded page carries the recording's id, and
+    /// the server span records it so the session's requests can be found in
+    /// the traces. A value that is not a UUID is caller-chosen bytes and is
+    /// dropped, not recorded.
+    #[tokio::test]
+    async fn the_session_recording_header_is_recorded_only_when_it_is_a_session_id() {
+        let fields: Fields = capture();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(fields.clone())),
+        );
+        let app = axum::Router::new()
+            .route("/api/x", axum::routing::get(|| async { "ok" }))
+            .layer(axum_trace_layer());
+
+        let id = "123e4567-e89b-42d3-a456-426614174000";
+        for value in [id, "not-a-session", &"a".repeat(4096)] {
+            let req = http::Request::builder()
+                .uri("/api/x")
+                .header(super::super::SESSION_RECORDING_HEADER, value)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let _ = app.clone().oneshot(req).await.unwrap();
+        }
+
+        let recorded: Vec<String> = fields
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k == "session_recording.id")
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(recorded, vec![id.to_string()], "only the UUID should be recorded");
     }
 
     /// Span names are the primary aggregation key, so they must not carry a

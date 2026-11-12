@@ -588,6 +588,8 @@ pub(crate) fn metrics_filter(meta: &tracing::Metadata<'_>) -> bool {
 
 #[cfg(any(feature = "otel-axum", feature = "otel-actix"))]
 mod http_span;
+#[cfg(any(feature = "otel-axum", feature = "otel-actix"))]
+pub use http_span::SESSION_RECORDING_HEADER;
 
 // Named `*_layer`, not `axum` / `actix`, so the module never shadows the crate
 // of the same name inside this one.

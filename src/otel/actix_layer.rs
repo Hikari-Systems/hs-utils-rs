@@ -87,6 +87,10 @@ where
                     .headers()
                     .get(actix_web::http::header::USER_AGENT)
                     .and_then(|v| v.to_str().ok()),
+                session_recording: req
+                    .headers()
+                    .get(super::http_span::SESSION_RECORDING_HEADER)
+                    .and_then(|v| v.to_str().ok()),
             },
             parent,
         );
