@@ -21,7 +21,11 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Verify a Stripe webhook signature and parse the event JSON (port of
 /// `stripe.webhooks.constructEvent`). `payload` is the raw request body.
-pub fn construct_event(payload: &[u8], sig_header: &str, secret: &str) -> Result<serde_json::Value> {
+pub fn construct_event(
+    payload: &[u8],
+    sig_header: &str,
+    secret: &str,
+) -> Result<serde_json::Value> {
     // Header form: `t=<ts>,v1=<sig>,v1=<sig2>,...`
     let mut timestamp: Option<i64> = None;
     let mut signatures: Vec<String> = Vec::new();
@@ -266,7 +270,8 @@ pub async fn create_customer(core: &CoreServices, user_id: &str) -> Result<Strin
 }
 
 /// Create a 7-day-trial incomplete subscription, expanding the pending setup
-/// intent (port of the `createSubscriptionIntent` Stripe call).
+/// intent (port of the `createSubscriptionIntent` Stripe call). No automatic
+/// tax: see [`create_subscription`].
 pub async fn create_subscription_with_trial(
     core: &CoreServices,
     customer: &str,
@@ -275,27 +280,181 @@ pub async fn create_subscription_with_trial(
     dest_uri: &str,
     plan: &str,
 ) -> Result<StripeSubscription> {
-    let form: Vec<(String, String)> = vec![
-        ("customer".into(), customer.into()),
-        ("items[0][price]".into(), price_id.into()),
-        ("payment_behavior".into(), "default_incomplete".into()),
-        ("trial_period_days".into(), "7".into()),
-        ("expand[0]".into(), "pending_setup_intent".into()),
-        ("metadata[user_id]".into(), user_id.into()),
-        ("metadata[dest_uri]".into(), dest_uri.into()),
-        ("metadata[plan]".into(), plan.into()),
-    ];
+    create_subscription(
+        core,
+        &NewSubscription {
+            customer,
+            price_id,
+            user_id,
+            dest_uri,
+            plan,
+            trial_days: 7,
+            automatic_tax: false,
+        },
+    )
+    .await
+}
+
+/// What [`create_subscription`] starts.
+pub struct NewSubscription<'a> {
+    pub customer: &'a str,
+    pub price_id: &'a str,
+    pub user_id: &'a str,
+    pub dest_uri: &'a str,
+    pub plan: &'a str,
+    /// 0 for none: the first period is then paid now, through a payment intent
+    /// on the latest invoice (not expanded here).
+    pub trial_days: u32,
+    /// `automatic_tax[enabled]`: the customer needs a tax-valid address first
+    /// ([`update_customer_address`]).
+    pub automatic_tax: bool,
+}
+
+impl NewSubscription<'_> {
+    fn form(&self) -> Vec<(String, String)> {
+        let mut form: Vec<(String, String)> = vec![
+            ("customer".into(), self.customer.into()),
+            ("items[0][price]".into(), self.price_id.into()),
+            ("payment_behavior".into(), "default_incomplete".into()),
+            ("expand[0]".into(), "pending_setup_intent".into()),
+            ("metadata[user_id]".into(), self.user_id.into()),
+            ("metadata[dest_uri]".into(), self.dest_uri.into()),
+            ("metadata[plan]".into(), self.plan.into()),
+        ];
+        if self.trial_days > 0 {
+            form.push(("trial_period_days".into(), self.trial_days.to_string()));
+        }
+        if self.automatic_tax {
+            form.push(("automatic_tax[enabled]".into(), "true".into()));
+        }
+        form
+    }
+}
+
+/// Create an incomplete subscription, expanding the pending setup intent.
+pub async fn create_subscription(
+    core: &CoreServices,
+    n: &NewSubscription<'_>,
+) -> Result<StripeSubscription> {
     let resp = core
         .http
         .post(format!("{API_BASE}/subscriptions"))
         .bearer_auth(secret(core))
-        .form(&form)
+        .form(&n.form())
         .send_traced()
         .await?;
     if !resp.status().is_success() {
         return Err(err_for(resp, "subscriptions.create").await);
     }
     Ok(resp.json().await?)
+}
+
+/// A billing address, as Stripe's Address Element gives it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BillingAddress {
+    pub name: Option<String>,
+    pub line1: String,
+    pub line2: Option<String>,
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub postal_code: Option<String>,
+    /// ISO 3166-1 alpha-2, e.g. `GB`.
+    pub country: String,
+}
+
+impl BillingAddress {
+    /// Trimmed, empty parts dropped, the country upper-cased; refused (with a
+    /// message fit for the person) when the country isn't a two-letter code,
+    /// there's no first line, or a part is over 200 characters.
+    pub fn tidied(&self) -> std::result::Result<Self, String> {
+        let tidy = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let out = Self {
+            name: tidy(&self.name),
+            line1: self.line1.trim().to_string(),
+            line2: tidy(&self.line2),
+            city: tidy(&self.city),
+            state: tidy(&self.state),
+            postal_code: tidy(&self.postal_code),
+            country: self.country.trim().to_ascii_uppercase(),
+        };
+        if out.country.len() != 2 || !out.country.chars().all(|c| c.is_ascii_uppercase()) {
+            return Err("the country must be a two-letter code (e.g. GB)".into());
+        }
+        if out.line1.is_empty() {
+            return Err("the address needs a first line".into());
+        }
+        let parts = [
+            out.name.as_deref(),
+            Some(out.line1.as_str()),
+            out.line2.as_deref(),
+            out.city.as_deref(),
+            out.state.as_deref(),
+            out.postal_code.as_deref(),
+        ];
+        if parts.into_iter().flatten().any(|p| p.chars().count() > 200) {
+            return Err("an address field is too long".into());
+        }
+        Ok(out)
+    }
+
+    /// The customers.update form fields; empty optional parts are cleared.
+    fn form(&self) -> Vec<(String, String)> {
+        let opt = |v: &Option<String>| v.as_deref().map(str::trim).unwrap_or("").to_string();
+        let mut f = vec![
+            ("address[line1]".to_string(), self.line1.trim().to_string()),
+            ("address[line2]".to_string(), opt(&self.line2)),
+            ("address[city]".to_string(), opt(&self.city)),
+            ("address[state]".to_string(), opt(&self.state)),
+            ("address[postal_code]".to_string(), opt(&self.postal_code)),
+            (
+                "address[country]".to_string(),
+                self.country.trim().to_string(),
+            ),
+        ];
+        if let Some(n) = self
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            f.push(("name".into(), n.into()));
+        }
+        f
+    }
+}
+
+/// Stripe's error code for an address it can't work out tax for.
+pub const TAX_LOCATION_INVALID: &str = "customer_tax_location_invalid";
+
+/// Save the customer's billing address. With `validate_for_tax`, Stripe
+/// refuses an address it can't work out tax for: the error's text then
+/// contains [`TAX_LOCATION_INVALID`].
+pub async fn update_customer_address(
+    core: &CoreServices,
+    customer: &str,
+    address: &BillingAddress,
+    validate_for_tax: bool,
+) -> Result<()> {
+    let mut form = address.form();
+    if validate_for_tax {
+        form.push(("tax[validate_location]".into(), "immediately".into()));
+    }
+    let resp = core
+        .http
+        .post(format!("{API_BASE}/customers/{customer}"))
+        .bearer_auth(secret(core))
+        .form(&form)
+        .send_traced()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(err_for(resp, "customers.update").await);
+    }
+    Ok(())
 }
 
 pub async fn create_billing_portal_session(
@@ -319,4 +478,78 @@ pub async fn create_billing_portal_session(
     }
     let s: UrlOnly = resp.json().await?;
     Ok(s.url)
+}
+
+#[cfg(test)]
+mod tax_tests {
+    use super::*;
+
+    #[test]
+    fn subscriptions_ask_for_tax_only_when_told() {
+        let mut n = NewSubscription {
+            customer: "cus_1",
+            price_id: "price_1",
+            user_id: "u",
+            dest_uri: "",
+            plan: "monthly",
+            trial_days: 7,
+            automatic_tax: false,
+        };
+        let has = |f: &[(String, String)], k: &str| f.iter().any(|(fk, _)| fk == k);
+        assert!(!has(&n.form(), "automatic_tax[enabled]"));
+        assert!(has(&n.form(), "trial_period_days"));
+        n.automatic_tax = true;
+        n.trial_days = 0;
+        assert!(has(&n.form(), "automatic_tax[enabled]"));
+        assert!(!has(&n.form(), "trial_period_days"));
+    }
+
+    #[test]
+    fn addresses_are_tidied_and_checked() {
+        let a = BillingAddress {
+            name: Some("  ".into()),
+            line1: " 1 High St ".into(),
+            line2: Some("".into()),
+            city: Some(" London".into()),
+            state: None,
+            postal_code: Some("SW1A 1AA".into()),
+            country: "gb".into(),
+        };
+        let t = a.tidied().unwrap();
+        assert_eq!(t.name, None);
+        assert_eq!(t.line1, "1 High St");
+        assert_eq!(t.line2, None);
+        assert_eq!(t.city.as_deref(), Some("London"));
+        assert_eq!(t.country, "GB");
+        assert!(BillingAddress {
+            country: "GBR".into(),
+            ..t.clone()
+        }
+        .tidied()
+        .is_err());
+        assert!(BillingAddress {
+            line1: " ".into(),
+            ..t.clone()
+        }
+        .tidied()
+        .is_err());
+        assert!(BillingAddress {
+            city: Some("x".repeat(201)),
+            ..t
+        }
+        .tidied()
+        .is_err());
+    }
+
+    #[test]
+    fn address_form_clears_missing_parts() {
+        let a = BillingAddress {
+            line1: "1 High St".into(),
+            country: "GB".into(),
+            ..Default::default()
+        };
+        let f = a.form();
+        assert!(f.contains(&("address[line2]".into(), String::new())));
+        assert!(!f.iter().any(|(k, _)| k == "name"));
+    }
 }

@@ -14,6 +14,6 @@ pub use identity::IdentityQuery;
 pub use otel_ext::OtelExtension;
 pub use terms::{TermsMutation, TermsQuery};
 pub use types::{
-    CustomerPortalSession, Image, Plan, SubscriptionConfig, SubscriptionIntent, SubscriptionPlan,
-    SubscriptionSrc, UserSrc,
+    BillingAddressInput, CustomerPortalSession, Image, Plan, SubscriptionConfig,
+    SubscriptionIntent, SubscriptionPlan, SubscriptionSrc, UserSrc,
 };

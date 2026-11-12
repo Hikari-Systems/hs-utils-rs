@@ -110,6 +110,37 @@ pub struct SubscriptionPlan {
 pub struct SubscriptionConfig {
     pub publishable_key: String,
     pub plans: Vec<SubscriptionPlan>,
+    /// Prices are before tax, which Stripe works out from the billing address:
+    /// `createSubscriptionIntent` then needs `address` (`stripe.automaticTax`).
+    pub automatic_tax: bool,
+}
+
+/// A billing address, as Stripe's Address Element gives it.
+#[derive(async_graphql::InputObject)]
+pub struct BillingAddressInput {
+    pub name: Option<String>,
+    pub line1: String,
+    pub line2: Option<String>,
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub postal_code: Option<String>,
+    /// ISO 3166-1 alpha-2, e.g. `GB`.
+    pub country: String,
+}
+
+#[cfg(feature = "controller-payments")]
+impl From<BillingAddressInput> for crate::controller::payments::stripe::BillingAddress {
+    fn from(a: BillingAddressInput) -> Self {
+        Self {
+            name: a.name,
+            line1: a.line1,
+            line2: a.line2,
+            city: a.city,
+            state: a.state,
+            postal_code: a.postal_code,
+            country: a.country,
+        }
+    }
 }
 
 #[derive(SimpleObject)]

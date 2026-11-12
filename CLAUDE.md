@@ -62,6 +62,26 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 
 ## Migrating consumers
 
+### v0.38.0 — Stripe Tax: `stripe.automaticTax` and a billing address on `createSubscriptionIntent`
+
+**Compile break only for a struct literal:** `StripeConfig` gained `automatic_tax: bool`. A consumer that builds
+`hs_utils::controller::StripeConfig { … }` field by field adds `automatic_tax` (or `..Default::default()`). Nothing
+else breaks; the compiler shows the one place.
+
+**Not shown by the compiler:**
+- `automaticTax` defaults to **false**: nothing about checkout changes until a consumer turns it on
+  (`stripe__automaticTax: "true"`, string or bool).
+- When it's on, `createSubscriptionIntent` **refuses a call without `address`**, so the UI must collect it first
+  (Stripe's Address Element, mode `billing`) and read `listSubscriptionPlans.automaticTax` to know. The address is
+  saved on the customer with `tax[validate_location]=immediately`; Stripe refusing it comes back as "We couldn't find
+  that address to work out tax: please check it".
+- Prices should be `tax_behavior: exclusive` (tax added on top); a price's tax behaviour can't be changed once set.
+- The Stripe account needs Tax set up (head office, a registration per country it charges tax in).
+
+New: `stripe::{create_subscription, NewSubscription, BillingAddress, update_customer_address, TAX_LOCATION_INVALID}`,
+`graphql::types::BillingAddressInput`, `SubscriptionConfig.automatic_tax`. `create_subscription_with_trial` is
+unchanged (no tax).
+
 ### v0.37.2 — quiet healthchecks, per-call span levels, session ids out of traces
 
 **Drop-in from v0.37.1:** bump the tag; nothing to change.

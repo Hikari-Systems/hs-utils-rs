@@ -46,6 +46,12 @@ pub struct StripeConfig {
     /// Map of plan name → Stripe price id (e.g. `{ monthly, annual }`).
     #[serde(default)]
     pub price_id: BTreeMap<String, String>,
+    /// Stripe Tax: prices are before tax, which Stripe works out from the
+    /// customer's billing address. `createSubscriptionIntent` then requires an
+    /// `address` (saved on the customer, location-validated), and the
+    /// subscription is created with `automatic_tax[enabled]`. Off by default.
+    #[serde(default, deserialize_with = "crate::config::deser_bool_or_str")]
+    pub automatic_tax: bool,
 }
 
 /// The configuration the toolkit's shared resolvers, clients and helpers read.

@@ -11,8 +11,8 @@ use chrono::{TimeZone, Utc};
 
 use super::graphql::context::{core_parts, gql_err};
 use super::graphql::types::{
-    CustomerPortalSession, Plan, SubscriptionConfig, SubscriptionIntent, SubscriptionPlan,
-    SubscriptionSrc,
+    BillingAddressInput, CustomerPortalSession, Plan, SubscriptionConfig, SubscriptionIntent,
+    SubscriptionPlan, SubscriptionSrc,
 };
 use super::payment_data;
 
@@ -55,18 +55,25 @@ impl PaymentsQuery {
             return Ok(SubscriptionConfig {
                 publishable_key,
                 plans: Vec::new(),
+                automatic_tax: core.cfg.stripe.automatic_tax,
             });
         }
         let mut plans = Vec::new();
         for (id, price_id) in configured {
-            let price = stripe::retrieve_price(core, &price_id).await.map_err(gql_err)?;
+            let price = stripe::retrieve_price(core, &price_id)
+                .await
+                .map_err(gql_err)?;
             let unit_amount = price.unit_amount.unwrap_or(0);
             let interval = price
                 .recurring
                 .as_ref()
                 .and_then(|r| r.interval.clone())
                 .unwrap_or_else(|| "month".into());
-            let interval_count = price.recurring.as_ref().and_then(|r| r.interval_count).unwrap_or(1);
+            let interval_count = price
+                .recurring
+                .as_ref()
+                .and_then(|r| r.interval_count)
+                .unwrap_or(1);
             let months_in_period = if interval == "year" {
                 12 * interval_count
             } else {
@@ -90,6 +97,7 @@ impl PaymentsQuery {
         Ok(SubscriptionConfig {
             publishable_key,
             plans,
+            automatic_tax: core.cfg.stripe.automatic_tax,
         })
     }
 }
@@ -99,14 +107,25 @@ pub struct PaymentsMutation;
 
 #[Object]
 impl PaymentsMutation {
+    /// Begin a 7-day trial. `address` (saved on the Stripe customer) is
+    /// required when `listSubscriptionPlans.automaticTax` is true.
     async fn create_subscription_intent(
         &self,
         ctx: &Context<'_>,
         dest_uri: Option<String>,
         plan: Plan,
+        address: Option<BillingAddressInput>,
     ) -> async_graphql::Result<Option<SubscriptionIntent>> {
         let (core, gctx) = core_parts(ctx)?;
         let user_id = gctx.require_user_id()?;
+        let automatic_tax = core.cfg.stripe.automatic_tax;
+        let address = match address {
+            Some(a) => Some(stripe::BillingAddress::from(a).tidied().map_err(err)?),
+            None if automatic_tax => {
+                return Err(err("A billing address is needed to work out tax"));
+            }
+            None => None,
+        };
         let plan_str = match plan {
             Plan::Annual => "annual",
             Plan::Monthly => "monthly",
@@ -125,23 +144,42 @@ impl PaymentsMutation {
                 .map_err(gql_err)?;
         let customer_id = match states.first().and_then(|s| s.customer_id.clone()) {
             Some(c) => c,
-            None => stripe::create_customer(core, user_id).await.map_err(gql_err)?,
+            None => stripe::create_customer(core, user_id)
+                .await
+                .map_err(gql_err)?,
         };
+        if let Some(a) = address.as_ref().filter(|_| automatic_tax) {
+            stripe::update_customer_address(core, &customer_id, a, true)
+                .await
+                .map_err(|e| {
+                    if format!("{e}").contains(stripe::TAX_LOCATION_INVALID) {
+                        err("We couldn't find that address to work out tax: please check it")
+                    } else {
+                        gql_err(e)
+                    }
+                })?;
+        }
 
         for sub_id in stripe::list_subscriptions(core, &customer_id, "incomplete")
             .await
             .map_err(gql_err)?
         {
-            stripe::cancel_subscription(core, &sub_id).await.map_err(gql_err)?;
+            stripe::cancel_subscription(core, &sub_id)
+                .await
+                .map_err(gql_err)?;
         }
 
-        let subscription = stripe::create_subscription_with_trial(
+        let subscription = stripe::create_subscription(
             core,
-            &customer_id,
-            &price_id,
-            user_id,
-            dest_uri.as_deref().unwrap_or(""),
-            plan_str,
+            &stripe::NewSubscription {
+                customer: &customer_id,
+                price_id: &price_id,
+                user_id,
+                dest_uri: dest_uri.as_deref().unwrap_or(""),
+                plan: plan_str,
+                trial_days: 7,
+                automatic_tax,
+            },
         )
         .await
         .map_err(gql_err)?;
@@ -161,19 +199,32 @@ impl PaymentsMutation {
     ) -> async_graphql::Result<Option<SubscriptionSrc>> {
         let (core, gctx) = core_parts(ctx)?;
         let user_id = gctx.require_user_id()?;
-        let sub = stripe::retrieve_subscription(core, &subscription_id).await.map_err(gql_err)?;
+        let sub = stripe::retrieve_subscription(core, &subscription_id)
+            .await
+            .map_err(gql_err)?;
         if sub.metadata.get("user_id").map(String::as_str) != Some(user_id) {
             return Err(err("Subscription does not belong to this user"));
         }
         if sub.status != "trialing" && sub.status != "active" {
-            return Err(err(format!("Cannot activate subscription with status: {}", sub.status)));
+            return Err(err(format!(
+                "Cannot activate subscription with status: {}",
+                sub.status
+            )));
         }
         let customer_id = sub.customer.clone();
-        let price_id = sub.items.data.first().map(|i| i.price.id.clone()).unwrap_or_default();
+        let price_id = sub
+            .items
+            .data
+            .first()
+            .map(|i| i.price.id.clone())
+            .unwrap_or_default();
         let plan = payment_data::plan_from_price_id(&core.cfg, &price_id);
         let paid_at = Utc::now();
         let expires_secs = sub.trial_end.or(sub.current_period_end).unwrap_or(0);
-        let expires_at = Utc.timestamp_opt(expires_secs, 0).single().unwrap_or(paid_at);
+        let expires_at = Utc
+            .timestamp_opt(expires_secs, 0)
+            .single()
+            .unwrap_or(paid_at);
         let product_id = core.cfg.stripe.product_id.clone().unwrap_or_default();
 
         let existing =
@@ -182,15 +233,31 @@ impl PaymentsMutation {
                 .map_err(gql_err)?;
         if let Some(id) = existing.first().and_then(|s| s.id.clone()) {
             payment_data::update_user_payment_state(
-                core, &id, user_id, &core.cfg.sku, &product_id, &price_id, paid_at, expires_at,
-                &customer_id, &plan, None,
+                core,
+                &id,
+                user_id,
+                &core.cfg.sku,
+                &product_id,
+                &price_id,
+                paid_at,
+                expires_at,
+                &customer_id,
+                &plan,
+                None,
             )
             .await
             .map_err(gql_err)?;
         } else {
             payment_data::add_user_payment_state(
-                core, user_id, &core.cfg.sku, &product_id, &price_id, paid_at, expires_at,
-                &customer_id, &plan,
+                core,
+                user_id,
+                &core.cfg.sku,
+                &product_id,
+                &price_id,
+                paid_at,
+                expires_at,
+                &customer_id,
+                &plan,
             )
             .await
             .map_err(gql_err)?;
