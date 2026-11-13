@@ -62,6 +62,22 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 
 ## Migrating consumers
 
+### v0.39.0 — quiet long polls: `set_quiet_paths` and `client_span_at`
+
+**Drop-in from v0.38.x:** bump the tag; nothing to change. (From v0.37.x, see v0.38.0 below.)
+
+New, opt-in, for calls that wait by design, whose span duration is the wait and which, as exported entry spans,
+set the service's p99:
+- **`otel::set_quiet_paths(&["/jobs/claim"])`:** exact request paths whose server span is `DEBUG`, the same as
+  `/healthcheck`. At `otel.level=info` the request and everything beneath it is not exported, and
+  `http.server.request.duration` still counts it by `http.route`. Call once, before serving.
+  To trace the work a poll does get, start a span with an explicit `parent: None`
+  (`tracing::info_span!(parent: None, "jobs.claim.granted")`). It starts a new sampled root trace, and the
+  quiet request's unsampled context does not apply to it.
+- **`telemetry::client_span_at(level, system, op, peer)`** (also `otel::client_span_at`): `client_span` at a
+  level. Use `DEBUG` for an SQS `ReceiveMessage` long poll or a blocking pop. `hs.client.operation.duration`
+  still counts it.
+
 ### v0.38.1 — `session_recording.id` on server spans
 
 **No compile break.** The axum and actix server spans record `session_recording.id` when the request carries

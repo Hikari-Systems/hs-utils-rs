@@ -448,7 +448,9 @@ pub(crate) fn inject_outbound_context(span: &tracing::Span, headers: &mut http::
 pub use crate::http_client::{send, send_at, send_opaque, send_opaque_at, send_with, TraceOptions};
 
 /// Client spans for other calls (SMTP, a queue); see [`crate::telemetry`].
-pub use crate::telemetry::{client_span, record_error, record_outcome, set_path_redactor};
+pub use crate::telemetry::{
+    client_span, client_span_at, record_error, record_outcome, set_path_redactor, set_quiet_paths,
+};
 
 /// One span per GraphQL operation (async-graphql), for a controller's schema;
 /// the same type as `controller::graphql::OtelExtension`.

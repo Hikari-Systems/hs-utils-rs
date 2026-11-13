@@ -59,8 +59,8 @@ pub(crate) const HEALTHCHECK_PATH: &str = "/healthcheck";
 /// The server span for one inbound request, adopting `parent` (the context
 /// extracted from its `traceparent`).
 ///
-/// A request for exactly [`HEALTHCHECK_PATH`] (any method) gets a `DEBUG`
-/// span: same name, same fields, so `http.server.request.duration` still
+/// A request for exactly [`HEALTHCHECK_PATH`], or a path installed with
+/// [`crate::telemetry::set_quiet_paths`] (any method), gets a `DEBUG` span: same name, same fields, so `http.server.request.duration` still
 /// counts it, but an `otel.level=info` export does not see it. Its children
 /// would then be orphans the export DOES see — new roots, one trace per poll
 /// — so the request is also marked for [`super::QuietLayer`], which makes an
@@ -77,7 +77,7 @@ pub(crate) fn server_span(req: Inbound<'_>, parent: opentelemetry::Context) -> t
     let path = truncate(&crate::telemetry::redact_path(req.path), MAX_ATTR_LEN);
     let query = redact_query(req.query);
     let user_agent = truncate(req.user_agent.unwrap_or_default(), MAX_ATTR_LEN);
-    let quiet = req.path == HEALTHCHECK_PATH;
+    let quiet = req.path == HEALTHCHECK_PATH || crate::telemetry::is_quiet_path(req.path);
     // A span's level is fixed at its callsite, so one callsite per level.
     macro_rules! span_at {
         ($mac:ident) => {

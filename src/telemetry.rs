@@ -129,19 +129,46 @@ const DB_SYSTEMS: &[&str] = &["redis", "postgresql"];
 ///   a metric label, so keep it to a handful of values. [`record_outcome`]
 ///   sets it.
 pub fn client_span(system: &str, operation: &str, peer: &str) -> tracing::Span {
-    let span = tracing::info_span!(
-        "client",
-        otel.name = %format!("{system} {operation}"),
-        otel.kind = "client",
-        otel.status_code = tracing::field::Empty,
-        client.system = %system,
-        client.operation = %operation,
-        server.address = %truncate(peer, MAX_ATTR_LEN),
-        client.target = tracing::field::Empty,
-        client.outcome = tracing::field::Empty,
-        db.system.name = tracing::field::Empty,
-        db.operation.name = tracing::field::Empty,
-    );
+    client_span_at(tracing::Level::INFO, system, operation, peer)
+}
+
+/// [`client_span`] at `level`. For a call that waits by design — an SQS
+/// `ReceiveMessage` long poll, a blocking `BRPOP` — whose duration is the wait,
+/// not the far end's latency: at `DEBUG` an `otel.level=info` export never
+/// sees it (so it is not a root span setting the service's p99), while
+/// `hs.client.operation.duration` still counts it, labelled by operation.
+/// `ERROR` and `WARN` are treated as `INFO`.
+pub fn client_span_at(
+    level: tracing::Level,
+    system: &str,
+    operation: &str,
+    peer: &str,
+) -> tracing::Span {
+    let name = format!("{system} {operation}");
+    let peer = truncate(peer, MAX_ATTR_LEN);
+    // A span's level is fixed at its callsite, so one callsite per level.
+    macro_rules! span_at {
+        ($mac:ident) => {
+            tracing::$mac!(
+                "client",
+                otel.name = %name,
+                otel.kind = "client",
+                otel.status_code = tracing::field::Empty,
+                client.system = %system,
+                client.operation = %operation,
+                server.address = %peer,
+                client.target = tracing::field::Empty,
+                client.outcome = tracing::field::Empty,
+                db.system.name = tracing::field::Empty,
+                db.operation.name = tracing::field::Empty,
+            )
+        };
+    }
+    let span = match level {
+        tracing::Level::TRACE => span_at!(trace_span),
+        tracing::Level::DEBUG => span_at!(debug_span),
+        _ => span_at!(info_span),
+    };
     if DB_SYSTEMS.contains(&system) {
         span.record("db.system.name", system);
         span.record("db.operation.name", operation);
@@ -206,6 +233,39 @@ pub fn set_path_redactor(redact: fn(&str) -> String) -> bool {
         tracing::warn!("otel path redactor already installed; the second one is ignored");
     }
     set
+}
+
+static QUIET_PATHS: std::sync::OnceLock<&'static [&'static str]> = std::sync::OnceLock::new();
+
+/// Install process-wide extra quiet paths: exact request paths whose server
+/// span is `DEBUG`, as `/healthcheck`'s always is — at `otel.level=info` the
+/// request and everything beneath it is not exported, while
+/// `http.server.request.duration` still counts it, labelled by `http.route`.
+///
+/// For a long poll (a route that holds the request open until there is work
+/// or a timeout): its span's duration is the hold, so as an exported entry
+/// span it sets the service's p99. When the poll does get work, the handler
+/// can still trace that work by starting a span with an explicit
+/// `parent: None` — a new root trace, which the quiet context does not touch.
+///
+/// Call it once, before serving; a second call is ignored (and returns
+/// `false`).
+///
+/// ```rust,ignore
+/// hs_utils::otel::set_quiet_paths(&["/jobs/claim"]);
+/// ```
+pub fn set_quiet_paths(paths: &'static [&'static str]) -> bool {
+    let set = QUIET_PATHS.set(paths).is_ok();
+    if !set {
+        tracing::warn!("otel quiet paths already installed; the second set is ignored");
+    }
+    set
+}
+
+/// Whether `path` is one of the [`set_quiet_paths`] paths.
+#[cfg_attr(not(any(feature = "otel-axum", feature = "otel-actix")), allow(dead_code))]
+pub(crate) fn is_quiet_path(path: &str) -> bool {
+    QUIET_PATHS.get().is_some_and(|ps| ps.contains(&path))
 }
 
 /// `path` as the server span may record it.
@@ -440,6 +500,23 @@ mod tests {
             levels,
             [tracing::Level::TRACE, tracing::Level::DEBUG, tracing::Level::INFO, tracing::Level::INFO].map(Some)
         );
+    }
+
+    /// `client_span_at` makes the span at the level asked for (`WARN`/`ERROR`
+    /// as `INFO`), with the same name and fields as `client_span`.
+    #[test]
+    fn client_span_at_takes_the_level_asked_for() {
+        let cap = crate::telemetry::test_capture::capture();
+        let _g = crate::telemetry::test_capture::install(&cap);
+        let levels = [tracing::Level::TRACE, tracing::Level::DEBUG, tracing::Level::INFO, tracing::Level::ERROR]
+            .map(|l| client_span_at(l, "sqs", "ReceiveMessage", "sqs.eu-west-2.amazonaws.com"))
+            .map(|s| s.metadata().map(|m| (*m.level(), m.name())));
+        assert_eq!(
+            levels,
+            [tracing::Level::TRACE, tracing::Level::DEBUG, tracing::Level::INFO, tracing::Level::INFO]
+                .map(|l| Some((l, CLIENT_SPAN)))
+        );
+        assert_eq!(client_span("sqs", "ReceiveMessage", "h").metadata().map(|m| *m.level()), Some(tracing::Level::INFO));
     }
 
     #[test]

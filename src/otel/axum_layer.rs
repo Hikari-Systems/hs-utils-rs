@@ -338,4 +338,49 @@ mod tests {
             );
         }
     }
+
+    /// A path installed with `set_quiet_paths` (a long poll) is quiet like
+    /// `/healthcheck`: at `info` its span and its children are not exported,
+    /// it is still counted, and work it does under an explicit `parent: None`
+    /// span is exported as a trace of its own.
+    #[tokio::test]
+    async fn a_quiet_path_is_not_exported_but_a_fresh_root_beneath_it_is() {
+        use tracing::Instrument;
+        crate::telemetry::set_quiet_paths(&["/test/long-poll"]);
+        let ex = crate::otel::test_export::install("info");
+        let app = axum::Router::new()
+            .route(
+                "/test/long-poll",
+                axum::routing::post(|| async {
+                    async { tracing::info!("waiting") }
+                        .instrument(tracing::info_span!("poll.child"))
+                        .await;
+                    // Work arrived: trace it on its own.
+                    async { tracing::info!("granted") }
+                        .instrument(tracing::info_span!(parent: None, "poll.granted"))
+                        .await;
+                    "ok"
+                }),
+            )
+            .layer(axum_trace_layer());
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/test/long-poll")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+
+        let spans = ex.finished();
+        let names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
+        assert_eq!(names, ["poll.granted"], "only the fresh root is exported");
+        let granted = &spans[0];
+        assert_eq!(granted.parent_span_id, opentelemetry::trace::SpanId::INVALID, "a root");
+        assert!(granted.span_context.is_sampled());
+        let p = ex.points();
+        assert_eq!(
+            crate::otel::metrics::tests::has(&p, "http.server.request.duration", ("http.route", "/test/long-poll")),
+            Some(1.0),
+            "{p:?}"
+        );
+    }
 }
