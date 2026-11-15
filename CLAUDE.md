@@ -62,6 +62,21 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 
 ## Migrating consumers
 
+### v0.40.1 — request spans and request metrics were being lost after database queries
+
+**Drop-in, and worth taking:** bump the tag; nothing to change. Every service using `actix_trace()` or
+`axum_trace_layer()` whose handlers run sqlx queries was losing most of its server spans and
+`http.server.request.duration` / `http.server.active_requests` counts. After 0.40.1 dashboards show the real
+request rate, which can be many times what they showed before.
+
+Why: `tracing-subscriber`'s per-layer filters keep each layer's last verdict in a thread-local, and a callsite
+every filter calls `Interest::always` skips the check and reuses whatever is left there. The INFO server span
+was the only such callsite. sqlx's per-statement `log::log_enabled!` (through the `tracing-log` bridge `init`
+installs) runs a check that no event follows, so the next request span on that worker thread inherited
+"every layer says no": created, but neither exported nor counted. The metrics layer's (internal)
+`MetricsFilter` now registers request and client spans as `Interest::sometimes`, so each is checked
+afresh. Regression test: `actix_layer::dangling_filter_pass`.
+
 ### v0.40.0 — bounded `server.address` on the outbound HTTP metric
 
 **Drop-in from v0.39.x:** bump the tag. Nothing has to change, but the `server.address` label on

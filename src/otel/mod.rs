@@ -359,8 +359,8 @@ pub fn init(level: &str, cfg: &OtelConfig) -> Result<OtelGuard> {
     };
 
     // The metrics layer sees this crate's request/client spans at any level
-    // whatever the log level says; nothing else.
-    let metrics_filter: fn(&tracing::Metadata<'_>) -> bool = metrics_filter;
+    // whatever the log level says; nothing else. See `MetricsFilter` for why
+    // it is not a plain `filter_fn`.
 
     tracing_subscriber::registry()
         .with(fmt_layer())
@@ -373,7 +373,7 @@ pub fn init(level: &str, cfg: &OtelConfig) -> Result<OtelGuard> {
                 .with_tracer(tracer)
                 .with_filter(export_filter(level, cfg)),
         )
-        .with(span_metrics.map(|m| m.with_filter(tracing_subscriber::filter::filter_fn(metrics_filter))))
+        .with(span_metrics.map(|m| m.with_filter(MetricsFilter)))
         .init();
 
     let instruments = meter.as_ref().map(|m| metrics::install(m, cfg.process_metrics));
@@ -587,6 +587,35 @@ pub(crate) fn metrics_filter(meta: &tracing::Metadata<'_>) -> bool {
         && matches!(meta.name(), SERVER_SPAN | HTTP_CLIENT_SPAN | CLIENT_SPAN)
 }
 
+/// The span-metrics layer's filter: [`metrics_filter`], with one difference
+/// from a plain `filter_fn` — it registers this crate's request and client
+/// spans as `Interest::sometimes`, not `always`.
+///
+/// That is not about cost. `tracing-subscriber`'s per-layer filters remember
+/// each layer's verdict on the last `enabled` check per thread, and an
+/// `Interest::always` callsite skips the check and uses whatever is left
+/// there. A check that no event follows — sqlx's per-statement
+/// `log::log_enabled!` through the `tracing-log` bridge, a `tracing::enabled!`
+/// — leaves its own verdicts behind, so the next request span on that worker
+/// thread was handed "every layer says no": neither exported nor counted.
+/// A `sometimes` callsite is checked afresh each time, so the span gets its
+/// own verdicts.
+pub(crate) struct MetricsFilter;
+
+impl<S> tracing_subscriber::layer::Filter<S> for MetricsFilter {
+    fn enabled(&self, meta: &tracing::Metadata<'_>, _: &tracing_subscriber::layer::Context<'_, S>) -> bool {
+        metrics_filter(meta)
+    }
+
+    fn callsite_enabled(&self, meta: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        if metrics_filter(meta) {
+            tracing::subscriber::Interest::sometimes()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+}
+
 // ── framework layers ────────────────────────────────────────────────────────
 
 #[cfg(any(feature = "otel-axum", feature = "otel-actix"))]
@@ -641,7 +670,6 @@ pub(crate) mod test_export {
             .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
             .build();
         let (meter, metrics) = super::metrics::tests::provider();
-        let filter: fn(&tracing::Metadata<'_>) -> bool = super::metrics_filter;
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::registry()
                 .with(super::quiet_layer())
@@ -650,10 +678,7 @@ pub(crate) mod test_export {
                         .with_tracer(provider.tracer("test"))
                         .with_filter(EnvFilter::new(level)),
                 )
-                .with(
-                    super::metrics::SpanMetrics::new(&meter)
-                        .with_filter(tracing_subscriber::filter::filter_fn(filter)),
-                ),
+                .with(super::metrics::SpanMetrics::new(&meter).with_filter(super::MetricsFilter)),
         );
         Export { spans, meter, metrics, _guard }
     }

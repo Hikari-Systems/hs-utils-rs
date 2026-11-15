@@ -426,3 +426,61 @@ mod tests {
         assert_eq!(names, ["GET /healthcheck/deep", "GET /healthchecks"]);
     }
 }
+
+/// A filter pass nobody consumes — `log::log_enabled!` through the
+/// `tracing-log` bridge (sqlx's query logger does one per statement), or a
+/// `tracing::enabled!` — must not hide the next request from the export or
+/// the metrics.
+#[cfg(test)]
+mod dangling_filter_pass {
+    use super::*;
+    use actix_web::{test, web, App, HttpResponse};
+
+    /// What `LogTracer::enabled` does for sqlx's `log_enabled!(Debug)`.
+    fn log_enabled_debug() {
+        let span = tracing::debug_span!(target: "sqlx::query", "log record");
+        let meta = span.metadata().expect("a disabled span keeps its metadata");
+        let _ = tracing::dispatcher::get_default(|d| d.enabled(meta));
+    }
+
+    /// sqlx's per-statement check at its default (DEBUG) level: every filter says no.
+    async fn after_log_enabled() -> HttpResponse {
+        log_enabled_debug();
+        HttpResponse::Ok().finish()
+    }
+
+    /// Only the export says yes.
+    async fn after_enabled_macro() -> HttpResponse {
+        let _ = tracing::enabled!(target: "sqlx::query", tracing::Level::INFO);
+        HttpResponse::Ok().finish()
+    }
+
+    #[actix_web::test]
+    async fn every_request_is_exported_and_counted_after_a_dangling_enabled_check() {
+        let ex = crate::otel::test_export::install("info");
+        let app = test::init_service(
+            App::new()
+                .wrap(actix_trace())
+                .route("/a", web::get().to(after_log_enabled))
+                .route("/b", web::get().to(after_enabled_macro)),
+        )
+        .await;
+        for path in ["/a", "/b"] {
+            for _ in 0..5 {
+                let r = test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
+                assert_eq!(r.status(), 200);
+            }
+        }
+        let finished = ex.finished();
+        let points = ex.points();
+        let got = |path: &str| {
+            let name = format!("GET {path}");
+            (
+                finished.iter().filter(|s| s.name == name).count(),
+                crate::otel::metrics::tests::has(&points, "http.server.request.duration", ("http.route", path)),
+            )
+        };
+        assert_eq!([got("/a"), got("/b")], [(5, Some(5.0)), (5, Some(5.0))], "(spans exported, requests counted) per route");
+    }
+}
+
