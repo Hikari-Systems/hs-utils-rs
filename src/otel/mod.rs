@@ -436,7 +436,24 @@ pub(crate) fn inject_outbound_context(span: &tracing::Span, headers: &mut http::
     use opentelemetry::trace::TraceContextExt as _;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     let own = span.context();
-    let cx = if own.span().span_context().is_valid() { own } else { opentelemetry::Context::current() };
+    let cx = if own.span().span_context().is_valid() {
+        own
+    } else {
+        let current = opentelemetry::Context::current();
+        // A deliberately quiet call (a DEBUG/TRACE client span: a polling
+        // loop's claim, lease or long poll) made with no trace around it, as
+        // a background loop's are: with nothing to continue, say "not
+        // sampled", so the service called drops its side of the poll too
+        // rather than opening a sampled root trace for every one. An INFO call
+        // with no context still sends nothing, so a caller with tracing off
+        // leaves the callee's own sampling decision alone.
+        let quiet = span.metadata().is_some_and(|m| *m.level() > tracing::Level::INFO);
+        if !current.span().span_context().is_valid() && quiet {
+            unsampled_context()
+        } else {
+            current
+        }
+    };
     global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&cx, &mut HeaderInjector(headers));
     });
@@ -531,17 +548,37 @@ thread_local! {
 /// (a per-thread guard stack, pushed on enter and popped on exit).
 pub(crate) struct QuietLayer;
 
-type MetaFilter = tracing_subscriber::filter::FilterFn<fn(&tracing::Metadata<'_>) -> bool>;
-
 /// [`QuietLayer`], seeing only the server spans it may have to act on.
-pub(crate) fn quiet_layer<S>() -> tracing_subscriber::filter::Filtered<QuietLayer, MetaFilter, S>
+pub(crate) fn quiet_layer<S>() -> tracing_subscriber::filter::Filtered<QuietLayer, QuietFilter, S>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
-    let only_server_spans: fn(&tracing::Metadata<'_>) -> bool = |meta| {
-        meta.is_span() && meta.name() == crate::telemetry::SERVER_SPAN && meta.target().starts_with("hs_utils")
-    };
-    QuietLayer.with_filter(tracing_subscriber::filter::filter_fn(only_server_spans))
+    QuietLayer.with_filter(QuietFilter)
+}
+
+fn is_server_span(meta: &tracing::Metadata<'_>) -> bool {
+    meta.is_span() && meta.name() == crate::telemetry::SERVER_SPAN && meta.target().starts_with("hs_utils")
+}
+
+/// [`QuietLayer`]'s filter: server spans only, registered as
+/// `Interest::sometimes` for the same reason as [`MetricsFilter`]. With the
+/// metrics layer off (`otel.metricsEnabled=false`) this is the filter that
+/// keeps the server span's callsite from being `always` in every layer, which
+/// would let stale per-layer verdicts hide request spans again.
+pub(crate) struct QuietFilter;
+
+impl<S> tracing_subscriber::layer::Filter<S> for QuietFilter {
+    fn enabled(&self, meta: &tracing::Metadata<'_>, _: &tracing_subscriber::layer::Context<'_, S>) -> bool {
+        is_server_span(meta)
+    }
+
+    fn callsite_enabled(&self, meta: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        if is_server_span(meta) {
+            tracing::subscriber::Interest::sometimes()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
 }
 
 fn unsampled_context() -> opentelemetry::Context {
@@ -682,6 +719,26 @@ pub(crate) mod test_export {
                         .with_filter(EnvFilter::new(level)),
                 )
                 .with(super::metrics::SpanMetrics::new(&meter).with_filter(super::MetricsFilter)),
+        );
+        Export { spans, meter, metrics, _guard }
+    }
+
+    /// [`install`] without the span-metrics layer, as `init` builds it with
+    /// `otel.metricsEnabled=false`.
+    pub(crate) fn install_without_metrics(level: &str) -> Export {
+        opentelemetry::global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
+        let spans = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
+            .build();
+        let (meter, metrics) = super::metrics::tests::provider();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(super::quiet_layer()).with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(provider.tracer("test"))
+                    .with_filter(EnvFilter::new(level)),
+            ),
         );
         Export { spans, meter, metrics, _guard }
     }

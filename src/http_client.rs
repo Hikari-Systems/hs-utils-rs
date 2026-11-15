@@ -348,6 +348,48 @@ mod tests {
         );
     }
 
+    /// A background loop's quiet call (DEBUG client span, no trace around it)
+    /// tells the service it calls not to sample, so that service doesn't open
+    /// a sampled root trace per poll. An INFO call with no trace around it
+    /// still starts its own sampled trace, as before.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_quiet_call_with_no_trace_around_it_sends_not_sampled() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::{layer::SubscriberExt, Layer as _};
+
+        opentelemetry::global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
+        let _g = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(provider.tracer("test"))
+                    .with_filter(tracing_subscriber::EnvFilter::new("info")),
+            ),
+        );
+        let client = reqwest::Client::new();
+        let traceparent = |req: &str| -> Option<String> {
+            req.lines().find(|l| l.starts_with("traceparent:")).map(|l| l.trim_end().to_string())
+        };
+
+        for level in [Level::DEBUG, Level::TRACE] {
+            let (base, srv) = hop().await;
+            let _ = client.get(format!("{base}/claim")).send_traced_at(level).await.unwrap();
+            let tp = traceparent(&srv.await.unwrap()).expect("a quiet call must still send traceparent");
+            assert!(tp.ends_with("-00"), "{level}: a quiet call with no context must say not sampled: {tp}");
+        }
+
+        let (base, srv) = hop().await;
+        let _ = client.get(format!("{base}/work")).send_traced().await.unwrap();
+        let tp = traceparent(&srv.await.unwrap()).expect("an exported INFO call sends its own context");
+        assert!(tp.ends_with("-01"), "an INFO call starts a sampled trace of its own: {tp}");
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1, "only the INFO call is exported");
+        assert!(tp.contains(&spans[0].span_context.trace_id().to_string()), "{tp} is not the exported span's trace");
+    }
+
     /// Through the real export layer at `info`: a DEBUG client span is not
     /// exported, and the `traceparent` it sends is its caller's, so the far
     /// end still continues the caller's trace.

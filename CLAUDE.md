@@ -62,6 +62,21 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 
 ## Migrating consumers
 
+### v0.40.2 — quiet polls with no trace send "not sampled"; the metrics-off filter gap closed
+
+**Drop-in from v0.40.1:** bump the tag; nothing to change.
+- A DEBUG/TRACE outbound call (`send_traced_at(Level::DEBUG)`, the level for polling loops' claims, leases
+  and long polls) made with **no trace around it** now sends `traceparent: …-00`. The service called then
+  does not export its side of each poll as a sampled root trace. Before, it sent no `traceparent` at all,
+  so every background poll became one root trace in the callee. An INFO call with no context is unchanged
+  (it starts its own sampled trace), and a quiet call inside an exported span still continues it (`-01`).
+  Expect a drop in root traces on services that are polled.
+- With `otel.metricsEnabled=false` the v0.40.1 fix did not apply, because the metrics layer carrying
+  `MetricsFilter` is not installed. The quiet layer's filter now also registers the server span as
+  `Interest::sometimes`, so request spans survive stale filter state with metrics off too. Regression tests:
+  `http_client::tests::a_quiet_call_with_no_trace_around_it_sends_not_sampled`,
+  `otel::filter_state_tests::metrics_off`.
+
 ### v0.40.1 — request spans and request metrics were being lost after database queries
 
 **Drop-in, and worth taking:** bump the tag; nothing to change. Every service using `actix_trace()` or

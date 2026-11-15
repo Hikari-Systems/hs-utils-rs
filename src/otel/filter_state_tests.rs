@@ -229,3 +229,38 @@ mod client {
         }
     }
 }
+
+/// With the metrics layer off (`otel.metricsEnabled=false`) no layer is left
+/// whose filter is `sometimes`, unless the quiet layer's is: the same stale
+/// verdicts must not hide request spans from the export.
+#[cfg(feature = "otel-actix")]
+mod metrics_off {
+    use super::*;
+    use actix_web::{test, web, App, HttpResponse};
+
+    #[actix_web::test]
+    async fn request_spans_are_exported_whatever_poisons_the_filter_state() {
+        for p in POISONS {
+            for when in WHENS {
+                let case = format!("metrics off {p:?} {when:?}");
+                let ex = test_export::install_without_metrics("info");
+                let handler = move || async move {
+                    if matches!(when, When::InHandler) {
+                        poison(p);
+                    }
+                    HttpResponse::Ok().finish()
+                };
+                let app = test::init_service(App::new().wrap(crate::otel::actix_trace()).route("/work", web::get().to(handler))).await;
+                for _ in 0..N {
+                    if matches!(when, When::Between) {
+                        poison(p);
+                    }
+                    let r = test::call_service(&app, test::TestRequest::get().uri("/work").to_request()).await;
+                    assert_eq!(r.status(), 200, "{case}");
+                }
+                let work = ex.finished().iter().filter(|s| s.name == "GET /work").count();
+                assert_eq!(work, N, "{case}: server spans exported");
+            }
+        }
+    }
+}
