@@ -639,6 +639,9 @@ pub use actix_layer::{actix_trace, ActixTrace, ActixTraceMiddleware};
 /// layer behind an `EnvFilter`, span metrics behind [`metrics_filter`] — but
 /// exporting to memory, for the framework layers' tests.
 #[cfg(all(test, any(feature = "otel-axum", feature = "otel-actix")))]
+mod filter_state_tests;
+
+#[cfg(all(test, any(feature = "otel-axum", feature = "otel-actix")))]
 pub(crate) mod test_export {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
