@@ -12,6 +12,9 @@
 //!   response status is known, so an SSE stream is not one enormous request.
 //! * `http.server.active_requests` (up-down) — `http.request.method`.
 //! * `http.client.request.duration` (s) — method, `server.address`, status.
+//!   `server.address` is bounded: in-cluster names, pinned hosts and the first
+//!   [`crate::telemetry::MAX_METRIC_PEERS`] dotted hosts by name, the rest
+//!   `other` (see [`crate::telemetry::set_metric_peer_hosts`]).
 //! * `hs.client.operation.duration` (s) — `client.system`, `client.operation`,
 //!   `client.outcome`: redis, locks (the lock-wait histogram; `busy` is an
 //!   outcome), pub/sub, a service's own SMTP.
@@ -290,6 +293,31 @@ pub(crate) struct SpanMetrics {
     active: UpDownCounter<i64>,
     client_http_duration: Histogram<f64>,
     client_duration: Histogram<f64>,
+    peers: PeerLabels,
+}
+
+/// Bounds the `server.address` label on `http.client.request.duration`; see
+/// [`crate::telemetry::set_metric_peer_hosts`]. Spans are not affected.
+#[derive(Default)]
+struct PeerLabels {
+    admitted: Mutex<std::collections::HashSet<String>>,
+}
+
+impl PeerLabels {
+    fn label(&self, host: &str) -> String {
+        if host.is_empty() || !host.contains('.') || crate::telemetry::is_pinned_metric_peer(host) {
+            return host.to_string();
+        }
+        let mut admitted = self.admitted.lock().unwrap_or_else(|e| e.into_inner());
+        if admitted.contains(host) {
+            return host.to_string();
+        }
+        if admitted.len() < crate::telemetry::MAX_METRIC_PEERS {
+            admitted.insert(host.to_string());
+            return host.to_string();
+        }
+        "other".to_string()
+    }
 }
 
 impl SpanMetrics {
@@ -311,6 +339,7 @@ impl SpanMetrics {
                 .build(),
             client_http_duration: hist("http.client.request.duration", "Outbound HTTP request duration"),
             client_duration: hist("hs.client.operation.duration", "Outbound call duration (redis, locks, pub/sub, SMTP …), by outcome"),
+            peers: PeerLabels::default(),
         }
     }
 
@@ -379,7 +408,7 @@ where
             SpanKind::HttpClient => {
                 let mut a = vec![
                     KeyValue::new("http.request.method", f.method.clone().unwrap_or_default()),
-                    KeyValue::new("server.address", f.address.clone().unwrap_or_default()),
+                    KeyValue::new("server.address", self.peers.label(f.address.as_deref().unwrap_or_default())),
                 ];
                 match f.status {
                     Some(s) => a.push(KeyValue::new("http.response.status_code", s)),
@@ -538,6 +567,40 @@ pub(crate) mod tests {
         let p = points(&provider, &exporter);
         assert_eq!(has(&p, "http.server.request.duration", ("http.route", "/healthcheck")), Some(1.0), "{p:?}");
         assert_eq!(has(&p, "http.client.request.duration", ("server.address", "poller")), Some(1.0), "{p:?}");
+    }
+
+    /// `server.address` on the client metric is bounded: in-cluster names
+    /// always, then the first MAX_METRIC_PEERS dotted hosts, the rest `other`.
+    #[test]
+    fn client_metric_peer_label_is_bounded() {
+        let labels = PeerLabels::default();
+        assert_eq!(labels.label("user-data-service"), "user-data-service");
+        assert_eq!(labels.label(""), "");
+        for i in 0..crate::telemetry::MAX_METRIC_PEERS {
+            let host = format!("site{i}.example.org");
+            assert_eq!(labels.label(&host), host, "within the cap");
+        }
+        assert_eq!(labels.label("one-more.example.org"), "other");
+        assert_eq!(labels.label("site0.example.org"), "site0.example.org", "an admitted host keeps its label");
+        assert_eq!(labels.label("another-service"), "another-service", "dotless names are never capped");
+    }
+
+    #[test]
+    fn client_metric_records_bounded_peer() {
+        let (provider, exporter) = provider();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanMetrics::new(&provider)));
+        for i in 0..(crate::telemetry::MAX_METRIC_PEERS + 5) {
+            let host = format!("feed{i}.example.net");
+            drop(tracing::info_span!(
+                "http.client",
+                http.request.method = "GET",
+                server.address = host.as_str(),
+                http.response.status_code = 200u16,
+            ));
+        }
+        let p = points(&provider, &exporter);
+        assert_eq!(has(&p, "http.client.request.duration", ("server.address", "other")), Some(5.0), "{p:?}");
+        assert_eq!(has(&p, "http.client.request.duration", ("server.address", "feed0.example.net")), Some(1.0), "{p:?}");
     }
 
     /// Another crate's span named like ours is not ours.

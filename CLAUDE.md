@@ -62,6 +62,21 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 
 ## Migrating consumers
 
+### v0.40.0 — bounded `server.address` on the outbound HTTP metric
+
+**Drop-in from v0.39.x:** bump the tag. Nothing has to change, but the `server.address` label on
+`http.client.request.duration` is now bounded:
+- A dotless host (an in-cluster service name such as `user-data-service`) is always labelled by name.
+- The first `MAX_METRIC_PEERS` (20) distinct dotted hosts a process calls are labelled by name; every later
+  one is labelled `other`. A process that fetches arbitrary sites used to grow a set of histogram series per
+  site, each exported for the life of the process.
+- **`otel::set_metric_peer_hosts(&["api.example.com", ".example.org"])`** pins hosts that keep their own
+  label whatever order they are first seen in: an exact host, or `.suffix` for that host and any subdomain.
+  Call once at startup, before the first outbound call. Pin the external APIs whose latency a dashboard
+  breaks out.
+
+Spans are unchanged: `server.address` on a client span is always the real host.
+
 ### v0.39.0 — quiet long polls: `set_quiet_paths` and `client_span_at`
 
 **Drop-in from v0.38.x:** bump the tag; nothing to change. (From v0.37.x, see v0.38.0 below.)

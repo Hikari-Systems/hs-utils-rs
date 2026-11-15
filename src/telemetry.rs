@@ -268,6 +268,64 @@ pub(crate) fn is_quiet_path(path: &str) -> bool {
     QUIET_PATHS.get().is_some_and(|ps| ps.contains(&path))
 }
 
+static METRIC_PEER_HOSTS: std::sync::OnceLock<&'static [&'static str]> = std::sync::OnceLock::new();
+
+/// How many distinct dotted hosts `http.client.request.duration` labels by
+/// name in one process before recording further ones as `other`.
+pub const MAX_METRIC_PEERS: usize = 20;
+
+/// Pin hosts that `http.client.request.duration` always labels by name: an
+/// exact host, or a suffix starting with `.` (`.example.com` matches that host
+/// and any subdomain). Spans keep the real `server.address` whatever is set.
+///
+/// Without pins, a dotless host (an in-cluster service name such as
+/// `user-data-service`) is always labelled by name, and the first
+/// [`MAX_METRIC_PEERS`] distinct dotted hosts a process calls are too; any
+/// host after those is labelled `other`. Every distinct label is a set of
+/// histogram series exported for the life of the process, so a service that
+/// fetches arbitrary sites (crawlers, feed readers) would otherwise grow one
+/// series set per site. Pin the external APIs whose latency you want broken
+/// out so they keep their own label whatever order hosts are first seen in.
+///
+/// Call once at startup, before the first outbound call. Returns `false` (and
+/// logs) if pins were already installed; the second set is ignored.
+pub fn set_metric_peer_hosts(hosts: &'static [&'static str]) -> bool {
+    let set = METRIC_PEER_HOSTS.set(hosts).is_ok();
+    if !set {
+        tracing::warn!("metric peer hosts already installed; the second set is ignored");
+    }
+    set
+}
+
+/// Whether `host` is pinned by [`set_metric_peer_hosts`].
+#[cfg_attr(not(feature = "otel"), allow(dead_code))]
+pub(crate) fn is_pinned_metric_peer(host: &str) -> bool {
+    METRIC_PEER_HOSTS.get().is_some_and(|hs| hs.iter().any(|p| pin_matches(p, host)))
+}
+
+/// `pattern` is an exact host, or `.suffix` for the suffix's own host and any
+/// subdomain of it.
+fn pin_matches(pattern: &str, host: &str) -> bool {
+    match pattern.strip_prefix('.') {
+        Some(suffix) => host == suffix || host.ends_with(pattern),
+        None => host == pattern,
+    }
+}
+
+#[cfg(test)]
+mod metric_peer_tests {
+    use super::pin_matches;
+
+    #[test]
+    fn pins_match_exact_hosts_and_dot_suffixes() {
+        assert!(pin_matches("api.example.com", "api.example.com"));
+        assert!(!pin_matches("api.example.com", "x.api.example.com"));
+        assert!(pin_matches(".example.com", "example.com"));
+        assert!(pin_matches(".example.com", "a.b.example.com"));
+        assert!(!pin_matches(".example.com", "notexample.com"));
+    }
+}
+
 /// `path` as the server span may record it.
 pub(crate) fn redact_path(path: &str) -> String {
     match PATH_REDACTOR.get() {

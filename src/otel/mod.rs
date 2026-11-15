@@ -449,7 +449,8 @@ pub use crate::http_client::{send, send_at, send_opaque, send_opaque_at, send_wi
 
 /// Client spans for other calls (SMTP, a queue); see [`crate::telemetry`].
 pub use crate::telemetry::{
-    client_span, client_span_at, record_error, record_outcome, set_path_redactor, set_quiet_paths,
+    client_span, client_span_at, record_error, record_outcome, set_metric_peer_hosts, set_path_redactor, set_quiet_paths,
+    MAX_METRIC_PEERS,
 };
 
 /// One span per GraphQL operation (async-graphql), for a controller's schema;
