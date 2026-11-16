@@ -287,6 +287,7 @@ struct GenAiFields {
     duration_s: Option<f64>,
     ttft_s: Option<f64>,
     tokens_per_second: Option<f64>,
+    cost_usd: Option<f64>,
 }
 
 impl tracing::field::Visit for Fields {
@@ -325,6 +326,7 @@ impl tracing::field::Visit for Fields {
             "hs.gen_ai.duration_s" => self.genai.duration_s = Some(v),
             "gen_ai.response.time_to_first_chunk" => self.genai.ttft_s = Some(v),
             "hs.gen_ai.output_tokens_per_second" => self.genai.tokens_per_second = Some(v),
+            "hs.gen_ai.cost_usd" => self.genai.cost_usd = Some(v),
             _ => {}
         }
     }
@@ -358,6 +360,7 @@ pub(crate) struct SpanMetrics {
     genai_tokens: Histogram<f64>,
     genai_ttft: Histogram<f64>,
     genai_throughput: Histogram<f64>,
+    genai_cost: Counter<f64>,
     peers: PeerLabels,
     models: ModelLabels,
 }
@@ -451,6 +454,11 @@ impl SpanMetrics {
                 .with_description("Output tokens per second of generation (whole call when not streamed)")
                 .with_boundaries(GENAI_THROUGHPUT_BUCKETS.to_vec())
                 .build(),
+            genai_cost: m
+                .f64_counter("hs.gen_ai.client.cost")
+                .with_unit("USD")
+                .with_description("What GenAI calls cost, as the provider reports it (OpenRouter usage.cost)")
+                .build(),
             peers: PeerLabels::default(),
             models: ModelLabels::default(),
         }
@@ -490,6 +498,9 @@ impl SpanMetrics {
         }
         if let Some(r) = g.tokens_per_second {
             self.genai_throughput.record(r, &a);
+        }
+        if let Some(c) = g.cost_usd.filter(|c| c.is_finite() && *c >= 0.0) {
+            self.genai_cost.add(c, &a);
         }
         for (kind, n) in [("input", g.input_tokens), ("output", g.output_tokens)] {
             if let Some(n) = n.filter(|n| *n >= 0) {
@@ -785,6 +796,31 @@ pub(crate) mod tests {
         assert_eq!(has(&p, "gen_ai.client.operation.duration", ("error.type", "throttled")), Some(1.0));
         assert_eq!(has(&p, "gen_ai.client.token.usage", ("hs.gen_ai.task", "chat.turn")), None, "a failed call has no tokens");
         assert_eq!(has(&p, "gen_ai.client.operation.time_to_first_chunk", ("hs.gen_ai.task", "chat.turn")), None);
+        assert_eq!(has(&p, "hs.gen_ai.client.cost", ("hs.gen_ai.task", "graph.extract")), None, "no cost reported, no point");
+    }
+
+    /// A reported cost sums into `hs.gen_ai.client.cost`, by task and model.
+    #[test]
+    fn genai_cost_sums_into_a_counter() {
+        use crate::genai::{operation, provider, GenAiCall, Usage};
+        let (provider_, exporter) = provider();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanMetrics::new(&provider_)));
+        for cost in [0.25, 0.5] {
+            let mut call = GenAiCall::start(operation::CHAT, provider::OPENROUTER, "z-ai/glm-x", "calendar.extract", false);
+            call.finish(&Usage { output_tokens: Some(10), cost_usd: Some(cost), upstream_provider: Some("Z.AI".into()), ..Default::default() });
+            drop(call);
+        }
+        let p = points(&provider_, &exporter);
+        let sum = p.iter().find(|(n, _, a)| {
+            n == "hs.gen_ai.client.cost"
+                && a.contains(&("hs.gen_ai.task".into(), "calendar.extract".into()))
+                && a.contains(&("gen_ai.provider.name".into(), "openrouter".into()))
+        });
+        assert_eq!(sum.map(|(_, v, _)| *v), Some(0.75), "{p:?}");
+        assert!(
+            !p.iter().any(|(_, _, a)| a.iter().any(|(k, _)| k == "hs.gen_ai.upstream_provider")),
+            "the upstream host is never a metric label"
+        );
     }
 
     /// The model label is bounded like `server.address`: the first

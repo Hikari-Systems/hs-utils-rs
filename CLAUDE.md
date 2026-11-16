@@ -33,7 +33,7 @@ src/
   server.rs        — run() wrapping HttpServer
   session_store.rs — build_session_store(): the session store, plus locks() / event_bus() on its database
   lock.rs          — LockManager / LockGuard: named locks (Postgres advisory, or in-process)
-  genai.rs         — feature `otel`: GenAiCall (span + log line per GenAI call: tokens, TTFT, throughput,
+  genai.rs         — GenAiCall (span + log line per GenAI call: tokens, cost, TTFT, throughput,
                      model, provider, task); the metrics layer turns it into gen_ai.client.* metrics
   telemetry.rs     — always on: client_span / record_outcome / record_error, query redaction, and the
                      metrics facade (count, up_down, register_gauges) the feature-gated modules call
@@ -63,6 +63,21 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 ---
 
 ## Migrating consumers
+
+### v0.42.0 — `genai::Usage` reports cost and the upstream host
+
+**No compile break for `..Default::default()` users:** `genai::Usage` gains `cost_usd: Option<f64>` and
+`upstream_provider: Option<String>`. **Compile break:** a `Usage { .. }` literal that names every field without
+`..Default::default()` must add the two (or the default).
+
+- **Span:** `hs.gen_ai.cost_usd` (the provider-reported charge in USD, e.g. OpenRouter's `usage.cost`) and
+  `hs.gen_ai.upstream_provider` (the host a router picked, e.g. OpenRouter's `provider`), both on the
+  `gen_ai call finished` line too.
+- **Metric:** `hs.gen_ai.client.cost` (counter, `USD`), same labels as `gen_ai.client.token.usage` minus
+  `gen_ai.token.type`. Only calls that report a cost add to it. The upstream host is never a metric label.
+
+**Not shown by the compiler:** nothing records a cost unless the caller fills `cost_usd`; Bedrock and
+Anthropic responses carry none, so their spend still comes from tokens × price.
 
 ### v0.41.0 — spans only with `otel`; `genai::GenAiCall` for every GenAI call
 

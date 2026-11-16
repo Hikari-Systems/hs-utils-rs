@@ -48,6 +48,11 @@
 //!   for a stream, over total time otherwise (so it includes the prompt read).
 //! * `hs.gen_ai.provider_latency_s` — the provider's own figure, when it sends
 //!   one (Bedrock's `metrics.latencyMs`).
+//! * `hs.gen_ai.cost_usd` — what the provider says the call cost, in USD, when
+//!   it reports one (OpenRouter's `usage.cost`). Also the
+//!   `hs.gen_ai.client.cost` counter.
+//! * `hs.gen_ai.upstream_provider` — the host a router sent the call to
+//!   (OpenRouter's `provider`). Span only: it is not a metric label.
 //! * `hs.gen_ai.result` — the caller's verdict on the reply, set any time
 //!   before the call is dropped: `ok`, `empty`, `unparseable`, … .
 //!
@@ -109,6 +114,12 @@ pub struct Usage {
     pub response_model: Option<String>,
     /// The provider's own latency figure, when it sends one.
     pub provider_latency: Option<Duration>,
+    /// What the provider says the call cost, in USD, when it reports one
+    /// (OpenRouter's `usage.cost`).
+    pub cost_usd: Option<f64>,
+    /// The host a router picked to serve the call (OpenRouter's `provider`,
+    /// e.g. `DeepInfra`), when the provider is a router.
+    pub upstream_provider: Option<String>,
 }
 
 /// One GenAI call in flight. Create it just before the request, put the
@@ -163,6 +174,8 @@ impl GenAiCall {
             hs.gen_ai.generation_s = Empty,
             hs.gen_ai.output_tokens_per_second = Empty,
             hs.gen_ai.provider_latency_s = Empty,
+            hs.gen_ai.cost_usd = Empty,
+            hs.gen_ai.upstream_provider = Empty,
             )
         };
         Self {
@@ -225,6 +238,12 @@ impl GenAiCall {
         if let Some(p) = usage.provider_latency {
             s.record("hs.gen_ai.provider_latency_s", p.as_secs_f64());
         }
+        if let Some(c) = usage.cost_usd.filter(|c| c.is_finite()) {
+            s.record("hs.gen_ai.cost_usd", c);
+        }
+        if let Some(u) = &usage.upstream_provider {
+            s.record("hs.gen_ai.upstream_provider", truncate_label(u).as_str());
+        }
         t.record(s);
         tracing::info!(
             parent: s,
@@ -235,6 +254,8 @@ impl GenAiCall {
             hs.gen_ai.duration_s = t.total,
             hs.gen_ai.ingestion_s = t.ingestion,
             hs.gen_ai.output_tokens_per_second = t.tokens_per_second,
+            hs.gen_ai.cost_usd = usage.cost_usd,
+            hs.gen_ai.upstream_provider = usage.upstream_provider.as_deref(),
             "gen_ai call finished"
         );
     }
@@ -388,6 +409,27 @@ mod tests {
         assert!(get(&rec, "gen_ai.response.time_to_first_chunk").is_some(), "{rec:?}");
         assert!(get(&rec, "hs.gen_ai.duration_s").is_some());
         assert_eq!(get(&rec, "error.type"), None, "a finished call is not an error");
+        assert_eq!(get(&rec, "hs.gen_ai.cost_usd"), None, "no cost reported, none recorded");
+    }
+
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
+    #[test]
+    fn a_routed_call_records_its_cost_and_upstream_host() {
+        let cap = crate::telemetry::test_capture::capture();
+        let _g = crate::telemetry::test_capture::install(&cap);
+        let mut call = GenAiCall::start(operation::CHAT, provider::OPENROUTER, "qwen/qwen3-next-80b-a3b-instruct", "calendar.extract", false);
+        call.finish(&Usage {
+            input_tokens: Some(1000),
+            output_tokens: Some(100),
+            cost_usd: Some(0.00042),
+            upstream_provider: Some("DeepInfra".into()),
+            ..Default::default()
+        });
+        drop(call);
+        let rec = cap.lock().unwrap().clone();
+        assert_eq!(get(&rec, "gen_ai.provider.name").as_deref(), Some("openrouter"));
+        assert_eq!(get(&rec, "hs.gen_ai.cost_usd").as_deref(), Some("0.00042"));
+        assert_eq!(get(&rec, "hs.gen_ai.upstream_provider").as_deref(), Some("DeepInfra"));
     }
 
     #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
