@@ -618,10 +618,11 @@ where
 /// at ANY level — a `DEBUG` healthcheck or polling call is still a request to
 /// count — and nothing else (it ignores everything else anyway).
 pub(crate) fn metrics_filter(meta: &tracing::Metadata<'_>) -> bool {
+    use crate::genai::GENAI_SPAN;
     use crate::telemetry::{CLIENT_SPAN, HTTP_CLIENT_SPAN, SERVER_SPAN};
     meta.is_span()
         && meta.target().starts_with("hs_utils")
-        && matches!(meta.name(), SERVER_SPAN | HTTP_CLIENT_SPAN | CLIENT_SPAN)
+        && matches!(meta.name(), SERVER_SPAN | HTTP_CLIENT_SPAN | CLIENT_SPAN | GENAI_SPAN)
 }
 
 /// The span-metrics layer's filter: [`metrics_filter`], with one difference

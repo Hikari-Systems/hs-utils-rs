@@ -56,6 +56,9 @@ fn operation_label(name: Option<&str>) -> &str {
 #[async_graphql::async_trait::async_trait]
 impl Extension for OtelExtension {
     async fn execute(&self, ctx: &ExtensionContext<'_>, operation_name: Option<&str>, next: NextExecute<'_>) -> Response {
+        if !crate::telemetry::EMIT_SPANS {
+            return next.run(ctx, operation_name).await;
+        }
         let label = operation_label(operation_name);
         let span = tracing::info_span!(
             "graphql",
@@ -79,6 +82,8 @@ impl Extension for OtelExtension {
 
 #[cfg(test)]
 mod tests {
+    // Some helpers serve only the span-field tests, which need `otel`.
+    #![cfg_attr(not(feature = "otel"), allow(dead_code, unused_imports))]
     use super::*;
     use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
 
@@ -103,6 +108,7 @@ mod tests {
         assert_eq!(operation_label(Some("9lives")), "<anonymous>");
     }
 
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
     #[tokio::test]
     async fn an_operation_gets_a_named_span_with_its_error_count() {
         let cap = crate::telemetry::test_capture::capture();

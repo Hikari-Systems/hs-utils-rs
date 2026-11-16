@@ -26,7 +26,8 @@
 //! `#[tokio::test]`s would interleave their fields into one capture; the drives
 //! are sequential and the capture is cleared between them, so a `rfind` cannot
 //! read the previous drive's value.
-#![cfg(feature = "web-login")]
+// Spans exist only with `otel` (`telemetry::EMIT_SPANS`).
+#![cfg(all(feature = "web-login", feature = "otel"))]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

@@ -237,6 +237,8 @@ fn kind(e: &reqwest::Error) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    // Some helpers serve only the span-field tests, which need `otel`.
+    #![cfg_attr(not(feature = "otel"), allow(dead_code, unused_imports))]
     use super::*;
     use crate::telemetry::test_capture::{capture, install};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -257,6 +259,7 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
     #[tokio::test]
     async fn records_the_status_and_redacts_the_query() {
         let cap = capture();
@@ -283,7 +286,9 @@ mod tests {
         let err = send(reqwest::Client::new().get("http://127.0.0.1:9/x?token=SECRET")).await;
         assert!(err.is_err());
         let rec = cap.lock().unwrap().clone();
-        assert!(rec.iter().any(|(k, v)| k == "otel.status_code" && v == "ERROR"));
+        if crate::telemetry::EMIT_SPANS {
+            assert!(rec.iter().any(|(k, v)| k == "otel.status_code" && v == "ERROR"));
+        }
         assert!(rec.iter().any(|(k, v)| k == "error" && v == "connect"), "{rec:?}");
         assert!(!rec.iter().any(|(_, v)| v.contains("SECRET")), "{rec:?}");
     }
@@ -303,6 +308,7 @@ mod tests {
     }
 
     /// `send_traced_at(DEBUG)` is below an INFO filter; `send_traced()` is not.
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
     #[tokio::test]
     async fn send_traced_at_debug_is_a_debug_span() {
         use tracing_subscriber::{layer::SubscriberExt, Layer as _};
@@ -329,6 +335,7 @@ mod tests {
     }
 
     /// `send_traced_with(path)` records the template, never the id.
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
     #[tokio::test]
     async fn send_traced_with_a_path_records_the_template() {
         let cap = capture();

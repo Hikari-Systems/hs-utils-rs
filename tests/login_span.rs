@@ -21,7 +21,8 @@
 //! `set_default` is thread-local, so a unit test sharing a binary with tests
 //! that drive `callback` without a subscriber can cache `Interest::never` for
 //! this callsite and then pass vacuously. Its own binary, one global subscriber.
-#![cfg(feature = "web-login")]
+// Spans exist only with `otel` (`telemetry::EMIT_SPANS`).
+#![cfg(all(feature = "web-login", feature = "otel"))]
 
 use std::sync::{Arc, Mutex};
 

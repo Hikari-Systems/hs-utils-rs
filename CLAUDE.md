@@ -33,6 +33,8 @@ src/
   server.rs        — run() wrapping HttpServer
   session_store.rs — build_session_store(): the session store, plus locks() / event_bus() on its database
   lock.rs          — LockManager / LockGuard: named locks (Postgres advisory, or in-process)
+  genai.rs         — feature `otel`: GenAiCall (span + log line per GenAI call: tokens, TTFT, throughput,
+                     model, provider, task); the metrics layer turns it into gen_ai.client.* metrics
   telemetry.rs     — always on: client_span / record_outcome / record_error, query redaction, and the
                      metrics facade (count, up_down, register_gauges) the feature-gated modules call
   http_client.rs   — send() / SendTraced / TraceOptions: reqwest 0.12 in a client span (a level, a
@@ -61,6 +63,62 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 ---
 
 ## Migrating consumers
+
+### v0.41.0 — spans only with `otel`; `genai::GenAiCall` for every GenAI call
+
+**No compile break from v0.40.2:** bump the tag. Every public item is still there in every feature set.
+
+**Span emission is gated at build time on `otel`** (`telemetry::EMIT_SPANS = cfg!(feature = "otel")`). Without
+`otel`, `client_span`, `client_span_at`, the outbound HTTP span, the GraphQL operation span, `auth.login`,
+`auth.gate` and `GenAiCall`'s span all hand back `Span::none()`; `record`, `record_outcome` and `.instrument`
+on it are no-ops. Log events are not gated. Measured in release, with the subscriber `otel::init` installs when
+`otel.enabled=false`: a client span (create, enter, record, drop) costs ~750 ns with `otel` compiled (unchanged
+from v0.40.2) and ~1 ns without it (it was ~750 ns there too).
+
+**Not shown by the compiler (services built without `otel` only):** their stdout lines lose the span prefixes
+the fmt layer printed, e.g. `auth.gate{auth.gate.outcome=… auth.redirect.reason=…}:`. Each event keeps its own
+fields, so a redirect refusal still logs its reason once, on the event; `auth.gate.session.load_failed`, which
+is a span field and never a log line, is no longer visible anywhere without `otel`. A service that greps its
+stdout for a span prefix should adopt `otel` (it can stay `otel.enabled=false`) to keep it.
+
+**`genai::GenAiCall`**, callable in every build:
+
+New: `hs_utils::genai::{GenAiCall, Usage, provider, operation}`. Around each model call:
+`GenAiCall::start(operation, provider, model, task, streaming)`, put the request (and its transport span, via
+`call.span().in_scope(..)`) inside `call.span()`, call `first_chunk()` on a stream's first content chunk, then
+`finish(&Usage { .. })` or `fail(error_type)`, and `result(verdict)` once the reply is parsed. Dropped
+unfinished, it records `error.type = cancelled`.
+
+- **Span** `gen_ai`, named `{operation} {model}`: the OpenTelemetry GenAI attributes (`gen_ai.provider.name`,
+  `gen_ai.request.model`, `gen_ai.request.stream`, `gen_ai.usage.*`, `gen_ai.response.finish_reasons`,
+  `gen_ai.response.time_to_first_chunk`) plus `hs.gen_ai.task`, `hs.gen_ai.result`, `hs.gen_ai.duration_s`
+  (total), `hs.gen_ai.ingestion_s` / `hs.gen_ai.generation_s` (streams only), `hs.gen_ai.output_tokens_per_second`
+  and `hs.gen_ai.provider_latency_s`.
+- **One INFO line** per finished call (`gen_ai call finished`, target `hs_utils::genai`), a WARN per failure,
+  printed on stdout at the log level in every build, and exported as the span's events with `otel`. Cost per
+  call, line included: ~0.6 µs without `otel`, ~2.4 µs with it compiled and disabled — against a model call
+  of seconds.
+- **Metrics** (with `otel` metrics on): `gen_ai.client.operation.duration`, `gen_ai.client.token.usage` (by
+  `gen_ai.token.type`), `gen_ai.client.operation.time_to_first_chunk` (streams) and
+  `hs.gen_ai.client.output_throughput`, labelled by operation, provider, model, stream, task and `error.type`.
+  Token totals per task come from the metric, so they are exact whatever traces are sampled.
+
+**Gating.**
+- **Build time:** no spans at all without feature `otel` (above). No new dependencies.
+- **Run time, `otel` compiled but `otel.enabled` unset or false:** `init` installs only the stdout layer — no
+  exporter, no metrics layer, no network. Spans reach stdout's span context and nothing else.
+- **No content, by construction.** There is no way to put a prompt, a reply or a tool argument on the span.
+  If one is ever wanted, it goes behind an opt-in config key that defaults off, as the conventions require.
+- **Labels are bounded.** `task`, `result` and `error_type` are `&'static str`. The model label keeps the first
+  `MAX_METRIC_MODELS` (20) distinct models per process and calls later ones `other`, so a service that takes a
+  model id from a user cannot mint one series per string. Spans keep the real id.
+- **Switches that already exist:** `otel.enabled` (everything), `otel.metricsEnabled` (metrics), and
+  `otel.level`: `info,hs_utils::genai=off` stops the spans and log lines being exported while the metrics
+  still count every call. The stdout line follows the log level (`log.level=…,hs_utils::genai=warn`).
+- **No per-chunk telemetry.** A stream records its first-chunk time and its totals, never an event per chunk.
+
+**Not shown by the compiler:** `ttft` exists only for streamed calls. A non-streaming call reports a total and
+its throughput includes the prompt read, so compare throughput within `gen_ai.request.stream`, never across it.
 
 ### v0.40.2 — quiet polls with no trace send "not sampled"; the metrics-off filter gap closed
 

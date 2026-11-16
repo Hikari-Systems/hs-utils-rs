@@ -32,6 +32,18 @@
 /// bytes turned into billable outbound ones.
 pub(crate) const MAX_ATTR_LEN: usize = 256;
 
+/// The build-time gate on span emission: `true` only with feature `otel`.
+///
+/// Every span this crate builds checks it, so a build without `otel` emits no
+/// spans at all — not to an exporter, and not to stdout's span context either.
+/// The builders (`client_span`, `client_span_at`, the outbound HTTP span, the
+/// GraphQL and login spans, `genai::GenAiCall`) stay callable in every build
+/// and hand back `Span::none()`, on which `record` and `instrument` do
+/// nothing; consumers need no `#[cfg]` of their own. Log events are not
+/// gated: they go to stdout at the log level, as ever. Metrics have their own
+/// no-op facade below.
+pub const EMIT_SPANS: bool = cfg!(feature = "otel");
+
 pub(crate) const REDACTED: &str = "<redacted>";
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {
@@ -144,6 +156,9 @@ pub fn client_span_at(
     operation: &str,
     peer: &str,
 ) -> tracing::Span {
+    if !EMIT_SPANS {
+        return tracing::Span::none();
+    }
     let name = format!("{system} {operation}");
     let peer = truncate(peer, MAX_ATTR_LEN);
     // A span's level is fixed at its callsite, so one callsite per level.
@@ -369,6 +384,9 @@ pub(crate) struct Outbound<'a> {
 /// for inbound requests — outbound URLs carry tokens too (a JWKS or Kratos
 /// URL with a session token, a Stripe idempotency key).
 pub(crate) fn http_client_span(out: Outbound<'_>) -> tracing::Span {
+    if !EMIT_SPANS {
+        return tracing::Span::none();
+    }
     let port = out.port.map(|p| format!(":{p}")).unwrap_or_default();
     let with_path = |path: &str| {
         let query = redact_query(out.query);
@@ -468,8 +486,24 @@ pub(crate) fn register_gauges(source: GaugeSource) {
 
 #[cfg(test)]
 mod tests {
+    /// Without `otel` no span is built at all (the builders stay callable and
+    /// hand back a disabled span); with it they are real spans.
+    #[test]
+    fn span_emission_follows_the_otel_feature() {
+        let cap = crate::telemetry::test_capture::capture();
+        let _g = crate::telemetry::test_capture::install(&cap);
+        let span = client_span("redis", "GET", "redis-sentinel");
+        record_outcome(&span, "ok");
+        assert_eq!(span.is_disabled(), !EMIT_SPANS);
+        assert_eq!(cfg!(feature = "otel"), EMIT_SPANS);
+        if !EMIT_SPANS {
+            assert!(cap.lock().unwrap().is_empty(), "no span fields without otel");
+        }
+    }
+
     use super::*;
 
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
     #[test]
     fn client_url_carries_query_names_not_values() {
         let cap = crate::telemetry::test_capture::capture();
@@ -493,6 +527,7 @@ mod tests {
 
     /// A webhook URL is its own credential (`hooks.slack.com/services/T/B/<secret>`):
     /// an opaque call records the origin and nothing after it.
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
     #[test]
     fn an_opaque_url_records_only_its_origin() {
         let cap = crate::telemetry::test_capture::capture();
@@ -516,6 +551,7 @@ mod tests {
     /// A path segment that is a credential (a session id the far end treats
     /// as a bearer): the caller's template replaces the path, so the route
     /// stays readable and the id never reaches the span.
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
     #[test]
     fn a_path_record_replaces_the_concrete_path() {
         let cap = crate::telemetry::test_capture::capture();
@@ -538,6 +574,7 @@ mod tests {
 
     /// A debug client span is a different callsite with the same name and
     /// fields, so the metrics layer and the tests treat it alike.
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
     #[test]
     fn a_client_span_takes_the_level_asked_for() {
         let cap = crate::telemetry::test_capture::capture();
@@ -562,6 +599,7 @@ mod tests {
 
     /// `client_span_at` makes the span at the level asked for (`WARN`/`ERROR`
     /// as `INFO`), with the same name and fields as `client_span`.
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
     #[test]
     fn client_span_at_takes_the_level_asked_for() {
         let cap = crate::telemetry::test_capture::capture();
@@ -577,6 +615,7 @@ mod tests {
         assert_eq!(client_span("sqs", "ReceiveMessage", "h").metadata().map(|m| *m.level()), Some(tracing::Level::INFO));
     }
 
+    #[cfg(feature = "otel")] // reads span fields; spans exist only with `otel`
     #[test]
     fn db_systems_get_db_semconv_fields() {
         let cap = crate::telemetry::test_capture::capture();

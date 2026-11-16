@@ -34,6 +34,7 @@ use tracing::span;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
+use crate::genai::GENAI_SPAN;
 use crate::telemetry::{GaugeSource, Sample, CLIENT_SPAN, HTTP_CLIENT_SPAN, SERVER_SPAN};
 
 /// Instrumentation scope of everything this crate reports.
@@ -46,6 +47,27 @@ pub(crate) const SCOPE: &str = "hs-utils";
 const DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
 ];
+
+/// GenAI call durations and time to first chunk: the semantic conventions'
+/// advised boundaries, extended to five minutes for long generations.
+const GENAI_DURATION_BUCKETS: &[f64] = &[
+    0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92, 163.84, 327.68,
+];
+
+/// `gen_ai.client.token.usage`: the semantic conventions' advised boundaries.
+const GENAI_TOKEN_BUCKETS: &[f64] = &[
+    1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0,
+];
+
+/// `hs.gen_ai.client.output_throughput`, output tokens per second.
+const GENAI_THROUGHPUT_BUCKETS: &[f64] = &[
+    1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 150.0, 200.0, 300.0, 500.0, 1000.0,
+];
+
+/// Distinct `gen_ai.request.model` labels a process keeps; later models are
+/// labelled `other`. The model is normally config, but a service that lets a
+/// user pick one must not mint a series per string. Spans keep the real id.
+pub(crate) const MAX_METRIC_MODELS: usize = 20;
 
 // ── the meter, once `init` has made one ─────────────────────────────────────
 
@@ -235,6 +257,7 @@ enum SpanKind {
     Server,
     HttpClient,
     Client,
+    GenAi,
 }
 
 /// Field values the metrics need, captured as the span records them.
@@ -247,6 +270,23 @@ struct Fields {
     system: Option<String>,
     operation: Option<String>,
     outcome: Option<String>,
+    genai: GenAiFields,
+}
+
+/// What a GenAI span carries for its metrics.
+#[derive(Default)]
+struct GenAiFields {
+    operation: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    task: Option<String>,
+    error_type: Option<String>,
+    stream: bool,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    duration_s: Option<f64>,
+    ttft_s: Option<f64>,
+    tokens_per_second: Option<f64>,
 }
 
 impl tracing::field::Visit for Fields {
@@ -258,6 +298,11 @@ impl tracing::field::Visit for Fields {
             "client.system" => &mut self.system,
             "client.operation" => &mut self.operation,
             "client.outcome" => &mut self.outcome,
+            "gen_ai.operation.name" => &mut self.genai.operation,
+            "gen_ai.provider.name" => &mut self.genai.provider,
+            "gen_ai.request.model" => &mut self.genai.model,
+            "hs.gen_ai.task" => &mut self.genai.task,
+            "error.type" => &mut self.genai.error_type,
             _ => return,
         };
         *slot = Some(v.to_string());
@@ -268,8 +313,24 @@ impl tracing::field::Visit for Fields {
         }
     }
     fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
-        if f.name() == "http.response.status_code" {
-            self.status = Some(v);
+        match f.name() {
+            "http.response.status_code" => self.status = Some(v),
+            "gen_ai.usage.input_tokens" => self.genai.input_tokens = Some(v),
+            "gen_ai.usage.output_tokens" => self.genai.output_tokens = Some(v),
+            _ => {}
+        }
+    }
+    fn record_f64(&mut self, f: &tracing::field::Field, v: f64) {
+        match f.name() {
+            "hs.gen_ai.duration_s" => self.genai.duration_s = Some(v),
+            "gen_ai.response.time_to_first_chunk" => self.genai.ttft_s = Some(v),
+            "hs.gen_ai.output_tokens_per_second" => self.genai.tokens_per_second = Some(v),
+            _ => {}
+        }
+    }
+    fn record_bool(&mut self, f: &tracing::field::Field, v: bool) {
+        if f.name() == "gen_ai.request.stream" {
+            self.genai.stream = v;
         }
     }
     fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
@@ -293,7 +354,34 @@ pub(crate) struct SpanMetrics {
     active: UpDownCounter<i64>,
     client_http_duration: Histogram<f64>,
     client_duration: Histogram<f64>,
+    genai_duration: Histogram<f64>,
+    genai_tokens: Histogram<f64>,
+    genai_ttft: Histogram<f64>,
+    genai_throughput: Histogram<f64>,
     peers: PeerLabels,
+    models: ModelLabels,
+}
+
+/// Bounds the `gen_ai.request.model` label on the GenAI metrics: the first
+/// [`MAX_METRIC_MODELS`] distinct models keep their name, later ones are
+/// `other`. Spans are not affected.
+#[derive(Default)]
+struct ModelLabels {
+    admitted: Mutex<std::collections::HashSet<String>>,
+}
+
+impl ModelLabels {
+    fn label(&self, model: &str) -> String {
+        let mut admitted = self.admitted.lock().unwrap_or_else(|e| e.into_inner());
+        if admitted.contains(model) {
+            return model.to_string();
+        }
+        if admitted.len() < MAX_METRIC_MODELS {
+            admitted.insert(model.to_string());
+            return model.to_string();
+        }
+        "other".to_string()
+    }
 }
 
 /// Bounds the `server.address` label on `http.client.request.duration`; see
@@ -339,7 +427,32 @@ impl SpanMetrics {
                 .build(),
             client_http_duration: hist("http.client.request.duration", "Outbound HTTP request duration"),
             client_duration: hist("hs.client.operation.duration", "Outbound call duration (redis, locks, pub/sub, SMTP …), by outcome"),
+            genai_duration: m
+                .f64_histogram("gen_ai.client.operation.duration")
+                .with_unit("s")
+                .with_description("GenAI call duration, request to last byte")
+                .with_boundaries(GENAI_DURATION_BUCKETS.to_vec())
+                .build(),
+            genai_tokens: m
+                .f64_histogram("gen_ai.client.token.usage")
+                .with_unit("{token}")
+                .with_description("Input and output tokens per GenAI call, by gen_ai.token.type")
+                .with_boundaries(GENAI_TOKEN_BUCKETS.to_vec())
+                .build(),
+            genai_ttft: m
+                .f64_histogram("gen_ai.client.operation.time_to_first_chunk")
+                .with_unit("s")
+                .with_description("Time to the first chunk of a streamed GenAI response")
+                .with_boundaries(GENAI_DURATION_BUCKETS.to_vec())
+                .build(),
+            genai_throughput: m
+                .f64_histogram("hs.gen_ai.client.output_throughput")
+                .with_unit("{token}/s")
+                .with_description("Output tokens per second of generation (whole call when not streamed)")
+                .with_boundaries(GENAI_THROUGHPUT_BUCKETS.to_vec())
+                .build(),
             peers: PeerLabels::default(),
+            models: ModelLabels::default(),
         }
     }
 
@@ -352,6 +465,39 @@ impl SpanMetrics {
             a.push(KeyValue::new("http.response.status_code", s));
         }
         a
+    }
+}
+
+impl SpanMetrics {
+    /// A closed GenAI span's metrics. Its own recorded duration (request to
+    /// last byte) is preferred to the span's lifetime, which runs on while the
+    /// caller parses the reply.
+    fn record_genai(&self, g: &GenAiFields, span_secs: f64) {
+        let s = |v: &Option<String>| v.clone().unwrap_or_default();
+        let mut a = vec![
+            KeyValue::new("gen_ai.operation.name", s(&g.operation)),
+            KeyValue::new("gen_ai.provider.name", s(&g.provider)),
+            KeyValue::new("gen_ai.request.model", self.models.label(g.model.as_deref().unwrap_or_default())),
+            KeyValue::new("gen_ai.request.stream", g.stream),
+            KeyValue::new("hs.gen_ai.task", s(&g.task)),
+        ];
+        if let Some(e) = &g.error_type {
+            a.push(KeyValue::new("error.type", e.clone()));
+        }
+        self.genai_duration.record(g.duration_s.unwrap_or(span_secs), &a);
+        if let Some(t) = g.ttft_s {
+            self.genai_ttft.record(t, &a);
+        }
+        if let Some(r) = g.tokens_per_second {
+            self.genai_throughput.record(r, &a);
+        }
+        for (kind, n) in [("input", g.input_tokens), ("output", g.output_tokens)] {
+            if let Some(n) = n.filter(|n| *n >= 0) {
+                let mut ta = a.clone();
+                ta.push(KeyValue::new("gen_ai.token.type", kind));
+                self.genai_tokens.record(n as f64, &ta);
+            }
+        }
     }
 }
 
@@ -370,6 +516,7 @@ where
             SERVER_SPAN => SpanKind::Server,
             HTTP_CLIENT_SPAN => SpanKind::HttpClient,
             CLIENT_SPAN => SpanKind::Client,
+            GENAI_SPAN => SpanKind::GenAi,
             _ => return,
         };
         let mut fields = Fields::default();
@@ -426,6 +573,7 @@ where
                     ],
                 );
             }
+            SpanKind::GenAi => self.record_genai(&f.genai, secs),
         }
     }
 }
@@ -601,6 +749,54 @@ pub(crate) mod tests {
         let p = points(&provider, &exporter);
         assert_eq!(has(&p, "http.client.request.duration", ("server.address", "other")), Some(5.0), "{p:?}");
         assert_eq!(has(&p, "http.client.request.duration", ("server.address", "feed0.example.net")), Some(1.0), "{p:?}");
+    }
+
+    /// A GenAI call becomes a duration, a token count per type, a TTFT (it
+    /// streamed) and a throughput, all labelled by provider, model, task and
+    /// stream; a failed call carries `error.type` and no tokens.
+    #[test]
+    fn genai_calls_become_token_and_latency_metrics() {
+        use crate::genai::{operation, provider, GenAiCall, Usage};
+        let (provider_, exporter) = provider();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanMetrics::new(&provider_)));
+
+        let mut call = GenAiCall::start(operation::CHAT, provider::AWS_BEDROCK, "qwen.qwen3-next-80b-a3b", "graph.extract", true);
+        call.first_chunk();
+        call.finish(&Usage { input_tokens: Some(5000), output_tokens: Some(200), ..Default::default() });
+        drop(call);
+        let mut failed = GenAiCall::start(operation::CHAT, provider::ANTHROPIC, "claude-x", "chat.turn", false);
+        failed.fail("throttled");
+        drop(failed);
+
+        let p = points(&provider_, &exporter);
+        let tok = |kind: &str| {
+            p.iter().any(|(n, _, a)| {
+                n == "gen_ai.client.token.usage"
+                    && a.contains(&("gen_ai.token.type".into(), kind.into()))
+                    && a.contains(&("hs.gen_ai.task".into(), "graph.extract".into()))
+                    && a.contains(&("gen_ai.request.model".into(), "qwen.qwen3-next-80b-a3b".into()))
+                    && a.contains(&("gen_ai.provider.name".into(), "aws.bedrock".into()))
+                    && a.contains(&("gen_ai.request.stream".into(), "true".into()))
+            })
+        };
+        assert!(tok("input") && tok("output"), "{p:?}");
+        assert_eq!(has(&p, "gen_ai.client.operation.time_to_first_chunk", ("hs.gen_ai.task", "graph.extract")), Some(1.0));
+        assert_eq!(has(&p, "hs.gen_ai.client.output_throughput", ("hs.gen_ai.task", "graph.extract")), Some(1.0));
+        assert_eq!(has(&p, "gen_ai.client.operation.duration", ("error.type", "throttled")), Some(1.0));
+        assert_eq!(has(&p, "gen_ai.client.token.usage", ("hs.gen_ai.task", "chat.turn")), None, "a failed call has no tokens");
+        assert_eq!(has(&p, "gen_ai.client.operation.time_to_first_chunk", ("hs.gen_ai.task", "chat.turn")), None);
+    }
+
+    /// The model label is bounded like `server.address`: the first
+    /// MAX_METRIC_MODELS models keep their name, the rest are `other`.
+    #[test]
+    fn genai_model_label_is_bounded() {
+        let labels = ModelLabels::default();
+        for i in 0..MAX_METRIC_MODELS {
+            assert_eq!(labels.label(&format!("m{i}")), format!("m{i}"));
+        }
+        assert_eq!(labels.label("user-typed-model"), "other");
+        assert_eq!(labels.label("m0"), "m0", "an admitted model keeps its label");
     }
 
     /// Another crate's span named like ours is not ours.

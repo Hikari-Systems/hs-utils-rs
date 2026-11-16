@@ -28,6 +28,10 @@
 //! event inside it — so with no OTLP exporter configured at all, those fields
 //! render, and `auth.redirect.reason` appears on the line twice.
 //!
+//! That holds with feature `otel` only. Without it hs-utils builds no spans
+//! (`telemetry::EMIT_SPANS`), so the prefix is gone and the reason renders
+//! once, on the event.
+//!
 //! **Its own binary, like every log-reading test here**, because `tracing`'s
 //! callsite interest cache is process-global and a subscriber can be installed
 //! once. See `tests/gate_span.rs`' header.
@@ -152,25 +156,32 @@ async fn the_shipped_filter_renders_the_refusal_reason_on_the_span_and_on_the_ev
         "a refusal is a WARN, not a DEBUG the fleet would never filter for:\n{line}"
     );
 
-    // The span prefix. THIS is the correction: these two fields are not
-    // export-only — they render with no exporter configured at all.
-    assert!(
-        line.contains("auth.gate{"),
-        "the refusal renders inside the auth.gate span at the shipped filter:\n{line}"
-    );
-    let braces = line
-        .split_once("auth.gate{")
-        .and_then(|(_, rest)| rest.split_once('}'))
-        .map(|(inside, _)| inside)
-        .unwrap_or_else(|| panic!("no auth.gate{{…}} field prefix:\n{line}"));
-    assert!(
-        braces.contains("auth.redirect.refused=true"),
-        "the span carries the verdict:\n{braces}"
-    );
-    assert!(
-        braces.contains(r#"auth.redirect.reason="not_origin_relative""#),
-        "the span carries the reason, quoted because `Span::record` took a &str:\n{braces}"
-    );
+    // The span prefix exists only where spans do: with `otel`
+    // (`telemetry::EMIT_SPANS`). Without it the event below still carries the
+    // reason, and the line has no `auth.gate{…}` prefix at all.
+    if hs_utils::telemetry::EMIT_SPANS {
+        // The span prefix. THIS is the correction: these two fields are not
+        // export-only — they render with no exporter configured at all.
+        assert!(
+            line.contains("auth.gate{"),
+            "the refusal renders inside the auth.gate span at the shipped filter:\n{line}"
+        );
+        let braces = line
+            .split_once("auth.gate{")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(inside, _)| inside)
+            .unwrap_or_else(|| panic!("no auth.gate{{…}} field prefix:\n{line}"));
+        assert!(
+            braces.contains("auth.redirect.refused=true"),
+            "the span carries the verdict:\n{braces}"
+        );
+        assert!(
+            braces.contains(r#"auth.redirect.reason="not_origin_relative""#),
+            "the span carries the reason, quoted because `Span::record` took a &str:\n{braces}"
+        );
+    } else {
+        assert!(!line.contains("auth.gate{"), "no spans without otel:\n{line}");
+    }
 
     // …and the event's own fields, after the message.
     let (_, after_message) = line.split_once(MESSAGE).expect("message present");
@@ -188,8 +199,8 @@ async fn the_shipped_filter_renders_the_refusal_reason_on_the_span_and_on_the_ev
     // that sentence checkable.
     assert_eq!(
         line.matches("auth.redirect.reason=").count(),
-        2,
-        "once on the span, once on the event:\n{line}"
+        if hs_utils::telemetry::EMIT_SPANS { 2 } else { 1 },
+        "once on the span (with otel), once on the event:\n{line}"
     );
 
     // The gate has no authenticated user, so the line must not carry one. The

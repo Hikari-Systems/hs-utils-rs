@@ -6,6 +6,11 @@ pub mod logging;
 // service's own SMTP). Plain `tracing`, so always on; `otel` exports them.
 pub mod telemetry;
 
+// One span, log line and metric set per generative-AI call (tokens, TTFT,
+// throughput, model and provider). Callable in every build; the span is
+// emitted only with `otel` (see `telemetry::EMIT_SPANS`).
+pub mod genai;
+
 #[cfg(feature = "http-client")]
 pub mod http_client;
 

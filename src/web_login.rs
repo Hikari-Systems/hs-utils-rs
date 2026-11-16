@@ -996,7 +996,7 @@ struct CallbackQuery {
 /// `WebLogin` is not `Debug`, so `skip(wl)` compiles — and compiles *because*
 /// the other two are being recorded. `tests/login_span.rs` is what fails when
 /// someone writes it.
-#[tracing::instrument(
+#[cfg_attr(feature = "otel", tracing::instrument(
     name = "auth.login",
     skip_all,
     fields(
@@ -1006,7 +1006,7 @@ struct CallbackQuery {
         session.op = tracing::field::Empty,
         user.id = tracing::field::Empty,
     )
-)]
+))]
 async fn callback(
     State(wl): State<WebLogin>,
     headers: HeaderMap,
@@ -1304,21 +1304,26 @@ async fn callback(
 /// refuses with `outcome=refused_401 session.present=true` — byte-identical to
 /// an expired session, and a different incident.
 pub async fn gate(State(g): State<GateState>, req: Request, next: Next) -> Response {
-    let span = tracing::info_span!(
-        "auth.gate",
-        auth.gate.fail_fast = g.fail_fast,
-        auth.gate.outcome = tracing::field::Empty,
-        auth.gate.session.present = tracing::field::Empty,
-        auth.gate.session.minted = tracing::field::Empty,
-        auth.gate.session.load_failed = tracing::field::Empty,
-        // Recorded only when a destination was refused — see `safe_dest`. A
-        // field that is present and `false` on every clean request defeats the
-        // `auth.redirect.refused exists` filter.
-        auth.redirect.refused = tracing::field::Empty,
-        auth.redirect.reason = tracing::field::Empty,
-        session.op = tracing::field::Empty,
-        user.id = tracing::field::Empty,
-    );
+    // Gated with every other span: see `telemetry::EMIT_SPANS`.
+    let span = if crate::telemetry::EMIT_SPANS {
+    tracing::info_span!(
+            "auth.gate",
+            auth.gate.fail_fast = g.fail_fast,
+            auth.gate.outcome = tracing::field::Empty,
+            auth.gate.session.present = tracing::field::Empty,
+            auth.gate.session.minted = tracing::field::Empty,
+            auth.gate.session.load_failed = tracing::field::Empty,
+            // Recorded only when a destination was refused — see `safe_dest`. A
+            // field that is present and `false` on every clean request defeats the
+            // `auth.redirect.refused exists` filter.
+            auth.redirect.refused = tracing::field::Empty,
+            auth.redirect.reason = tracing::field::Empty,
+            session.op = tracing::field::Empty,
+            user.id = tracing::field::Empty,
+        )
+    } else {
+        tracing::Span::none()
+    };
     // The request's parts, not the request itself: `Body` is not `Sync`, so
     // holding a `&Request` across an await would make this middleware's future
     // non-`Send` and axum would not accept it.

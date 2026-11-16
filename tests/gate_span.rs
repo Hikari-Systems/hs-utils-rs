@@ -30,7 +30,8 @@
 //! asserted positively (it must be the caller's), *and* a capturing layer
 //! asserts `auth.gate` was genuinely recorded. A disabled span therefore fails
 //! on the second assertion instead of passing the first.
-#![cfg(feature = "web-login")]
+// Spans exist only with `otel` (`telemetry::EMIT_SPANS`).
+#![cfg(all(feature = "web-login", feature = "otel"))]
 
 use std::sync::{Arc, Mutex};
 
