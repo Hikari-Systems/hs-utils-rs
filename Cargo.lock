@@ -1462,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "hs-utils"
-version = "0.42.0"
+version = "0.43.0"
 dependencies = [
  "actix-http",
  "actix-service",
@@ -1472,11 +1472,13 @@ dependencies = [
  "async-graphql-axum",
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "futures-util",
  "hex",
  "hmac 0.13.0",
  "http 1.4.0",
+ "http-body",
  "jsonwebtoken",
  "log",
  "moka",

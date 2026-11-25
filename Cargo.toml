@@ -1,6 +1,6 @@
 [package]
 name = "hs-utils"
-version = "0.42.0"
+version = "0.43.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -26,7 +26,9 @@ lock-redis = ["lock", "web-login-redis", "dep:uuid", "tokio/rt"]
 pubsub-axum = ["pubsub", "dep:axum", "dep:tokio-stream"]
 # `http_client::send`: reqwest 0.12 with a client span (and, with `otel`, an
 # outbound `traceparent`). Every feature here that calls out over HTTP uses it.
-http-client = ["dep:reqwest"]
+# `dep:http` and `dep:http-body`: the response body is re-wrapped to count its bytes
+# when the far end sends no Content-Length (see http_client::send_with).
+http-client = ["dep:reqwest", "dep:http", "dep:http-body", "dep:bytes"]
 web = ["dep:actix-web", "dep:actix-service", "dep:actix-http", "dep:futures-util"]
 # Framework-free RFC 7591 DCR proxy primitives. Pick an adapter feature below
 # to wire it into your HTTP framework of choice.
@@ -207,6 +209,8 @@ reqwest13 = { package = "reqwest", version = "0.13", default-features = false, f
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 tower-http = { version = "0.6", default-features = false, features = ["trace"], optional = true }
 http = { version = "1", optional = true }
+http-body = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util"] }

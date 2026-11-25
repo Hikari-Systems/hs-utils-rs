@@ -64,6 +64,34 @@ There is no CHANGELOG in this repo, so "the plan" goes in the section below — 
 
 ## Migrating consumers
 
+### v0.43.0 — outbound response body size on the client span and a metric
+
+**Drop-in from v0.42.0:** bump the tag; nothing to change. Every `send` / `send_traced*` / `send_with` call
+gains, on its `http.client` span:
+- `http.response.body.size`: the response's `Content-Length` when it has one, or else the bytes counted as
+  the caller reads the body.
+- `hs.http.response.body.size_source`: `header` or `counted`.
+- `hs.http.response.body.compressed`: `true` when the size is of a still-encoded body (a `Content-Length`
+  beside a `Content-Encoding`, or a counted body reqwest did not decode), `false` when it is the
+  uncompressed size. reqwest's own decompression removes `Content-Length` along with `Content-Encoding`, so a
+  body it decoded is counted, uncompressed.
+- `hs.http.response.body.complete` (counted only): `false` when the body was dropped before its end or
+  failed partway (a failure also marks the span `error = body`).
+
+Nothing is recorded for a HEAD, a 1xx, 204 or 304. **Metric:** `http.client.response.body.size` (histogram,
+`By`, 1 KiB to 512 MiB buckets), labelled by method, the bounded `server.address` and
+`hs.http.response.body.compressed`.
+
+**Not shown by the compiler:**
+- **A counted body holds its span open until the body is read or dropped,** so in a trace that span now
+  covers the download, not just the time to the headers. Calls whose response has a `Content-Length` are
+  unchanged. `http.client.request.duration` is now recorded when the status arrives (like the server
+  duration), so the metric does not move for either kind; a call with no response is still recorded at close
+  as `error.type = no_response`.
+- A counted response is rebuilt around the counting body. Status, headers, extensions and `url()` are the
+  same; it is a different `reqwest::Response` value, so nothing that depends on its identity should notice.
+- Without `otel` (or when nothing wants the span) the response is returned untouched and nothing is counted.
+
 ### v0.42.0 — `genai::Usage` reports cost and the upstream host
 
 **No compile break for `..Default::default()` users:** `genai::Usage` gains `cost_usd: Option<f64>` and

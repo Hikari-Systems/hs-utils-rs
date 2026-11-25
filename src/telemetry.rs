@@ -413,6 +413,10 @@ pub(crate) fn http_client_span(out: Outbound<'_>) -> tracing::Span {
                 server.port = out.port.map(i64::from),
                 url.full = %full,
                 http.response.status_code = tracing::field::Empty,
+                http.response.body.size = tracing::field::Empty,
+                hs.http.response.body.compressed = tracing::field::Empty,
+                hs.http.response.body.size_source = tracing::field::Empty,
+                hs.http.response.body.complete = tracing::field::Empty,
             )
         };
     }

@@ -133,12 +133,145 @@ pub async fn send_with(request: RequestBuilder, opts: TraceOptions) -> reqwest::
     #[cfg(feature = "otel")]
     crate::otel::inject_outbound_context(&span, built.headers_mut());
 
+    let is_head = built.method() == reqwest::Method::HEAD;
     let result = client.execute(built).instrument(span.clone()).await;
-    match &result {
-        Ok(resp) => record_http_client_status(&span, resp.status().as_u16()),
-        Err(e) => record_error(&span, &kind(e)),
+    match result {
+        Ok(resp) => {
+            record_http_client_status(&span, resp.status().as_u16());
+            Ok(record_body_size(&span, resp, is_head))
+        }
+        Err(e) => {
+            record_error(&span, &kind(&e));
+            Err(e)
+        }
     }
-    result
+}
+
+// ── response body size ──────────────────────────────────────────────────────
+//
+// `http.response.body.size` on the client span (and, through the metrics layer,
+// `http.client.response.body.size`), with `hs.http.response.body.compressed`
+// saying which size it is:
+//
+// * A `Content-Length` is recorded as it stands, straight away. reqwest's
+//   decompression removes `Content-Length` along with `Content-Encoding` when it
+//   decodes a body, so a length still beside a `Content-Encoding` is the
+//   compressed size on the wire; a length alone is the uncompressed size.
+// * No `Content-Length` (a streamed or chunked body, or one reqwest
+//   decompressed) and the body is counted as the caller reads it: compressed if
+//   the response still carries a `Content-Encoding` (reqwest did not decode it),
+//   uncompressed otherwise — the bytes the caller actually holds.
+//
+// Counting keeps a clone of the span until the body ends or is dropped, so that
+// span's own duration covers the download. The duration metric does not move:
+// it is recorded when the status is (see `otel::metrics`).
+
+/// Record what can be known now, and wrap the body to count it if the length
+/// is not known. Without span emission (no `otel`, or a span no subscriber
+/// wants) the response is returned untouched.
+fn record_body_size(span: &tracing::Span, resp: Response, is_head: bool) -> Response {
+    if span.is_disabled() {
+        return resp;
+    }
+    let status = resp.status().as_u16();
+    // No body to measure: a Content-Length on these describes some other
+    // response (the GET a HEAD stands for, the cached copy a 304 confirms).
+    if is_head || status == 204 || status == 304 || (100..200).contains(&status) {
+        return resp;
+    }
+    let headers = resp.headers();
+    let compressed = headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.trim().is_empty() && !v.trim().eq_ignore_ascii_case("identity"));
+    span.record("hs.http.response.body.compressed", compressed);
+
+    let declared = headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if let Some(n) = declared {
+        span.record("http.response.body.size", n);
+        span.record("hs.http.response.body.size_source", "header");
+        return resp;
+    }
+
+    span.record("hs.http.response.body.size_source", "counted");
+    // reqwest::Response -> http::Response<Body> loses the URL (it lives in a
+    // reqwest-private extension); ResponseBuilderExt::url, which is public,
+    // puts it back, so `resp.url()` is unchanged for the caller.
+    use reqwest::ResponseBuilderExt as _;
+    let url = resp.url().clone();
+    let (mut parts, body) = http::Response::<reqwest::Body>::from(resp).into_parts();
+    if let Ok(carrier) = http::Response::builder().url(url).body(()) {
+        parts.extensions.extend(carrier.into_parts().0.extensions);
+    }
+    let body = reqwest::Body::wrap(CountingBody { inner: body, span: span.clone(), bytes: 0, finished: false });
+    Response::from(http::Response::from_parts(parts, body))
+}
+
+/// A response body that adds up the bytes it hands on and records the total on
+/// its span when it ends, fails or is dropped.
+struct CountingBody {
+    inner: reqwest::Body,
+    span: tracing::Span,
+    bytes: u64,
+    finished: bool,
+}
+
+impl CountingBody {
+    fn finish(&mut self, complete: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.span.record("http.response.body.size", self.bytes);
+        self.span.record("hs.http.response.body.complete", complete);
+    }
+}
+
+impl http_body::Body for CountingBody {
+    type Data = bytes::Bytes;
+    type Error = reqwest::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.bytes += data.len() as u64;
+                }
+            }
+            Poll::Ready(Some(Err(_))) => {
+                self.finish(false);
+                record_error(&self.span, &"body");
+            }
+            Poll::Ready(None) => self.finish(true),
+            Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for CountingBody {
+    fn drop(&mut self) {
+        // Dropped before the end: the caller stopped reading (or never read).
+        // An empty body that was never polled is still complete.
+        let complete = http_body::Body::is_end_stream(&self.inner);
+        self.finish(complete);
+    }
 }
 
 /// `.send_traced()` on a `RequestBuilder`: [`send`] as a method, so a chained
@@ -291,6 +424,117 @@ mod tests {
         }
         assert!(rec.iter().any(|(k, v)| k == "error" && v == "connect"), "{rec:?}");
         assert!(!rec.iter().any(|(_, v)| v.contains("SECRET")), "{rec:?}");
+    }
+
+    /// A one-shot server that answers with `raw`, verbatim.
+    async fn respond(raw: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await.unwrap();
+            sock.write_all(raw).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// The last value recorded for each body-size field.
+    fn body_fields(cap: &crate::telemetry::test_capture::Fields) -> [Option<String>; 4] {
+        let rec = cap.lock().unwrap().clone();
+        let get = |k: &str| rec.iter().rev().find(|(f, _)| f == k).map(|(_, v)| v.clone());
+        [
+            get("http.response.body.size"),
+            get("hs.http.response.body.compressed"),
+            get("hs.http.response.body.size_source"),
+            get("hs.http.response.body.complete"),
+        ]
+    }
+
+    const CHUNKED: &[u8] = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n\
+5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+
+    /// A Content-Length is recorded as the uncompressed size, without
+    /// touching the body.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_content_length_is_recorded_from_the_header() {
+        let cap = capture();
+        let _g = install(&cap);
+        let base =
+            respond(b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\nconnection: close\r\n\r\nhello world").await;
+        let resp = send(reqwest::Client::new().get(format!("{base}/x"))).await.unwrap();
+        assert_eq!(resp.text().await.unwrap(), "hello world");
+        let [size, compressed, source, complete] = body_fields(&cap);
+        assert_eq!(size.as_deref(), Some("11"));
+        assert_eq!(compressed.as_deref(), Some("false"));
+        assert_eq!(source.as_deref(), Some("header"));
+        assert_eq!(complete, None, "a header size is not counted, so there is nothing to complete");
+    }
+
+    /// A Content-Length beside a Content-Encoding reqwest did not decode is
+    /// the compressed size on the wire.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_content_length_beside_an_encoding_is_compressed() {
+        let cap = capture();
+        let _g = install(&cap);
+        let base = respond(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\ncontent-encoding: x-test\r\nconnection: close\r\n\r\nabcd",
+        )
+        .await;
+        let resp = send(reqwest::Client::new().get(format!("{base}/x"))).await.unwrap();
+        let _ = resp.bytes().await.unwrap();
+        let [size, compressed, source, _] = body_fields(&cap);
+        assert_eq!((size.as_deref(), compressed.as_deref(), source.as_deref()), (Some("4"), Some("true"), Some("header")));
+    }
+
+    /// No Content-Length: the body is counted as it is read, and the caller
+    /// sees the same response — body, status, headers and URL.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_body_without_a_length_is_counted() {
+        let cap = capture();
+        let _g = install(&cap);
+        let base = respond(CHUNKED).await;
+        let url = format!("{base}/stream?page=2");
+        let resp = send(reqwest::Client::new().get(&url)).await.unwrap();
+        assert_eq!(resp.url().as_str(), url, "the URL must survive the re-wrap");
+        assert_eq!(resp.status(), 200);
+        assert!(resp.headers().get("transfer-encoding").is_some(), "headers must survive the re-wrap");
+        assert_eq!(body_fields(&cap)[0], None, "nothing is known until the body is read");
+        assert_eq!(resp.text().await.unwrap(), "hello world");
+        let [size, compressed, source, complete] = body_fields(&cap);
+        assert_eq!(size.as_deref(), Some("11"));
+        assert_eq!(compressed.as_deref(), Some("false"));
+        assert_eq!(source.as_deref(), Some("counted"));
+        assert_eq!(complete.as_deref(), Some("true"));
+    }
+
+    /// A counted body dropped unread records what was read, as incomplete.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_body_dropped_unread_is_incomplete() {
+        let cap = capture();
+        let _g = install(&cap);
+        let base = respond(CHUNKED).await;
+        let resp = send(reqwest::Client::new().get(format!("{base}/stream"))).await.unwrap();
+        drop(resp);
+        let [size, _, source, complete] = body_fields(&cap);
+        assert_eq!(source.as_deref(), Some("counted"));
+        assert_eq!(size.as_deref(), Some("0"));
+        assert_eq!(complete.as_deref(), Some("false"));
+    }
+
+    /// A HEAD has no body to measure, whatever its Content-Length says.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_head_records_no_body_size() {
+        let cap = capture();
+        let _g = install(&cap);
+        let base = respond(b"HTTP/1.1 200 OK\r\ncontent-length: 999\r\nconnection: close\r\n\r\n").await;
+        let _ = send(reqwest::Client::new().head(format!("{base}/x"))).await.unwrap();
+        assert_eq!(body_fields(&cap), [None, None, None, None]);
     }
 
     /// A one-shot server answering 204 that hands back the request head.

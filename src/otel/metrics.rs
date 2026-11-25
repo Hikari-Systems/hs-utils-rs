@@ -12,6 +12,11 @@
 //!   response status is known, so an SSE stream is not one enormous request.
 //! * `http.server.active_requests` (up-down) — `http.request.method`.
 //! * `http.client.request.duration` (s) — method, `server.address`, status.
+//!   Measured to the response status (headers), like the server duration, so a
+//!   span kept open while its body is counted does not lengthen it.
+//! * `http.client.response.body.size` (By) — method, `server.address`,
+//!   `hs.http.response.body.compressed`: the response's `Content-Length`, or the
+//!   bytes counted when it has none (see [`crate::http_client::send_with`]).
 //!   `server.address` is bounded: in-cluster names, pinned hosts and the first
 //!   [`crate::telemetry::MAX_METRIC_PEERS`] dotted hosts by name, the rest
 //!   `other` (see [`crate::telemetry::set_metric_peer_hosts`]).
@@ -55,6 +60,11 @@ const GENAI_DURATION_BUCKETS: &[f64] = &[
 ];
 
 /// `gen_ai.client.token.usage`: the semantic conventions' advised boundaries.
+/// Response body sizes, 1 KiB to 512 MiB.
+const BODY_SIZE_BUCKETS: &[f64] = &[
+    1024.0, 16384.0, 131072.0, 1048576.0, 8388608.0, 67108864.0, 536870912.0,
+];
+
 const GENAI_TOKEN_BUCKETS: &[f64] = &[
     1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0,
 ];
@@ -270,6 +280,8 @@ struct Fields {
     system: Option<String>,
     operation: Option<String>,
     outcome: Option<String>,
+    body_size: Option<u64>,
+    body_compressed: Option<bool>,
     genai: GenAiFields,
 }
 
@@ -309,13 +321,16 @@ impl tracing::field::Visit for Fields {
         *slot = Some(v.to_string());
     }
     fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
-        if f.name() == "http.response.status_code" {
-            self.status = i64::try_from(v).ok();
+        match f.name() {
+            "http.response.status_code" => self.status = i64::try_from(v).ok(),
+            "http.response.body.size" => self.body_size = Some(v),
+            _ => {}
         }
     }
     fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
         match f.name() {
             "http.response.status_code" => self.status = Some(v),
+            "http.response.body.size" => self.body_size = u64::try_from(v).ok(),
             "gen_ai.usage.input_tokens" => self.genai.input_tokens = Some(v),
             "gen_ai.usage.output_tokens" => self.genai.output_tokens = Some(v),
             _ => {}
@@ -331,8 +346,10 @@ impl tracing::field::Visit for Fields {
         }
     }
     fn record_bool(&mut self, f: &tracing::field::Field, v: bool) {
-        if f.name() == "gen_ai.request.stream" {
-            self.genai.stream = v;
+        match f.name() {
+            "gen_ai.request.stream" => self.genai.stream = v,
+            "hs.http.response.body.compressed" => self.body_compressed = Some(v),
+            _ => {}
         }
     }
     fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
@@ -346,7 +363,7 @@ struct Timing {
     kind: SpanKind,
     start: Instant,
     fields: Fields,
-    /// The server duration has been recorded (at the status).
+    /// The server or HTTP-client duration has been recorded (at the status).
     done: bool,
 }
 
@@ -355,6 +372,7 @@ pub(crate) struct SpanMetrics {
     server_duration: Histogram<f64>,
     active: UpDownCounter<i64>,
     client_http_duration: Histogram<f64>,
+    client_body_size: Histogram<f64>,
     client_duration: Histogram<f64>,
     genai_duration: Histogram<f64>,
     genai_tokens: Histogram<f64>,
@@ -428,7 +446,13 @@ impl SpanMetrics {
                 .with_unit("{request}")
                 .with_description("Inbound requests in progress")
                 .build(),
-            client_http_duration: hist("http.client.request.duration", "Outbound HTTP request duration"),
+            client_http_duration: hist("http.client.request.duration", "Outbound HTTP request duration, to the response status"),
+            client_body_size: m
+                .f64_histogram("http.client.response.body.size")
+                .with_unit("By")
+                .with_description("Outbound HTTP response body size; hs.http.response.body.compressed says which size")
+                .with_boundaries(BODY_SIZE_BUCKETS.to_vec())
+                .build(),
             client_duration: hist("hs.client.operation.duration", "Outbound call duration (redis, locks, pub/sub, SMTP …), by outcome"),
             genai_duration: m
                 .f64_histogram("gen_ai.client.operation.duration")
@@ -462,6 +486,25 @@ impl SpanMetrics {
             peers: PeerLabels::default(),
             models: ModelLabels::default(),
         }
+    }
+
+    /// Method and bounded `server.address`: the labels every HTTP-client metric has.
+    fn client_attrs(&self, f: &Fields) -> Vec<KeyValue> {
+        vec![
+            KeyValue::new("http.request.method", f.method.clone().unwrap_or_default()),
+            KeyValue::new("server.address", self.peers.label(f.address.as_deref().unwrap_or_default())),
+        ]
+    }
+
+    /// `http.client.request.duration`, with the status or, when there was no
+    /// response, `error.type = no_response`.
+    fn record_client_duration(&self, f: &Fields, secs: f64) {
+        let mut a = self.client_attrs(f);
+        match f.status {
+            Some(s) => a.push(KeyValue::new("http.response.status_code", s)),
+            None => a.push(KeyValue::new("error.type", "no_response")),
+        }
+        self.client_http_duration.record(secs, &a);
     }
 
     fn server_attrs(f: &Fields) -> Vec<KeyValue> {
@@ -545,9 +588,18 @@ where
         let mut ext = span.extensions_mut();
         let Some(t) = ext.get_mut::<Timing>() else { return };
         values.record(&mut t.fields);
-        if t.kind == SpanKind::Server && !t.done && t.fields.status.is_some() {
-            t.done = true;
-            self.server_duration.record(t.start.elapsed().as_secs_f64(), &Self::server_attrs(&t.fields));
+        if !t.done && t.fields.status.is_some() {
+            match t.kind {
+                SpanKind::Server => {
+                    t.done = true;
+                    self.server_duration.record(t.start.elapsed().as_secs_f64(), &Self::server_attrs(&t.fields));
+                }
+                SpanKind::HttpClient => {
+                    t.done = true;
+                    self.record_client_duration(&t.fields, t.start.elapsed().as_secs_f64());
+                }
+                _ => {}
+            }
         }
     }
 
@@ -564,15 +616,15 @@ where
                 self.active.add(-1, &[KeyValue::new("http.request.method", f.method.clone().unwrap_or_default())]);
             }
             SpanKind::HttpClient => {
-                let mut a = vec![
-                    KeyValue::new("http.request.method", f.method.clone().unwrap_or_default()),
-                    KeyValue::new("server.address", self.peers.label(f.address.as_deref().unwrap_or_default())),
-                ];
-                match f.status {
-                    Some(s) => a.push(KeyValue::new("http.response.status_code", s)),
-                    None => a.push(KeyValue::new("error.type", "no_response")),
+                // Recorded at the status already, unless there never was one.
+                if !t.done {
+                    self.record_client_duration(f, secs);
                 }
-                self.client_http_duration.record(secs, &a);
+                if let Some(n) = f.body_size {
+                    let mut a = self.client_attrs(f);
+                    a.push(KeyValue::new("hs.http.response.body.compressed", f.body_compressed.unwrap_or(false)));
+                    self.client_body_size.record(n as f64, &a);
+                }
             }
             SpanKind::Client => {
                 self.client_duration.record(
@@ -726,6 +778,39 @@ pub(crate) mod tests {
         let p = points(&provider, &exporter);
         assert_eq!(has(&p, "http.server.request.duration", ("http.route", "/healthcheck")), Some(1.0), "{p:?}");
         assert_eq!(has(&p, "http.client.request.duration", ("server.address", "poller")), Some(1.0), "{p:?}");
+    }
+
+    /// The client duration is recorded at the status, so a span held open
+    /// while its body is counted is not timed twice or lengthened; the body
+    /// size is recorded at close, labelled compressed or not.
+    #[test]
+    fn client_duration_at_the_status_and_body_size_at_close() {
+        let (provider, exporter) = provider();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanMetrics::new(&provider)));
+        let span = tracing::info_span!(
+            "http.client",
+            http.request.method = "GET",
+            server.address = "clinicaltrials.gov",
+            http.response.status_code = tracing::field::Empty,
+            http.response.body.size = tracing::field::Empty,
+            hs.http.response.body.compressed = tracing::field::Empty,
+        );
+        span.record("http.response.status_code", 200u16);
+        let p = points(&provider, &exporter);
+        assert_eq!(has(&p, "http.client.request.duration", ("server.address", "clinicaltrials.gov")), Some(1.0), "{p:?}");
+        assert_eq!(has(&p, "http.client.response.body.size", ("server.address", "clinicaltrials.gov")), None, "not before close");
+
+        span.record("hs.http.response.body.compressed", false);
+        span.record("http.response.body.size", 80_896_565u64);
+        drop(span);
+        let p = points(&provider, &exporter);
+        assert_eq!(has(&p, "http.client.request.duration", ("server.address", "clinicaltrials.gov")), Some(1.0), "timed once: {p:?}");
+        assert_eq!(has(&p, "http.client.response.body.size", ("hs.http.response.body.compressed", "false")), Some(1.0), "{p:?}");
+
+        // No status at all: still one duration, as no_response, at close.
+        drop(tracing::info_span!("http.client", http.request.method = "GET", server.address = "gone"));
+        let p = points(&provider, &exporter);
+        assert_eq!(has(&p, "http.client.request.duration", ("error.type", "no_response")), Some(1.0), "{p:?}");
     }
 
     /// `server.address` on the client metric is bounded: in-cluster names
